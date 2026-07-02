@@ -39,6 +39,10 @@ huggingface/
 .DS_Store
 Thumbs.db
 
+# Archives
+*.7z
+*.zip
+
 # Environment / secrets
 .env
 *.secret

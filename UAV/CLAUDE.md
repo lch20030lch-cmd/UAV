@@ -1,6 +1,6 @@
 # UAV-ISAC-MLLM — Constraint-Aware MLLM for UAV-ISAC
 
-**目标**: 用 Gemma 3 12B (LoRA + 约束投影头) 为 UAV-ISAC 的 SCA-FP 数值优化器提供智能热启动。
+**目标**: 用 Gemma 3 4B (LoRA + 约束投影头) 为 UAV-ISAC 的 SCA-FP 数值优化器提供智能热启动。
 
 **文档导航 (新成员必读 — 2026-06-26 重构)**:
 - [docs/README.md](docs/README.md) — 文档总索引
@@ -14,7 +14,7 @@
 ## 当前状态
 
 - ✅ 全部源码完成，7 轮审查闭合 + 一审修复闭合
-- ✅ GitHub 私有仓库: `Lampotaku/UAV-ISAC-MLLM`
+- ✅ GitHub 仓库: `lch20030lch-cmd/UAV`
 - ✅ Plan A: 纯 PyTorch CE + SDPA, 0 Unsloth 引用
 - ✅ 终极配置: bs=2, grad_accum=8, seq=3456, bf16 全精度
 - 🔴 旧数据全作废 (19,925 SFT + DPO) — q_current 缺失 → mode collapse (0.893x)
@@ -26,8 +26,8 @@
 
 | 项 | 值 |
 |----|-----|
-| 本地 | Windows, `h:\Projects\UAV` |
-| 服务器 | AutoDL RTX PRO 6000 96GB, `/root/UAV-ISAC-MLLM` |
+| 本地 | Windows, `C:\Users\Shardeom-PC\Desktop\Projects\UAV` |
+| 服务器 | AutoDL RTX PRO 6000 96GB, `/root/Projects/UAV` |
 | 数据盘 | `/root/autodl-tmp/` (系统盘仅 30GB) |
 | GPU | Blackwell sm_120, CUDA 13.0, Driver 595.58.03 |
 | 精度 | bf16 全精度 LoRA (96GB 无需量化) |
@@ -58,7 +58,7 @@ configs/        → default.yaml (全部超参数)
 ### SFT 完成后 (服务器上执行)
 
 ```bash
-cd /root/UAV-ISAC-MLLM && git pull
+cd /root/Projects && git pull
 conda activate uavmllm
 # Step 1: Stage II DPO (2 epochs, ~5-10h)
 python src/training/train_dpo.py --config configs/default.yaml --data_dir /root/autodl-tmp/data/full5000
