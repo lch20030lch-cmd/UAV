@@ -49,7 +49,7 @@ training:
     logging_steps: 5
 
 model:
-  backbone: "/root/autodl-tmp/huggingface/models/gemma-3-12b-it"
+  backbone: "/root/autodl-tmp/huggingface/models/gemma-3-4b-it"
   use_multimodal: false
   torch_dtype: "bfloat16"
   attn_implementation: "sdpa"
@@ -66,10 +66,10 @@ model:
 
   control_token:
     num_tokens: 8
-    hidden_dim: 3840
+    hidden_dim: 2560
 
   projection_head:
-    hidden_dim: 3840
+    hidden_dim: 2560
     mlp_hidden: [256, 256]
     readout_out_dim: 128
     tau_power: 0.5
