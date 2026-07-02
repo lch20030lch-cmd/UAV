@@ -60,7 +60,7 @@ training:
 
 # ---- 模型 ----
 model:
-  backbone: "/root/autodl-tmp/huggingface/models/gemma-3-12b-it"   # Gemma 3 12B Instruct (AutoDL 本地路径)
+  backbone: "/root/autodl-tmp/huggingface/models/gemma-3-4b-it"    # Gemma 3 4B Instruct (AutoDL 本地路径)
   use_multimodal: false                # 先用文本版验证, 后续切换为 true
   torch_dtype: "bfloat16"
   attn_implementation: "sdpa"   # PyTorch 原生 SDPA → cuDNN Fused Attention (~2.5s/step)
@@ -80,11 +80,11 @@ model:
   # Control Token
   control_token:
     num_tokens: 8           # 控制 token 数量 (32→8: 单 query 瓶颈已修复为 Multi-Query, 无需多 token)
-    hidden_dim: 3840        # Gemma 3 12B 的 hidden_size
+    hidden_dim: 2560        # Gemma 3 4B 的 hidden_size
 
   # Projection Head
   projection_head:
-    hidden_dim: 3840
+    hidden_dim: 2560
     mlp_hidden: [256, 256]   # 两层 hidden MLP
     readout_out_dim: 128     # 读出投影
     tau_power: 0.5           # softmax temperature (功率)
