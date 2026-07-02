@@ -1,0 +1,160 @@
+# ==========================================================================
+# Constraint-Aware MLLM for UAV-ISAC — 主配置文件
+# 硬件目标: RTX PRO 6000 96GB @ AutoDL
+# ==========================================================================
+
+# ---- 硬件 / 训练 ----
+# RTX PRO 6000 96GB (Blackwell sm_120) — CUDA 12.8+
+# 使用 Unsloth 替代 bitsandbytes (Unsloth 内置 Blackwell 优化内核)
+hardware:
+  gpu: "RTX PRO 6000"
+  vram_gb: 96
+  use_4bit: false           # bf16 全精度 LoRA — 96GB 无需量化, 质量更好
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+
+  # 如果 flash-attn 不可用, 改为 sdpa:
+  # attn_fallback: "sdpa"
+
+training:
+  seed: 42
+  # Stage I: SFT
+  sft:
+    epochs: 3                    # 全量生产: 3 epochs
+    per_device_batch_size: 2          # bs=2: CE fp32 梯度 ~8GB, 峰值 ~70GB — 96GB 安全 (闲置 38GB 利用)
+    gradient_accumulation_steps: 8    # 有效 batch = bs=2 × 8 = 16
+    learning_rate: 2.0e-4
+    lr_scheduler: "cosine"
+    warmup_ratio: 0.03
+    weight_decay: 0.01
+    max_seq_length: 3456             # 128-aligned, 包容最大样本 3329 + 8 ctrl tokens, 砍 4096→3456 省 ~40% 注意力计算
+    save_steps: 100                   # 全量生产: 每 ~44min 存 checkpoint (100步 × 26s)
+    save_total_limit: 3               # 自动清理: 只保留最近 N 个 checkpoint, 防爆盘
+    save_full_state: true             # 全量: save_state (含 optimizer, 可续训). 烟雾: false (仅存 LoRA)
+    logging_steps: 10                 # 全量生产: 每 10 步打 log
+
+    # Phase 1: CTL-only warmup (控制表示预训练)
+    # 完全关闭 CE loss，强制 LoRA 学会将环境信息编码到 control token。
+    # 用 perturbation sensitivity 作为自动切换指标。
+    phase1:
+      enabled: true                     # 启用 Phase 1
+      lr_lora: 5.0e-4                   # Phase 1 LoRA LR (1e-3 反跌, 退回安全区)
+      lambda_ctl: 1.0                   # Phase 1 控制 loss 权重 (Phase 2 用 model.loss.lambda_ctl=0.5)
+      sensitivity_check_steps: 50       # 每 N 步检查 perturbation sensitivity
+      sensitivity_threshold: 0.1        # 跨环境 delta_q L2 ratio > 0.1 → 切换 Phase 2
+      max_steps: 250                    # 省钱版: 历史数据显示 150-250 区间已覆盖最佳表征点
+
+  # Stage II: DPO
+  dpo:
+    epochs: 2
+    per_device_batch_size: 1          # bs=1 → 双模型48GB + 4×logits(fp32) 15GB ≈ 63GB; backward≈12GB → 峰值~75GB (bs=2 会OOM)
+    gradient_accumulation_steps: 16   # 有效 batch = 1×16 = 16
+    learning_rate: 5.0e-5
+    lr_scheduler: "cosine"
+    warmup_ratio: 0.03
+    beta: 0.1                    # DPO temperature (论文值)
+    mu: 0.05                     # SFT anchor 系数 (防遗忘)
+    max_seq_length: 3456             # 128-aligned, 同 SFT
+    save_steps: 100                   # 每 100 步存 checkpoint, 观察中间效果
+    logging_steps: 10                 # 每 10 步打一次 log
+
+# ---- 模型 ----
+model:
+  backbone: "/root/autodl-tmp/huggingface/models/gemma-3-12b-it"   # Gemma 3 12B Instruct (AutoDL 本地路径)
+  use_multimodal: false                # 先用文本版验证, 后续切换为 true
+  torch_dtype: "bfloat16"
+  attn_implementation: "sdpa"   # PyTorch 原生 SDPA → cuDNN Fused Attention (~2.5s/step)
+  # eager = 21s/step (O(n²) 全注意力矩阵)
+  # flash_attention_2: 需额外 pip install + Blackwell 预编译 wheel
+
+  lora:
+    rank: 16                # 论文 r=16
+    alpha: 32               # 论文 α=32
+    dropout: 0        # Unsloth: >0 会禁用快速内核, 导致 21s/step
+    target_modules:         # Gemma 3 的 attention 线性层
+      - "q_proj"
+      - "k_proj"
+      - "v_proj"
+      - "o_proj"
+
+  # Control Token
+  control_token:
+    num_tokens: 8           # 控制 token 数量 (32→8: 单 query 瓶颈已修复为 Multi-Query, 无需多 token)
+    hidden_dim: 3840        # Gemma 3 12B 的 hidden_size
+
+  # Projection Head
+  projection_head:
+    hidden_dim: 3840
+    mlp_hidden: [256, 256]   # 两层 hidden MLP
+    readout_out_dim: 128     # 读出投影
+    tau_power: 0.5           # softmax temperature (功率)
+    tau_assoc: 0.5           # Sinkhorn temperature (关联)
+    sinkhorn_iters: 20       # Sinkhorn 迭代次数
+
+  # Loss weights
+  loss:
+    lambda_ctl: 0.5          # 控制 loss 权重 (论文 λ_ctl)
+    lambda_q: 1.0            # 位移 loss
+    lambda_a: 0.5            # 关联 loss
+    lambda_p: 0.3            # 功率 loss
+    lambda_sep: 0.1          # 分离惩罚 (论文 λ_sep)
+
+# ---- 仿真环境 ----
+simulation:
+  area_size: [1000, 1000]    # m² (论文 1000×1000)
+  num_uavs: 4                # M = 4
+  num_users: 20              # K = 20
+  num_targets: 6             # T = 6
+  num_antennas_tx: 8         # N_t
+  num_antennas_rx: 8         # N_r
+  carrier_freq_ghz: 5.8      # f_c
+  bandwidth_mhz: 20          # B
+  p_max_dbm: 30              # P_m^max
+  noise_figure_db: 9
+  altitude_min_m: 50         # H_min
+  altitude_max_m: 300        # H_max
+  uav_min_separation_m: 10   # d_min
+  uav_max_speed_ms: 15       # v_max
+  slot_duration_s: 1.0       # Δt
+  sinr_c_min_db: 0           # Γ_c^min
+  sinr_s_min_db: 10          # Γ_s^min
+  rate_min_bps: 1e6          # R_k^min
+  load_cap_per_uav: 10       # K_m^max
+
+# ---- 数据生成 ----
+data:
+  num_environments: 5000     # S = 5000 (论文值)
+  num_restarts: 10           # N = 10   (论文值)
+  pair_margin_rho: 0.2       # ρ = 0.2  (论文值)
+  dpo_min_pairs_per_sample: 2
+
+  # 模态配置 (文本版验证阶段)
+  modalities:
+    use_comm_summary: true
+    use_sensing_summary: true
+    use_bev_text_grid: true     # 文本版: 用文本网格替代图像
+    use_bev_image: false        # 图像版: 需要 Gemma3 多模态权重
+
+  # 数据输出
+  output_dir: "/root/autodl-tmp/data/full_v2"
+  sft_file: "sft_dataset.jsonl"       # 全量生产: 5000 条
+  dpo_file: "dpo_dataset.jsonl"       # 全量 19,925 偏好对
+
+# ---- 评估 ----
+eval:
+  num_test_environments: 200
+  baseline_list:
+    - "csi_only"              # B1
+    - "isac_sca"              # B2
+    - "drl_assisted"          # B3
+    - "single_modal_frozen"   # B4
+    - "moe_baseline"          # B5
+    - "frozen_prompting"      # B6 (论文主要对比)
+    - "sft_only"              # B7
+    - "dpo_only"              # B8
+    - "sft_dpo_no_head"       # B9
+
+# ---- 输出 ----
+output_dir: "/root/autodl-tmp/outputs"
+checkpoint_dir: "/root/autodl-tmp/checkpoints"
+log_dir: "/root/autodl-tmp/logs"

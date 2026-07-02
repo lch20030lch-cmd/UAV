@@ -1,0 +1,138 @@
+# ==========================================================================
+# Constraint-Aware MLLM for UAV-ISAC — 烟雾测试配置 (完整 SFT→DPO→Eval 流程)
+# 数据: 200 环境 (smoke_v3)
+# 用途: 快速演示完整管线，验证代码无 bug
+# ==========================================================================
+
+hardware:
+  gpu: "RTX PRO 6000"
+  vram_gb: 96
+  use_4bit: false
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+
+training:
+  seed: 42
+
+  sft:
+    epochs: 1                          # 烟雾: 1 epoch 够看效果
+    per_device_batch_size: 2
+    gradient_accumulation_steps: 8     # 有效 batch = 16
+    learning_rate: 2.0e-4
+    lr_scheduler: "cosine"
+    warmup_ratio: 0.03
+    weight_decay: 0.01
+    max_seq_length: 3456
+    save_steps: 10                      # 烟雾: 每 10 步存 (频繁 demo)
+    save_total_limit: 2
+    logging_steps: 5
+
+    phase1:
+      enabled: true
+      lr_lora: 5.0e-4
+      lambda_ctl: 1.0
+      sensitivity_check_steps: 10      # 烟雾: 更快检测切换
+      sensitivity_threshold: 0.1
+      max_steps: 20                    # 烟雾: 20步够了 (~10min), 演示CTL即可
+
+  dpo:
+    epochs: 1                           # 烟雾: 1 epoch
+    per_device_batch_size: 1
+    gradient_accumulation_steps: 16
+    learning_rate: 5.0e-5
+    lr_scheduler: "cosine"
+    warmup_ratio: 0.03
+    beta: 0.1
+    mu: 0.05
+    max_seq_length: 3456
+    save_steps: 10
+    logging_steps: 5
+
+model:
+  backbone: "/root/autodl-tmp/huggingface/models/gemma-3-12b-it"
+  use_multimodal: false
+  torch_dtype: "bfloat16"
+  attn_implementation: "sdpa"
+
+  lora:
+    rank: 16
+    alpha: 32
+    dropout: 0
+    target_modules:
+      - "q_proj"
+      - "k_proj"
+      - "v_proj"
+      - "o_proj"
+
+  control_token:
+    num_tokens: 8
+    hidden_dim: 3840
+
+  projection_head:
+    hidden_dim: 3840
+    mlp_hidden: [256, 256]
+    readout_out_dim: 128
+    tau_power: 0.5
+    tau_assoc: 0.5
+    sinkhorn_iters: 20
+
+  loss:
+    lambda_ctl: 0.5
+    lambda_q: 1.0
+    lambda_a: 0.5
+    lambda_p: 0.3
+    lambda_sep: 0.1
+
+simulation:
+  area_size: [1000, 1000]
+  num_uavs: 4
+  num_users: 20
+  num_targets: 6
+  num_antennas_tx: 8
+  num_antennas_rx: 8
+  carrier_freq_ghz: 5.8
+  bandwidth_mhz: 20
+  p_max_dbm: 30
+  noise_figure_db: 9
+  altitude_min_m: 50
+  altitude_max_m: 300
+  uav_min_separation_m: 10
+  uav_max_speed_ms: 15
+  slot_duration_s: 1.0
+  sinr_c_min_db: 0
+  sinr_s_min_db: 10
+  rate_min_bps: 1e6
+  load_cap_per_uav: 10
+
+data:
+  num_environments: 200
+  num_restarts: 10
+  pair_margin_rho: 0.2
+  dpo_min_pairs_per_sample: 2
+
+  modalities:
+    use_comm_summary: true
+    use_sensing_summary: true
+    use_bev_text_grid: true
+    use_bev_image: false
+
+  output_dir: "/root/autodl-tmp/data/smoke_v3"
+  sft_file: "sft_dataset.jsonl"
+  dpo_file: "dpo_dataset.jsonl"
+
+eval:
+  num_test_environments: 200
+  baseline_list:
+    - "csi_only"
+    - "isac_sca"
+    - "drl_assisted"
+    - "single_modal_frozen"
+    - "moe_baseline"
+    - "frozen_prompting"
+    - "sft_only"
+    - "dpo_only"
+    - "sft_dpo_no_head"
+
+output_dir: "/root/autodl-tmp/outputs/smoke"
+checkpoint_dir: "/root/autodl-tmp/checkpoints/smoke"
+log_dir: "/root/autodl-tmp/logs/smoke"

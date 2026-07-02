@@ -1,0 +1,31 @@
+============================================================
+Evaluation Results Summary
+============================================================
+
+  sum_rate:
+    mean = 39.6957  ±  16.2847
+
+  mean_sensing_sinr_db:
+    mean = 14.4174  ±  1.0678
+
+  mean_crb:
+    mean = 0.0000  ±  0.0000
+
+  joint_satisfaction:
+    mean = 0.5063  ±  0.0249
+
+  sca_fp_iterations_warm:
+    mean = 2.0000  ±  0.0000
+
+  sca_fp_iterations_cold:
+    mean = 2.6950  ±  0.4604
+
+  sca_fp_speedup:
+    mean = 1.3475  ±  0.2302
+
+  inference_latency_ms:
+    mean = 316.7920  ±  41.4764
+
+  Total valid samples: 200
+
+Results saved to /root/autodl-tmp/eval/sft_only.json
