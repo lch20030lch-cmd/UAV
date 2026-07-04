@@ -1,11 +1,12 @@
 # ==========================================================================
 # Constraint-Aware MLLM for UAV-ISAC — 主配置文件
 # 硬件目标: RTX PRO 6000 96GB @ AutoDL
+# 次要目标: RTX 5090 32GB → 用 configs/rtx5090.yaml
 # ==========================================================================
 
 # ---- 硬件 / 训练 ----
 # RTX PRO 6000 96GB (Blackwell sm_120) — CUDA 12.8+
-# 使用 Unsloth 替代 bitsandbytes (Unsloth 内置 Blackwell 优化内核)
+# bf16 全精度 LoRA (96GB 无需量化); RTX 5090 使用 4-bit NF4 QLoRA
 hardware:
   gpu: "RTX PRO 6000"
   vram_gb: 96

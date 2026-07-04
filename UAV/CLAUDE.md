@@ -15,7 +15,7 @@
 
 - ✅ 全部源码完成，7 轮审查闭合 + 一审修复闭合
 - ✅ GitHub 仓库: `lch20030lch-cmd/UAV`
-- ✅ Plan A: 纯 PyTorch CE + SDPA, 0 Unsloth 引用
+- ✅ Plan A: 纯 PyTorch CE + SDPA, 4-bit 路径使用 bitsandbytes NF4 (Unsloth 已完全移除)
 - ✅ 终极配置: bs=2, grad_accum=8, seq=3456, bf16 全精度
 - 🔴 旧数据全作废 (19,925 SFT + DPO) — q_current 缺失 → mode collapse (0.893x)
 - ✅ q_current Bug 修复: has_q_current flag + 统一 tensor shape (commit 270b707)
@@ -70,7 +70,7 @@ python src/eval/evaluate.py --config configs/default.yaml
 
 - 所有路径用 `/root/autodl-tmp/`，不写系统盘
 - 代码修改在本地 Windows，git push/pull 同步
-- **永远不在项目中 `import unsloth`** — 全局 monkey-patch 与 SDPA + grad ckpt 不兼容
+- 4-bit 路径使用 bitsandbytes NF4 + PEFT（RTX 5090 32GB），bf16 全精度路径不变（RTX PRO 6000 96GB）
 - DPO reference model 独立加载（不 deepcopy，会 OOM）
 - 数据生成支持 Ctrl+C 断点续跑
 - SFT: bs=2/grad_accum=8; DPO: bs=1/grad_accum=16 (有效 batch 均 16)

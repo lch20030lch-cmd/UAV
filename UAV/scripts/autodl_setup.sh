@@ -27,9 +27,9 @@ source activate uavmllm
 echo "[2/6] Installing PyTorch with CUDA 12.8..."
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-# ---- 3. Unsloth (替代 bitsandbytes, 内置 Blackwell sm_120 优化) ----
-echo "[3/6] Installing Unsloth + core dependencies..."
-pip install unsloth
+# ---- 3. bitsandbytes NF4 4-bit QLoRA (sm_120 支持, RTX 5090 32GB) ----
+echo "[3/6] Installing bitsandbytes + core dependencies..."
+pip install bitsandbytes>=0.45.3
 pip install transformers==4.49.0
 pip install peft==0.14.0
 pip install accelerate==1.3.0
@@ -62,17 +62,17 @@ print(f'GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:
 print(f'Compute capability: {torch.cuda.get_device_capability(0)}')
 "
 
-# ---- 6. 验证关键库 (含 Unsloth) ----
+# ---- 6. 验证关键库 ----
 echo "[6/6] Verifying key libraries..."
 python -c "
 import transformers; print(f'transformers: {transformers.__version__}')
 import peft; print(f'peft: {peft.__version__}')
 from accelerate import Accelerator; print('accelerate: OK')
 try:
-    from unsloth import FastLanguageModel
-    print('unsloth: OK (Blackwell ready)')
+    import bitsandbytes
+    print(f'bitsandbytes: {bitsandbytes.__version__} (RTX 5090 ready)')
 except ImportError:
-    print('unsloth: NOT FOUND — check install')
+    print('bitsandbytes: NOT FOUND — check install')
 print('All dependencies ready!')
 "
 

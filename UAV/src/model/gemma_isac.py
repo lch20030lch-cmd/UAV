@@ -14,7 +14,7 @@ Gemma3-ISAC 模型
   2. 推理: generate_warmstart() 返回投影后的 δ̂
 
 模型加载双轨制:
-  轨道 A (use_4bit=True):  Unsloth FastLanguageModel → eager attention (16-21s/step)
+  轨道 A (use_4bit=True):  bitsandbytes NF4 + PEFT → RTX 5090 32GB (~20.5 GB SFT / ~22 GB DPO)
   轨道 B (use_4bit=False): Native HF + PEFT + SDPA → cuDNN Fused Attention (~2-3s/step)
 """
 
@@ -33,19 +33,19 @@ class Gemma3ISAC(nn.Module):
     Gemma3 + LoRA + Control Token + Projection Head
 
     论文参数:
-      backbone: Gemma 3 12B (google/gemma-3-12b-it)
+      backbone: Gemma 3 4B (google/gemma-3-4b-it)
       LoRA rank: 16, α=32
       Control tokens: 8 个特殊 token
       Projection head: 2-layer MLP [256, 256]
 
-    Blackwell 适配:
-      使用 Unsloth FastLanguageModel 加载 4-bit + LoRA
-      (替代 bitsandbytes + PEFT, Unsloth 内置 sm_120 内核)
+    RTX 5090 适配:
+      4-bit 路径使用 bitsandbytes NF4 + PEFT (替代 Unsloth)
+      bnb >= 0.45.3 已确认支持 RTX 5090 (sm_120)
     """
 
     def __init__(
         self,
-        model_name_or_path: str = "google/gemma-3-12b-it",
+        model_name_or_path: str = "google/gemma-3-4b-it",
         use_4bit: bool = True,
         lora_rank: int = 16,
         lora_alpha: int = 32,
@@ -55,48 +55,45 @@ class Gemma3ISAC(nn.Module):
         proj_head_config: Optional[Dict] = None,
         torch_dtype: torch.dtype = torch.bfloat16,
         attn_implementation: str = "flash_attention_2",
-        max_seq_length: int = 4096,
-        **kwargs,  # 兼容旧参数 (bnb_4bit_compute_dtype, bnb_4bit_quant_type 等)
+        max_seq_length: int = 4096,  # 保留兼容性（已弃用, 新路径不依赖此参数）
     ):
         super().__init__()
 
         if lora_target_modules is None:
             lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
-        # ---- 模型加载: 双轨制 (Unsloth 4-bit / Native bf16 SDPA) ----
-        if use_4bit:
-            # 轨道 A: Unsloth 4-bit QLoRA (省显存, 但 Gemma 3 只能 eager attention)
-            try:
-                from unsloth import FastLanguageModel
-            except ImportError:
-                raise ImportError(
-                    "Unsloth is required for 4-bit QLoRA. "
-                    "Install: pip install unsloth"
-                )
+        # ═══════════════════════════════════════════════
+        # 模型加载: 双轨制 (bnb 4-bit / Native bf16 SDPA)
+        # ═══════════════════════════════════════════════
+        from transformers import AutoModelForCausalLM
 
-            self.base_model, tokenizer_or_processor = FastLanguageModel.from_pretrained(
-                model_name=model_name_or_path,
-                max_seq_length=max_seq_length,
+        if use_4bit:
+            # 轨道 A: bitsandbytes 4-bit NF4 QLoRA (RTX 5090 32GB)
+            from transformers import BitsAndBytesConfig
+            from peft import prepare_model_for_kbit_training
+
+            bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
-                dtype=torch_dtype,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name_or_path, trust_remote_code=True)
+
+            self.base_model = AutoModelForCausalLM.from_pretrained(
+                model_name_or_path,
+                quantization_config=bnb_config,
+                torch_dtype=torch_dtype,
                 attn_implementation=attn_implementation,
                 trust_remote_code=True,
             )
-
-            # Unwrap actual tokenizer from Gemma3Processor
-            if hasattr(tokenizer_or_processor, 'tokenizer'):
-                self.tokenizer = tokenizer_or_processor.tokenizer
-            else:
-                self.tokenizer = tokenizer_or_processor
+            self.base_model = prepare_model_for_kbit_training(self.base_model)
         else:
             # 轨道 B: Native HuggingFace + PEFT bf16 — SDPA 真正生效, ~2-3s/step
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-            from peft import LoraConfig, get_peft_model
-
             self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name_or_path,
-                trust_remote_code=True,
-            )
+                model_name_or_path, trust_remote_code=True)
 
             self.base_model = AutoModelForCausalLM.from_pretrained(
                 model_name_or_path,
@@ -104,7 +101,6 @@ class Gemma3ISAC(nn.Module):
                 attn_implementation=attn_implementation,
                 trust_remote_code=True,
             )
-            # 不用 device_map="auto" — Accelerate 负责设备放置
 
         # Gemma 专用: 确保 pad_token
         if self.tokenizer.pad_token is None:
@@ -134,30 +130,23 @@ class Gemma3ISAC(nn.Module):
 
         self.control_token_ids = self.tokenizer.convert_tokens_to_ids(control_tokens)
 
-        # ---- LoRA 注入 ----
+        # ═══════════════════════════════════════════════
+        # LoRA 注入 (双轨统一: 都走 PEFT, 仅 LoraConfig 有差异)
+        # ═══════════════════════════════════════════════
+        from peft import LoraConfig, get_peft_model
+
         if use_4bit:
-            # Unsloth 路径: FastLanguageModel.get_peft_model
-            self.base_model = FastLanguageModel.get_peft_model(
-                self.base_model,
+            # 4-bit: 不加 modules_to_save — prepare_model_for_kbit_training 已让 embed 可训练
+            peft_config = LoraConfig(
                 r=lora_rank,
-                target_modules=lora_target_modules,
                 lora_alpha=lora_alpha,
+                target_modules=lora_target_modules,
                 lora_dropout=lora_dropout,
                 bias="none",
-                use_gradient_checkpointing=True,
-                random_state=42,
             )
-            # 新增 token embedding 默认冻结, 需手动开启 (否则控制 token 保持随机初始化)
-            if num_added > 0:
-                embed = self.base_model.get_input_embeddings()
-                if hasattr(embed, 'weight'):
-                    embed.weight.requires_grad = True
         else:
-            # Native PEFT 路径: LoraConfig + get_peft_model
-            # modules_to_save 确保新增的控制 token embedding 参与训练
-            # 注意: modules_to_save 仅含 embed_tokens (不含 lm_head)
-            # lm_head 冻结: CE 梯度通过 frozen lm_head 回传到 hidden_states → LoRA
-            # 含 lm_head 会打断 Gemma 3 的 tie_word_embeddings, 浪费 ~12 GB
+            # bf16: modules_to_save=["embed_tokens"] 确保控制 token embedding 参与训练
+            # 注意: 不含 lm_head — 冻结 lm_head 省 ~12 GB, CE 梯度通过 frozen lm_head 回传
             peft_config = LoraConfig(
                 r=lora_rank,
                 lora_alpha=lora_alpha,
@@ -166,27 +155,32 @@ class Gemma3ISAC(nn.Module):
                 bias="none",
                 modules_to_save=["embed_tokens"],
             )
-            self.base_model = get_peft_model(self.base_model, peft_config)
-            self.base_model.gradient_checkpointing_enable()
-            # gc 验证: 直接检查 Gemma3Model.gradient_checkpointing 属性
-            transformer = self.base_model.model.model
-            if not getattr(transformer, 'gradient_checkpointing', False):
-                import logging
-                _log = logging.getLogger(__name__)
-                _log.warning("GC not enabled on Gemma3Model after enable() — forcing")
-                transformer.gradient_checkpointing_enable()
-            # 冻结 lm_head: CE 梯度通过 frozen lm_head 回传到 hidden_states → LoRA
-            # 若 tie_word_embeddings 仍生效 → clone 解绑以免影响 embed_tokens 训练
-            causal_lm = self.base_model.model
-            lm_head = causal_lm.lm_head
-            embed = causal_lm.get_input_embeddings()
-            if lm_head.weight.data_ptr() == embed.weight.data_ptr():
-                # 权重重绑 → clone 解绑 + 冻结
-                lm_head._parameters['weight'] = torch.nn.Parameter(
-                    lm_head.weight.data.clone(), requires_grad=False
-                )
-            else:
-                lm_head.weight.requires_grad = False
+
+        self.base_model = get_peft_model(self.base_model, peft_config)
+
+        # ═══════════════════════════════════════════════
+        # 共享: Gradient Checkpointing + lm_head 冻结 (OOM6 防护)
+        # ═══════════════════════════════════════════════
+        self.base_model.gradient_checkpointing_enable()
+        # gc 验证: 直接检查 Gemma3Model.gradient_checkpointing 属性
+        transformer = self.base_model.model.model
+        if not getattr(transformer, 'gradient_checkpointing', False):
+            import logging
+            _log = logging.getLogger(__name__)
+            _log.warning("GC not enabled on Gemma3Model after enable() — forcing")
+            transformer.gradient_checkpointing_enable()
+        # 冻结 lm_head: CE 梯度通过 frozen lm_head 回传到 hidden_states → LoRA
+        # 若 tie_word_embeddings 仍生效 → clone 解绑以免影响 embed_tokens 训练
+        causal_lm = self.base_model.model
+        lm_head = causal_lm.lm_head
+        embed = causal_lm.get_input_embeddings()
+        if lm_head.weight.data_ptr() == embed.weight.data_ptr():
+            # 权重重绑 → clone 解绑 + 冻结
+            lm_head._parameters['weight'] = torch.nn.Parameter(
+                lm_head.weight.data.clone(), requires_grad=False
+            )
+        else:
+            lm_head.weight.requires_grad = False
 
         # ---- Projection Head ----
         if proj_head_config is None:
@@ -435,11 +429,11 @@ class Gemma3ISAC(nn.Module):
         """
         加载完整模型 (LoRA + Projection Head + Tokenizer)
 
-        双轨制: use_4bit=True → Unsloth, use_4bit=False → Native HF + PEFT SDPA.
+        双轨制: use_4bit=True → bitsandbytes NF4 + PEFT, use_4bit=False → Native HF + PEFT SDPA.
         """
         from peft import PeftModel, LoraConfig, get_peft_model
 
-        # 提取构造参数 (kwargs 里的旧 BnB 参数被忽略)
+        # 提取构造参数
         use_4bit = kwargs.pop("use_4bit", True)
         lora_rank = kwargs.pop("lora_rank", 16)
         lora_alpha = kwargs.pop("lora_alpha", 32)
@@ -448,33 +442,40 @@ class Gemma3ISAC(nn.Module):
                                           ["q_proj", "k_proj", "v_proj", "o_proj"])
         num_control_tokens = kwargs.pop("num_control_tokens", 8)
         proj_head_config = kwargs.pop("proj_head_config", {})
-        max_seq_length = kwargs.pop("max_seq_length", 4096)
 
-        # ---- 模型加载: 双轨制 ----
+        # ═══════════════════════════════════════════════
+        # 模型加载: 双轨制 (bnb 4-bit / Native bf16)
+        # ═══════════════════════════════════════════════
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
         if use_4bit:
-            from unsloth import FastLanguageModel
+            # 轨道 A: bitsandbytes 4-bit NF4 QLoRA
+            from transformers import BitsAndBytesConfig
+            from peft import prepare_model_for_kbit_training
 
-            base_model, tokenizer_or_processor = FastLanguageModel.from_pretrained(
-                model_name=base_model_name,
-                max_seq_length=max_seq_length,
+            bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
-                dtype=torch_dtype,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                base_model_name, trust_remote_code=True)
+
+            base_model = AutoModelForCausalLM.from_pretrained(
+                base_model_name,
+                quantization_config=bnb_config,
+                torch_dtype=torch_dtype,
                 attn_implementation=attn_implementation,
                 trust_remote_code=True,
             )
-
-            # Unwrap actual tokenizer from Gemma3Processor
-            if hasattr(tokenizer_or_processor, 'tokenizer'):
-                tokenizer = tokenizer_or_processor.tokenizer
-            else:
-                tokenizer = tokenizer_or_processor
+            base_model = prepare_model_for_kbit_training(base_model)
         else:
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-
+            # 轨道 B: Native HuggingFace + PEFT bf16
             tokenizer = AutoTokenizer.from_pretrained(
-                base_model_name,
-                trust_remote_code=True,
-            )
+                base_model_name, trust_remote_code=True)
+
             base_model = AutoModelForCausalLM.from_pretrained(
                 base_model_name,
                 torch_dtype=torch_dtype,
@@ -504,66 +505,25 @@ class Gemma3ISAC(nn.Module):
             base_model.resize_token_embeddings(len(tokenizer))
         control_token_ids = tokenizer.convert_tokens_to_ids(control_tokens)
 
-        # ---- 加载 LoRA 权重 (双轨) ----
+        # ═══════════════════════════════════════════════
+        # 加载或创建 LoRA (双轨统一: 都走 PEFT)
+        # ═══════════════════════════════════════════════
         lora_path = os.path.join(load_dir, "lora")
         if os.path.exists(lora_path):
             # 已有训练好的 LoRA → 直接加载
             base_model = PeftModel.from_pretrained(base_model, lora_path, is_trainable=True)
-
-            # ══ OOM #6 修复: gc + lm_head 冻结 ══
-            # 1) Gradient checkpointing (from_pretrained 不恢复 gc 设置)
-            base_model.gradient_checkpointing_enable()
-            try:
-                base_model.model.model.gradient_checkpointing_enable()
-            except Exception:
-                pass
-            # 验证 gc 在底层 Gemma3Model 上生效; 若失败则直接设属性硬加固
-            transformer = base_model.model.model
-            if not getattr(transformer, 'gradient_checkpointing', False):
-                import logging
-                _log = logging.getLogger(__name__)
-                _log.warning(
-                    "GC NOT enabled on Gemma3Model after all enable() calls — "
-                    "forcing via direct attr. Activations without GC consume ~60 GB."
-                )
-                transformer.gradient_checkpointing = True
-                if not hasattr(transformer, '_gradient_checkpointing_func') or \
-                   transformer._gradient_checkpointing_func is None:
-                    transformer._gradient_checkpointing_func = \
-                        torch.utils.checkpoint.checkpoint
-
-            # 2) 冻结 lm_head (省 ~12 GB Adam m/v)
-            #    检查权重是否仍与 embed_tokens 绑定; 若绑定则 clone 解绑
-            causal_lm = base_model.model  # PeftModel → Gemma3ForCausalLM
-            lm_head = causal_lm.lm_head
-            embed = causal_lm.get_input_embeddings()
-            if lm_head.weight.data_ptr() == embed.weight.data_ptr():
-                # 权重仍绑定 → clone 解绑, 新 tensor requires_grad=False
-                lm_head._parameters['weight'] = torch.nn.Parameter(
-                    lm_head.weight.data.clone(), requires_grad=False
-                )
-            else:
-                lm_head.weight.requires_grad = False
         elif use_4bit:
-            # 4-bit 路径: 用 Unsloth 创建 fresh LoRA
-            base_model = FastLanguageModel.get_peft_model(
-                base_model,
+            # 4-bit fresh LoRA: 不加 modules_to_save
+            peft_config = LoraConfig(
                 r=lora_rank,
-                target_modules=lora_target_modules,
                 lora_alpha=lora_alpha,
+                target_modules=lora_target_modules,
                 lora_dropout=lora_dropout,
                 bias="none",
-                use_gradient_checkpointing=True,
-                random_state=42,
             )
-            # 新增 token embedding 需手动开启训练
-            if num_added > 0:
-                embed = base_model.get_input_embeddings()
-                if hasattr(embed, 'weight'):
-                    embed.weight.requires_grad = True
+            base_model = get_peft_model(base_model, peft_config)
         else:
-            # Native PEFT 路径: LoraConfig + get_peft_model
-            # (不含 lm_head: 冻结 lm_head 省 ~12 GB, 梯度通过 frozen lm_head 回传)
+            # bf16 fresh LoRA: modules_to_save=["embed_tokens"]
             peft_config = LoraConfig(
                 r=lora_rank,
                 lora_alpha=lora_alpha,
@@ -573,24 +533,43 @@ class Gemma3ISAC(nn.Module):
                 modules_to_save=["embed_tokens"],
             )
             base_model = get_peft_model(base_model, peft_config)
-            base_model.gradient_checkpointing_enable()
-            # gc 验证
-            transformer = base_model.model.model
-            if not getattr(transformer, 'gradient_checkpointing', False):
-                import logging
-                _log = logging.getLogger(__name__)
-                _log.warning("GC not enabled on Gemma3Model after get_peft_model — forcing")
-                transformer.gradient_checkpointing_enable()
-            # 冻结 lm_head (若仍与 embed_tokens 绑定则 clone 解绑)
-            causal_lm = base_model.model
-            lm_head = causal_lm.lm_head
-            embed = causal_lm.get_input_embeddings()
-            if lm_head.weight.data_ptr() == embed.weight.data_ptr():
-                lm_head._parameters['weight'] = torch.nn.Parameter(
-                    lm_head.weight.data.clone(), requires_grad=False
-                )
-            else:
-                lm_head.weight.requires_grad = False
+
+        # ═══════════════════════════════════════════════
+        # 共享: GC + lm_head 冻结 (OOM6 防护)
+        # ═══════════════════════════════════════════════
+        # 1) Gradient checkpointing (from_pretrained 不恢复 gc 设置)
+        base_model.gradient_checkpointing_enable()
+        try:
+            base_model.model.model.gradient_checkpointing_enable()
+        except Exception:
+            pass
+        # 验证 gc 在底层 Gemma3Model 上生效; 若失败则直接设属性硬加固
+        transformer = base_model.model.model
+        if not getattr(transformer, 'gradient_checkpointing', False):
+            import logging
+            _log = logging.getLogger(__name__)
+            _log.warning(
+                "GC NOT enabled on Gemma3Model after all enable() calls — "
+                "forcing via direct attr. Activations without GC consume ~60 GB."
+            )
+            transformer.gradient_checkpointing = True
+            if not hasattr(transformer, '_gradient_checkpointing_func') or \
+               transformer._gradient_checkpointing_func is None:
+                transformer._gradient_checkpointing_func = \
+                    torch.utils.checkpoint.checkpoint
+
+        # 2) 冻结 lm_head (省 ~12 GB Adam m/v)
+        #    检查权重是否仍与 embed_tokens 绑定; 若绑定则 clone 解绑
+        causal_lm = base_model.model  # PeftModel → Gemma3ForCausalLM
+        lm_head = causal_lm.lm_head
+        embed = causal_lm.get_input_embeddings()
+        if lm_head.weight.data_ptr() == embed.weight.data_ptr():
+            # 权重仍绑定 → clone 解绑, 新 tensor requires_grad=False
+            lm_head._parameters['weight'] = torch.nn.Parameter(
+                lm_head.weight.data.clone(), requires_grad=False
+            )
+        else:
+            lm_head.weight.requires_grad = False
 
         # ---- 恢复 Control Token Embedding (新格式: 单独保存的 8 行) ----
         # 新 save_pretrained 只保存 LoRA + ctrl_embed.pt, 不含完整 embed_tokens.
