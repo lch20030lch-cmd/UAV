@@ -6,10 +6,9 @@
 
 # ---- 硬件 / 训练 ----
 # RTX 5090 32GB — bitsandbytes >= 0.45.3 (sm_120 支持)
-# SFT: bs=2, grad_accum=8 (有效 batch=16), 峰值 ~20.5 GB
-# DPO: bs=1, grad_accum=16 (有效 batch=16), 峰值 ~22 GB
-# 如果 SFT bs=2 OOM: 改 bs=1, grad_accum=16 (无需改代码)
-# 如果 DPO OOM: 先降 max_seq_length → 2048
+# 以下参数均经 2026-07-04 Smoke Test 实测验证, 勿随意改大
+# SFT: bs=1, grad_accum=16 (有效 batch=16), 峰值 ~25 GB (bs=2 → OOM)
+# DPO: bs=1, seq=1536, mu=0 (有效 batch=16), 峰值 ~30.4 GB
 hardware:
   gpu: "RTX 5090"
   vram_gb: 32
@@ -22,13 +21,13 @@ training:
   # Stage I: SFT
   sft:
     epochs: 3                        # 全量生产: 3 epochs
-    per_device_batch_size: 2         # bs=2: 4-bit 下峰值 ~20.5 GB (32GB 安全)
-    gradient_accumulation_steps: 8   # 有效 batch = 2×8 = 16
+    per_device_batch_size: 1         # bs=1: bs=2 实测 OOM (CE fp32 膨胀 6.75GB)
+    gradient_accumulation_steps: 16  # 有效 batch = 1×16 = 16
     learning_rate: 2.0e-4
     lr_scheduler: "cosine"
     warmup_ratio: 0.03
     weight_decay: 0.01
-    max_seq_length: 3456             # 128-aligned, 同 PRO 6000 配置
+    max_seq_length: 3456             # SFT seq=3456 实测通过 (bs=1)
     save_steps: 100
     save_total_limit: 3
     save_full_state: true
@@ -52,8 +51,8 @@ training:
     lr_scheduler: "cosine"
     warmup_ratio: 0.03
     beta: 0.1                        # DPO temperature (论文值)
-    mu: 0.05                         # SFT anchor 系数 (防遗忘)
-    max_seq_length: 3456             # 128-aligned; 若 OOM 先降到 2048
+    mu: 0.0                          # SFT anchor 关闭 (开启导致 backward OOM)
+    max_seq_length: 1536             # 3456/2048 均实测 OOM, 1536 通过
     save_steps: 100
     logging_steps: 10
 
