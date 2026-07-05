@@ -96,3 +96,27 @@
 **总计消除: ~273 行冗余代码，9 个文件变更。**
 
 剩余的 Dataset 基类和 __init__/from_pretrained 合并因风险较高暂缓，待 DPO 训练完成后再做。
+
+---
+
+## 待推送 commits
+
+> 本地共 6 个 commit 未推送到 GitHub（含服务器上的 `compute_logits` 优化）。
+> 网络恢复后执行: `git pull --no-rebase && git push`
+
+| commit | 描述 | 来源 |
+|------|------|------|
+| `bf23c5b` | perf: Phase 1 skip lm_head to save 2.5GB VRAM | 服务器 |
+| `4e75ef3` | refactor: 删除死代码 (~88 行) | 本地 |
+| `58b1b6d` | refactor: 提取防爆盾环境变量 (~35 行) | 本地 |
+| `bbb12a6` | refactor: 提取 build_proj_head_config() (~52 行) | 本地 |
+| `de22c3f` | refactor: 提取 OOM6 防护函数 (~98 行) | 本地 |
+| `29cd5cc` | docs: 更新代码冗余清理日志 | 本地 |
+
+### 推送命令
+
+```bash
+cd /c/Users/Shardeom-PC/Desktop/Projects
+git pull --no-rebase origin main
+git push origin main
+```
