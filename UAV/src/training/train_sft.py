@@ -29,51 +29,22 @@ L_I = L_SFT + λ_ctl * L_ctl
 
 import os
 import sys
+from pathlib import Path
 
-# ⚠️ 必须在 import numpy / torch 之前！
-# 防止 Intel MKL / OpenBLAS 与 PyTorch DataLoader 多进程打架
-# 每个 worker 都试图开满全部核心 → CPU 100% 但进度卡死
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
+# 项目根路径 (必须在所有项目 import 之前设好)
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-# PyTorch CUDA 内存分配器: 允许动态释放缓存段, 减少碎片化 OOM
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+from src.training.env_setup import setup_env
+setup_env()
 
-# ── 【防爆盾 0】网络/遥测静默 ──
-# 0a: 禁止 Unsloth 连接 HuggingFace 上报统计 (国内超时 120s)
-os.environ["UNSLOTH_DISABLE_STATISTICS"] = "1"
-# 0b: HuggingFace 镜像 (国内加速, 不影响本地模型加载)
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-
-# ── 【防爆盾 1】核弹级环境变量 ──
-# Blackwell sm_120: 禁止 Inductor 使用 FlexAttention (共享内存 101KB < 需 114KB)
-os.environ["TORCHINDUCTOR_FLEX_ATTENTION"] = "0"
-os.environ["TORCH_COMPILE_DISABLE"] = "1"
-
-# ── 【防爆盾 2】项目已彻底肃清 Unsloth ──
-# Unsloth 即使局部导入 (from unsloth.kernels...) 也会触发全局 monkey-patch,
-# 导致 grad checkpoint 在 forward/recompute 间张量数不一致 (68≠65) → CheckpointError.
-# 现在全项目 0 处 unsloth 引用 — 纯 PyTorch F.cross_entropy + bs=1/grad_accum=16.
-# 模型加载走原生 HF + SDPA → 2-3s/step.
-
+# ══ 以下 import 在 setup_env() 之后, 确保环境变量已生效 ══
 import yaml
 import argparse
 import logging
-from pathlib import Path
 from typing import Dict, Optional
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-
-# ── 【防爆盾 3】代码级物理超度 FlexAttention ──
-import torch._inductor.config as inductor_config
-if hasattr(inductor_config, "flex_attention"):
-    inductor_config.flex_attention = False
-if hasattr(inductor_config, "use_flex_attention"):
-    inductor_config.use_flex_attention = False
 
 from transformers import (
     get_cosine_schedule_with_warmup,
@@ -82,9 +53,6 @@ from transformers import (
 from accelerate import Accelerator
 from tqdm import tqdm
 import shutil
-
-# 添加项目路径
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.model import Gemma3ISAC, UAVISACLosses
 from src.data.dataset import SFTDataset
