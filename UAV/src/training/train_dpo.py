@@ -50,7 +50,7 @@ import yaml
 import argparse
 import logging
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 
 import torch
 from torch.utils.checkpoint import checkpoint as _grad_ckpt
@@ -66,7 +66,6 @@ if hasattr(inductor_config, "use_flex_attention"):
 from transformers import get_cosine_schedule_with_warmup, set_seed
 from accelerate import Accelerator
 from tqdm import tqdm
-import json
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -190,6 +189,9 @@ def train_stage2(
             "v_max_dt": sim_cfg["uav_max_speed_ms"] * sim_cfg["slot_duration_s"],
             "p_max": 10 ** ((sim_cfg["p_max_dbm"] - 30) / 10),
             "K_max": sim_cfg["load_cap_per_uav"],
+            "tau_power": model_cfg["projection_head"]["tau_power"],
+            "tau_assoc": model_cfg["projection_head"]["tau_assoc"],
+            "sinkhorn_iters": model_cfg["projection_head"]["sinkhorn_iters"],
         },
         attn_implementation=model_cfg.get("attn_implementation", "flash_attention_2"),
     )
@@ -220,6 +222,9 @@ def train_stage2(
             "v_max_dt": sim_cfg["uav_max_speed_ms"] * sim_cfg["slot_duration_s"],
             "p_max": 10 ** ((sim_cfg["p_max_dbm"] - 30) / 10),
             "K_max": sim_cfg["load_cap_per_uav"],
+            "tau_power": model_cfg["projection_head"]["tau_power"],
+            "tau_assoc": model_cfg["projection_head"]["tau_assoc"],
+            "sinkhorn_iters": model_cfg["projection_head"]["sinkhorn_iters"],
         },
         attn_implementation=model_cfg.get("attn_implementation", "flash_attention_2"),
     )

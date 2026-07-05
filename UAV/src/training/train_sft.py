@@ -66,7 +66,6 @@ from pathlib import Path
 from typing import Dict, Optional
 
 import torch
-import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 # ── 【防爆盾 3】代码级物理超度 FlexAttention ──
@@ -82,7 +81,6 @@ from transformers import (
 )
 from accelerate import Accelerator
 from tqdm import tqdm
-import json
 import shutil
 
 # 添加项目路径

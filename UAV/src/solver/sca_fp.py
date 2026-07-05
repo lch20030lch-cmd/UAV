@@ -558,16 +558,3 @@ class SCAFPOptimizer:
 
         return float(utility)
 
-    def compute_utility_from_solution(
-        self, sol: SCAFPSolution, env: Dict
-    ) -> float:
-        """对已有解重新计算效用 (用于 DPO 排序)"""
-        return self._compute_utility(
-            sol.Q,
-            sol.A,
-            sol.W_c_power,
-            sol.W_s_power,
-            env.get("channel_gains", np.ones((self.M, self.K))),
-            env.get("target_positions", np.zeros((self.T, 2))),
-            env.get("user_weights", np.ones(self.K)),
-        )

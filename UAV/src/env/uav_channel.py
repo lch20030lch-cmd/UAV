@@ -255,13 +255,3 @@ class ISACChannel:
         R_x += np.outer(sensing_beamformer, sensing_beamformer.conj())
         return R_x
 
-    def generate_random_beamformers(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        生成随机初始波束成形向量 (用于 SCA-FP 重启)
-
-        Returns:
-            comm_beamformers: (K, N_t)
-            sensing_beamformer: (N_t,)
-        """
-        # 注意: 实际中 K 是变化的, 这里只是接口
-        return None, None  # 由 ISACScenario 调用时提供实际 K
