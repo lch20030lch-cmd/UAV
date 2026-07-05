@@ -1,4 +1,4 @@
-from .gemma_isac import Gemma3ISAC
+from .gemma_isac import Gemma3ISAC, ensure_gc_and_freeze_lm_head
 from .projection_head import ConstraintProjectionHead
 from .losses import UAVISACLosses
 

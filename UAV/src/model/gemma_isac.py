@@ -28,6 +28,50 @@ from .projection_head import ConstraintProjectionHead
 from .losses import UAVISACLosses
 
 
+def ensure_gc_and_freeze_lm_head(peft_model):
+    """OOM6 防护: 强制启用 gradient checkpointing + 冻结 lm_head
+
+    原在 __init__ / from_pretrained / training resume 中有 3 处重复的
+    ~30 行 GC 验证 + lm_head 绑定检查/解绑逻辑, 现提取为此函数。
+
+    Args:
+        peft_model: PeftModel wrapping Gemma3ForCausalLM
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+
+    # 1) Gradient checkpointing — from_pretrained 不恢复 gc 设置
+    peft_model.gradient_checkpointing_enable()
+    try:
+        peft_model.model.model.gradient_checkpointing_enable()
+    except Exception:
+        pass
+    # 验证 gc 在底层 Gemma3Model 上生效; 若失败则直接设属性硬加固
+    transformer = peft_model.model.model
+    if not getattr(transformer, 'gradient_checkpointing', False):
+        _log.warning(
+            "GC NOT enabled on Gemma3Model after all enable() calls — "
+            "forcing via direct attr. Activations without GC consume ~60 GB."
+        )
+        transformer.gradient_checkpointing = True
+        if not hasattr(transformer, '_gradient_checkpointing_func') or \
+           transformer._gradient_checkpointing_func is None:
+            transformer._gradient_checkpointing_func = \
+                torch.utils.checkpoint.checkpoint
+
+    # 2) 冻结 lm_head (省 ~12 GB Adam m/v)
+    #    检查权重是否仍与 embed_tokens 绑定; 若绑定则 clone 解绑
+    causal_lm = peft_model.model       # PeftModel → Gemma3ForCausalLM
+    lm_head = causal_lm.lm_head
+    embed = causal_lm.get_input_embeddings()
+    if lm_head.weight.data_ptr() == embed.weight.data_ptr():
+        lm_head._parameters['weight'] = torch.nn.Parameter(
+            lm_head.weight.data.clone(), requires_grad=False
+        )
+    else:
+        lm_head.weight.requires_grad = False
+
+
 class Gemma3ISAC(nn.Module):
     """
     Gemma3 + LoRA + Control Token + Projection Head
@@ -158,29 +202,8 @@ class Gemma3ISAC(nn.Module):
 
         self.base_model = get_peft_model(self.base_model, peft_config)
 
-        # ═══════════════════════════════════════════════
-        # 共享: Gradient Checkpointing + lm_head 冻结 (OOM6 防护)
-        # ═══════════════════════════════════════════════
-        self.base_model.gradient_checkpointing_enable()
-        # gc 验证: 直接检查 Gemma3Model.gradient_checkpointing 属性
-        transformer = self.base_model.model.model
-        if not getattr(transformer, 'gradient_checkpointing', False):
-            import logging
-            _log = logging.getLogger(__name__)
-            _log.warning("GC not enabled on Gemma3Model after enable() — forcing")
-            transformer.gradient_checkpointing_enable()
-        # 冻结 lm_head: CE 梯度通过 frozen lm_head 回传到 hidden_states → LoRA
-        # 若 tie_word_embeddings 仍生效 → clone 解绑以免影响 embed_tokens 训练
-        causal_lm = self.base_model.model
-        lm_head = causal_lm.lm_head
-        embed = causal_lm.get_input_embeddings()
-        if lm_head.weight.data_ptr() == embed.weight.data_ptr():
-            # 权重重绑 → clone 解绑 + 冻结
-            lm_head._parameters['weight'] = torch.nn.Parameter(
-                lm_head.weight.data.clone(), requires_grad=False
-            )
-        else:
-            lm_head.weight.requires_grad = False
+        # OOM6 防护: GC + lm_head 冻结
+        ensure_gc_and_freeze_lm_head(self.base_model)
 
         # ---- Projection Head ----
         if proj_head_config is None:
@@ -535,42 +558,8 @@ class Gemma3ISAC(nn.Module):
             )
             base_model = get_peft_model(base_model, peft_config)
 
-        # ═══════════════════════════════════════════════
-        # 共享: GC + lm_head 冻结 (OOM6 防护)
-        # ═══════════════════════════════════════════════
-        # 1) Gradient checkpointing (from_pretrained 不恢复 gc 设置)
-        base_model.gradient_checkpointing_enable()
-        try:
-            base_model.model.model.gradient_checkpointing_enable()
-        except Exception:
-            pass
-        # 验证 gc 在底层 Gemma3Model 上生效; 若失败则直接设属性硬加固
-        transformer = base_model.model.model
-        if not getattr(transformer, 'gradient_checkpointing', False):
-            import logging
-            _log = logging.getLogger(__name__)
-            _log.warning(
-                "GC NOT enabled on Gemma3Model after all enable() calls — "
-                "forcing via direct attr. Activations without GC consume ~60 GB."
-            )
-            transformer.gradient_checkpointing = True
-            if not hasattr(transformer, '_gradient_checkpointing_func') or \
-               transformer._gradient_checkpointing_func is None:
-                transformer._gradient_checkpointing_func = \
-                    torch.utils.checkpoint.checkpoint
-
-        # 2) 冻结 lm_head (省 ~12 GB Adam m/v)
-        #    检查权重是否仍与 embed_tokens 绑定; 若绑定则 clone 解绑
-        causal_lm = base_model.model  # PeftModel → Gemma3ForCausalLM
-        lm_head = causal_lm.lm_head
-        embed = causal_lm.get_input_embeddings()
-        if lm_head.weight.data_ptr() == embed.weight.data_ptr():
-            # 权重仍绑定 → clone 解绑, 新 tensor requires_grad=False
-            lm_head._parameters['weight'] = torch.nn.Parameter(
-                lm_head.weight.data.clone(), requires_grad=False
-            )
-        else:
-            lm_head.weight.requires_grad = False
+        # OOM6 防护: GC + lm_head 冻结
+        ensure_gc_and_freeze_lm_head(base_model)
 
         # ---- 恢复 Control Token Embedding (新格式: 单独保存的 8 行) ----
         # 新 save_pretrained 只保存 LoRA + ctrl_embed.pt, 不含完整 embed_tokens.

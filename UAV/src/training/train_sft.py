@@ -54,7 +54,7 @@ from accelerate import Accelerator
 from tqdm import tqdm
 import shutil
 
-from src.model import Gemma3ISAC, UAVISACLosses, build_proj_head_config
+from src.model import Gemma3ISAC, UAVISACLosses, build_proj_head_config, ensure_gc_and_freeze_lm_head
 from src.data.dataset import SFTDataset
 
 
@@ -153,52 +153,9 @@ def train_stage1(config_path: str, data_dir: Optional[str] = None, resume_from: 
         )
         model = model.to("cuda")
         model.train()
-        # ══ OOM #6 防御: gc + lm_head 冻结 ══
-        model.base_model.gradient_checkpointing_enable()
-        try:
-            model.base_model.model.model.gradient_checkpointing_enable()
-        except Exception:
-            pass
-        # gc 验证 + 硬加固 (直接设底层 Gemma3Model 属性)
-        transformer = model.base_model.model.model  # Gemma3Model
-        gc_ok = getattr(transformer, 'gradient_checkpointing', False)
-        if not gc_ok:
-            logger.warning(
-                "GC NOT enabled on Gemma3Model after all enable() calls — "
-                "forcing via direct attr. Without GC activations consume ~60 GB → OOM."
-            )
-            transformer.gradient_checkpointing = True
-            if not hasattr(transformer, '_gradient_checkpointing_func') or \
-               transformer._gradient_checkpointing_func is None:
-                transformer._gradient_checkpointing_func = \
-                    torch.utils.checkpoint.checkpoint
-            gc_ok = getattr(transformer, 'gradient_checkpointing', False)
-        if not gc_ok:
-            logger.critical(
-                "FATAL: Cannot enable gradient checkpointing on Gemma3Model. "
-                "Activations ~60 GB → OOM at ~94 GB. "
-                "Fallback: reduce per_device_batch_size to 1, set grad_accum to 16."
-            )
-        # lm_head 冻结: 检查权重绑定状态, 若仍绑定则 clone 解绑
-        causal_lm = model.base_model.model  # PeftModel → Gemma3ForCausalLM
-        lm_head = causal_lm.lm_head
-        embed = causal_lm.get_input_embeddings()
-        if lm_head.weight.data_ptr() == embed.weight.data_ptr():
-            # 权重仍绑定 → clone 解绑 + 冻结
-            lm_head._parameters['weight'] = torch.nn.Parameter(
-                lm_head.weight.data.clone(), requires_grad=False
-            )
-        else:
-            lm_head.weight.requires_grad = False
-        tied_ok = (
-            causal_lm.lm_head.weight.data_ptr()
-            == causal_lm.get_input_embeddings().weight.data_ptr()
-        )
-        logger.info(
-            f"OOM6 guards: gc={'✓' if gc_ok else '✗ FAILED'}, "
-            f"tied={'✓' if tied_ok else '✗ (untied to protect embed_tokens)'}, "
-            f"lm_head_grad={causal_lm.lm_head.weight.requires_grad}"
-        )
+        # OOM6 防护: GC + lm_head 冻结
+        ensure_gc_and_freeze_lm_head(model.base_model)
+        logger.info("OOM6 guards applied: GC + lm_head frozen")
         # Force-skip Phase 1: 模型已完成 CTL-only 预训练
         train_cfg["phase1"] = {"enabled": False}
     else:
