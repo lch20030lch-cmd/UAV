@@ -27,7 +27,7 @@ import multiprocessing as mp
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.model import Gemma3ISAC
+from src.model import Gemma3ISAC, build_proj_head_config
 from src.solver import SCAFPOptimizer, SCAFPConfig
 from src.env import ISACScenarioGenerator
 from src.data.prompt_builder import build_full_prompt
@@ -246,19 +246,7 @@ def run_evaluation(
             lora_rank=model_cfg["lora"]["rank"],
             lora_alpha=model_cfg["lora"]["alpha"],
             num_control_tokens=model_cfg["control_token"]["num_tokens"],
-            proj_head_config={
-                "hidden_dim": model_cfg["control_token"]["hidden_dim"],
-                "num_control_tokens": model_cfg["control_token"]["num_tokens"],
-                "M": sim_cfg["num_uavs"],
-                "K": sim_cfg["num_users"],
-                "area_w": sim_cfg["area_size"][0],
-                "area_h": sim_cfg["area_size"][1],
-                "h_min": sim_cfg["altitude_min_m"],
-                "h_max": sim_cfg["altitude_max_m"],
-                "v_max_dt": sim_cfg["uav_max_speed_ms"] * sim_cfg["slot_duration_s"],
-                "p_max": 10 ** ((sim_cfg["p_max_dbm"] - 30) / 10),
-                "K_max": sim_cfg["load_cap_per_uav"],
-            },
+            proj_head_config=build_proj_head_config(model_cfg, sim_cfg),
         )
         model = model.to("cuda")
         model.eval()

@@ -54,7 +54,7 @@ from accelerate import Accelerator
 from tqdm import tqdm
 import shutil
 
-from src.model import Gemma3ISAC, UAVISACLosses
+from src.model import Gemma3ISAC, UAVISACLosses, build_proj_head_config
 from src.data.dataset import SFTDataset
 
 
@@ -132,25 +132,7 @@ def train_stage1(config_path: str, data_dir: Optional[str] = None, resume_from: 
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
 
-    # ---- Proj head config (shared by init / resume paths) ----
-    _proj_head_cfg = {
-        "hidden_dim": model_cfg["control_token"]["hidden_dim"],
-        "num_control_tokens": model_cfg["control_token"]["num_tokens"],
-        "mlp_hidden": model_cfg["projection_head"]["mlp_hidden"],
-        "readout_out_dim": model_cfg["projection_head"]["readout_out_dim"],
-        "M": sim_cfg["num_uavs"],
-        "K": sim_cfg["num_users"],
-        "area_w": sim_cfg["area_size"][0],
-        "area_h": sim_cfg["area_size"][1],
-        "h_min": sim_cfg["altitude_min_m"],
-        "h_max": sim_cfg["altitude_max_m"],
-        "v_max_dt": sim_cfg["uav_max_speed_ms"] * sim_cfg["slot_duration_s"],
-        "p_max": 10 ** ((sim_cfg["p_max_dbm"] - 30) / 10),
-        "K_max": sim_cfg["load_cap_per_uav"],
-        "tau_power": model_cfg["projection_head"]["tau_power"],
-        "tau_assoc": model_cfg["projection_head"]["tau_assoc"],
-        "sinkhorn_iters": model_cfg["projection_head"]["sinkhorn_iters"],
-    }
+    proj_head_cfg = build_proj_head_config(model_cfg, sim_cfg)
 
     # ---- 初始化模型 (fresh / resume) ----
     if resume_from:
@@ -167,7 +149,7 @@ def train_stage1(config_path: str, data_dir: Optional[str] = None, resume_from: 
             num_control_tokens=model_cfg["control_token"]["num_tokens"],
             torch_dtype=torch.bfloat16,
             attn_implementation=model_cfg.get("attn_implementation", "flash_attention_2"),
-            proj_head_config=_proj_head_cfg,
+            proj_head_config=proj_head_cfg,
         )
         model = model.to("cuda")
         model.train()
@@ -229,7 +211,7 @@ def train_stage1(config_path: str, data_dir: Optional[str] = None, resume_from: 
             lora_dropout=model_cfg["lora"]["dropout"],
             lora_target_modules=model_cfg["lora"]["target_modules"],
             num_control_tokens=model_cfg["control_token"]["num_tokens"],
-            proj_head_config=_proj_head_cfg,
+            proj_head_config=proj_head_cfg,
             attn_implementation=model_cfg.get("attn_implementation", "flash_attention_2"),
         )
 
