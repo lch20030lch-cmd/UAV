@@ -7,7 +7,8 @@ last_updated: 2026-07-02
 
 # UAV-ISAC-MLLM — Documentation
 
-**目标**: 用 Gemma 3 12B (LoRA + 约束投影头) 为 UAV-ISAC 的 SCA-FP 数值优化器提供智能热启动。
+**目标**: 用 Gemma 3 4B (LoRA + 约束投影头) 为 UAV-ISAC 的 SCA-FP 数值优化器提供智能热启动。
+**硬件**: RTX PRO 6000 96GB (bf16) / RTX 5090 32GB (4-bit QLoRA)。
 
 ## 快速导航
 
@@ -33,7 +34,9 @@ docs/
 │   ├── status.md                          当前状态、blocker、下一步
 │   ├── onboarding.md                      新成员接手文档
 │   ├── quickstart.md                      Zero-to-running 操作指南
-│   └── canonical_config.md                Blessed 配置 + server 命令
+│   ├── canonical_config.md                Blessed 配置 + server 命令
+│   ├── server_ops.md                      服务器运维速查
+│   └── training_monitoring.md             训练监控指南 — 如何判断训练是否正常
 │
 ├── 01_architecture/                       稳定技术参考
 │   ├── problem_formulation.md             UAV-ISAC 数学、系统模型
@@ -83,6 +86,9 @@ docs/
 │   ├── bug_postmortem_template.md
 │   └── archive_rules.md
 │
+├── 08_logs/                                ★ 运行日志 (smoke test / deployment log)
+│   └── rtx5090_smoke_test_2026-07-04.md   RTX 5090 32GB Smoke Test 完整记录
+│
 └── 99_archive/                            已废弃 / 历史参考
     ├── README.md
     ├── data_validation_v1.md              旧版数据验证 (已作废)
@@ -122,4 +128,5 @@ docs/
 | **Data** | `05_data/` | "数据长什么样？怎么生成？" |
 | **Decisions** | `06_decisions/` | "关键决策是什么？为什么？" |
 | **Conventions** | `07_conventions/` | "怎么维护这些文档？" |
+| **Logs** | `08_logs/` | "某次部署/测试发生了什么？" |
 | **Archive** | `99_archive/` | "历史上还有什么？" |
