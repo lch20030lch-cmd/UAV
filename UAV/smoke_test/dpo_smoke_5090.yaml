@@ -1,0 +1,141 @@
+# ==========================================================================
+# DPO smoke test config for RTX 5090 32GB
+#
+# Purpose:
+#   Verify that Stage II DPO can load the SFT checkpoint, fit in VRAM, run
+#   backward, log finite losses, and save a final adapter before launching the
+#   full DPO run.
+#
+# Notes:
+#   - This file intentionally keeps the RTX 5090-safe DPO knobs:
+#       use_4bit=true, batch=1, grad_accum=16, max_seq_length=1536, mu=0.0
+#   - The smoke dataset is created by smoke_test/run_dpo_smoke.sh.
+#   - Outputs are isolated under dpo_smoke paths.
+# ==========================================================================
+
+hardware:
+  gpu: "RTX 5090"
+  vram_gb: 32
+  use_4bit: true
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+
+training:
+  seed: 42
+
+  sft:
+    epochs: 3
+    per_device_batch_size: 1
+    gradient_accumulation_steps: 16
+    learning_rate: 2.0e-4
+    lr_scheduler: "cosine"
+    warmup_ratio: 0.03
+    weight_decay: 0.01
+    max_seq_length: 3456
+    save_steps: 100
+    save_total_limit: 3
+    save_full_state: true
+    logging_steps: 10
+
+    phase1:
+      enabled: true
+      lr_lora: 5.0e-4
+      lambda_ctl: 1.0
+      sensitivity_check_steps: 50
+      sensitivity_threshold: 0.1
+      max_steps: 250
+
+  dpo:
+    epochs: 1
+    per_device_batch_size: 1
+    gradient_accumulation_steps: 16
+    learning_rate: 5.0e-5
+    lr_scheduler: "cosine"
+    warmup_ratio: 0.03
+    beta: 0.1
+    mu: 0.0
+    max_seq_length: 1536
+    save_steps: 10
+    logging_steps: 1
+
+model:
+  backbone: "google/gemma-3-4b-it"
+  use_multimodal: false
+  torch_dtype: "bfloat16"
+  attn_implementation: "sdpa"
+
+  lora:
+    rank: 16
+    alpha: 32
+    dropout: 0
+    target_modules:
+      - "q_proj"
+      - "k_proj"
+      - "v_proj"
+      - "o_proj"
+
+  control_token:
+    num_tokens: 8
+    hidden_dim: 2560
+
+  projection_head:
+    hidden_dim: 2560
+    mlp_hidden: [256, 256]
+    readout_out_dim: 128
+    tau_power: 0.5
+    tau_assoc: 0.5
+    sinkhorn_iters: 20
+
+  loss:
+    lambda_ctl: 0.5
+    lambda_q: 1.0
+    lambda_a: 0.5
+    lambda_p: 0.3
+    lambda_sep: 0.1
+
+simulation:
+  area_size: [1000, 1000]
+  num_uavs: 4
+  num_users: 20
+  num_targets: 6
+  num_antennas_tx: 8
+  num_antennas_rx: 8
+  carrier_freq_ghz: 5.8
+  bandwidth_mhz: 20
+  p_max_dbm: 30
+  noise_figure_db: 9
+  altitude_min_m: 50
+  altitude_max_m: 300
+  uav_min_separation_m: 10
+  uav_max_speed_ms: 15
+  slot_duration_s: 1.0
+  sinr_c_min_db: 0
+  sinr_s_min_db: 10
+  rate_min_bps: 1e6
+  load_cap_per_uav: 10
+
+data:
+  num_environments: 160
+  num_restarts: 10
+  pair_margin_rho: 0.2
+  dpo_min_pairs_per_sample: 2
+
+  modalities:
+    use_comm_summary: true
+    use_sensing_summary: true
+    use_bev_text_grid: true
+    use_bev_image: false
+
+  output_dir: "/root/autodl-tmp/data/dpo_smoke"
+  sft_file: "sft_dataset.jsonl"
+  dpo_file: "dpo_dataset.jsonl"
+
+eval:
+  num_test_environments: 20
+  baseline_list:
+    - "sft_only"
+    - "dpo_only"
+
+output_dir: "/root/autodl-tmp/outputs/dpo_smoke"
+checkpoint_dir: "/root/autodl-tmp/checkpoints/dpo_smoke"
+log_dir: "/root/autodl-tmp/logs/dpo_smoke"
