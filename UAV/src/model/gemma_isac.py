@@ -199,6 +199,7 @@ class Gemma3ISAC(nn.Module):
         attention_mask: torch.Tensor,
         control_mask: Optional[torch.Tensor] = None,
         q_current: Optional[torch.Tensor] = None,
+        compute_logits: bool = True,
         labels: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -237,7 +238,7 @@ class Gemma3ISAC(nn.Module):
             return_dict=True,
         )
         hidden_states = transformer_out.last_hidden_state  # (B, seq_len, hidden_dim)
-        logits = lm_head(hidden_states)          # 保持 bf16, 不产生 fp32 副本
+        logits = lm_head(hidden_states) if compute_logits else None          # Phase 1 跳过 lm_head 省 2.5GB
 
         # 提取控制 token 的 hidden states
         if control_mask is not None:

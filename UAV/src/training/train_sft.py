@@ -429,15 +429,15 @@ def train_stage1(config_path: str, data_dir: Optional[str] = None, resume_from: 
                 batch = next(phase1_iter)
 
             with accelerator.accumulate(model):
-                # 前向传播 (logits 也在计算，但 Phase 1 不使用)
+                # 前向传播 (Phase 1 跳过 lm_head 省 2.5GB)
                 outputs = model(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
                     control_mask=batch["control_mask"],
                     q_current=batch["q_current"] if batch["has_q_current"].all() else None,
                     labels=batch["labels"],
+                    compute_logits=False,
                 )
-
                 delta_target = {
                     "delta_q": batch["delta_q_target"],
                     "delta_a": batch["delta_a_target"],
