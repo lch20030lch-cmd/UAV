@@ -39,6 +39,7 @@ class UAVISACLosses:
         lambda_p: float = 0.3,
         lambda_sep: float = 0.1,
         lambda_assoc_ce: float = 0.0,
+        lambda_assoc_raw_ce: float = 0.0,
         dpo_beta: float = 0.1,
         sft_anchor_mu: float = 0.05,
     ):
@@ -48,6 +49,7 @@ class UAVISACLosses:
         self.lambda_p = lambda_p
         self.lambda_sep = lambda_sep
         self.lambda_assoc_ce = lambda_assoc_ce
+        self.lambda_assoc_raw_ce = lambda_assoc_raw_ce
         self.dpo_beta = dpo_beta
         self.sft_anchor_mu = sft_anchor_mu
 
@@ -67,6 +69,23 @@ class UAVISACLosses:
         target_idx = torch.argmax(delta_a_target, dim=1).contiguous()  # (B, K)
         return F.nll_loss(
             torch.log(pred).view(-1, pred.shape[-1]),
+            target_idx.view(-1),
+        )
+
+    def compute_association_raw_ce_loss(
+        self,
+        delta_a_raw: torch.Tensor,
+        delta_a_target: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        直接对 projection head 输出的 association logits 计算分类损失。
+
+        该项绕开 Sinkhorn/概率投影，专门检查 readout 是否能学出正确排序。
+        """
+        logits = delta_a_raw.permute(0, 2, 1).contiguous()  # (B, K, M)
+        target_idx = torch.argmax(delta_a_target, dim=1).contiguous()  # (B, K)
+        return F.cross_entropy(
+            logits.view(-1, logits.shape[-1]),
             target_idx.view(-1),
         )
 
@@ -102,6 +121,11 @@ class UAVISACLosses:
 
         # 可选辅助项: 按用户做 UAV 分类，专门约束 association argmax。
         loss_a_ce = self.compute_association_ce_loss(da_hat, da_tgt)
+        if "delta_a_raw" in delta_hat:
+            da_raw = delta_hat["delta_a_raw"].to(dtype=common_dtype)
+            loss_a_raw_ce = self.compute_association_raw_ce_loss(da_raw, da_tgt)
+        else:
+            loss_a_raw_ce = da_hat.new_tensor(0.0)
 
         # 功率 loss (MSE)
         loss_p = F.mse_loss(dp_hat, dp_tgt)
@@ -111,6 +135,7 @@ class UAVISACLosses:
             + self.lambda_a * loss_a
             + self.lambda_p * loss_p
             + self.lambda_assoc_ce * loss_a_ce
+            + self.lambda_assoc_raw_ce * loss_a_raw_ce
         )
 
         if return_components:
@@ -118,6 +143,7 @@ class UAVISACLosses:
                 "loss_q": loss_q,
                 "loss_a_bce": loss_a,
                 "loss_a_ce": loss_a_ce,
+                "loss_a_raw_ce": loss_a_raw_ce,
                 "loss_p": loss_p,
             }
         return total
@@ -255,8 +281,10 @@ class UAVISACLosses:
             "loss_q": ctl_parts["loss_q"].item(),
             "loss_a_bce": ctl_parts["loss_a_bce"].item(),
             "loss_a_ce": ctl_parts["loss_a_ce"].item(),
+            "loss_a_raw_ce": ctl_parts["loss_a_raw_ce"].item(),
             "loss_p": ctl_parts["loss_p"].item(),
             "lambda_assoc_ce": self.lambda_assoc_ce,
+            "lambda_assoc_raw_ce": self.lambda_assoc_raw_ce,
         }
         return total, metrics
 

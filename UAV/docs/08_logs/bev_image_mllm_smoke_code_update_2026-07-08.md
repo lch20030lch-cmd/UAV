@@ -1293,3 +1293,81 @@ delta_a_raw_entropy_mean
 control_states_per_dim_std_mean
 delta_raw_per_dim_std_mean
 ```
+
+control state / raw 诊断结果：
+
+```text
+delta_a_argmax_unique_per_user_mean: 1.05
+delta_a_argmax_fixed_user_count: 19
+delta_a_raw_per_dim_std_mean: 0.011296105571091175
+delta_a_raw_argmax_unique_per_user_mean: 1.05
+delta_a_raw_argmax_fixed_user_count: 19
+delta_a_raw_entropy_mean: 0.5396403615897059
+control_states_per_dim_std_mean: 0.4083298146724701
+control_states_per_dim_std_max: 4.742098808288574
+delta_raw_per_dim_std_mean: 0.011130240745842457
+delta_raw_per_dim_std_max: 0.03166813403367996
+```
+
+判断：
+
+```text
+control_states 跨样本方差很大，说明多模态 backbone/control token 表示中确实有样本差异。
+但 delta_raw 与 delta_a_raw 跨样本方差很小，且 delta_a_raw argmax 已经近乎固定。
+因此问题不在 Sinkhorn/AssociationProjection，而在 projection head/readout 没有把 control_states 的差异读到 association logits。
+```
+
+本轮代码更新：
+
+```text
+src/model/losses.py
+  - 新增 compute_association_raw_ce_loss。
+  - 新增 lambda_assoc_raw_ce。
+  - 直接对 delta_a_raw logits 做按用户分类 CE，绕开 Sinkhorn/概率投影。
+
+src/training/train_sft_mm.py
+  - 新增 --lambda_assoc_raw_ce。
+  - 训练日志新增 loss_a_raw_ce。
+```
+
+下一步建议命令：
+
+```bash
+python src/training/train_sft_mm.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --max_steps 30 \
+  --max_length 3072 \
+  --output_dir /root/autodl-tmp/outputs/mm_smoke_lora_assoc_raw_ce_30step \
+  --train_lora \
+  --lambda_q 0 \
+  --lambda_a 0 \
+  --lambda_p 0 \
+  --lambda_assoc_ce 0 \
+  --lambda_assoc_raw_ce 1.0
+```
+
+诊断命令：
+
+```bash
+python scripts/analyze_mm_delta_outputs.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --checkpoint /root/autodl-tmp/outputs/mm_smoke_lora_assoc_raw_ce_30step/mm_sft_lora_smoke_final \
+  --name mm_sft_lora_assoc_raw_ce_30step \
+  --num_samples 20 \
+  --max_length 3072 \
+  --output /root/autodl-tmp/outputs/mm_smoke_lora_assoc_raw_ce_30step/delta_diag_mm_sft_lora_assoc_raw_ce_30step.json \
+  --save_raw
+```
+
+验收重点：
+
+```text
+loss_a_raw_ce 是否下降。
+delta_a_raw_argmax_unique_per_user_mean 是否明显高于 1.05。
+delta_a_argmax_unique_per_user_mean 是否随 raw logits 改善。
+如果 raw CE 仍不改善，则需要改 projection head/readout 结构或训练策略。
+```

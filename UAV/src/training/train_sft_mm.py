@@ -79,6 +79,7 @@ def train_mm_sft_smoke(
     lambda_q: float = None,
     lambda_a: float = None,
     lambda_p: float = None,
+    lambda_assoc_raw_ce: float = None,
 ):
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -151,6 +152,11 @@ def train_mm_sft_smoke(
         if lambda_assoc_ce is not None
         else float(train_cfg.get("phase1", {}).get("lambda_assoc_ce", 0.0))
     )
+    assoc_raw_ce_weight = (
+        float(lambda_assoc_raw_ce)
+        if lambda_assoc_raw_ce is not None
+        else float(train_cfg.get("phase1", {}).get("lambda_assoc_raw_ce", 0.0))
+    )
     lambda_q_value = float(lambda_q) if lambda_q is not None else float(model_cfg["loss"]["lambda_q"])
     lambda_a_value = float(lambda_a) if lambda_a is not None else float(model_cfg["loss"]["lambda_a"])
     lambda_p_value = float(lambda_p) if lambda_p is not None else float(model_cfg["loss"]["lambda_p"])
@@ -161,6 +167,7 @@ def train_mm_sft_smoke(
         lambda_p=lambda_p_value,
         lambda_sep=model_cfg["loss"]["lambda_sep"],
         lambda_assoc_ce=assoc_ce_weight,
+        lambda_assoc_raw_ce=assoc_raw_ce_weight,
     )
     # 默认只训练投影头；传入 --train_lora 时，PEFT 会额外打开 LoRA 参数。
     proj_params = [p for p in model.projection_head.parameters() if p.requires_grad]
@@ -186,6 +193,7 @@ def train_mm_sft_smoke(
     print(f"  LoRA lr:                      {lora_lr if train_lora else 0.0}")
     print(f"  lambda_q/a/p:                 {lambda_q_value} / {lambda_a_value} / {lambda_p_value}")
     print(f"  association CE weight:        {assoc_ce_weight}")
+    print(f"  association raw CE weight:    {assoc_raw_ce_weight}")
 
     device = model.device
     global_step = 0
@@ -218,6 +226,8 @@ def train_mm_sft_smoke(
                 "delta_a": outputs["delta_a"],
                 "delta_p": outputs["delta_p"],
             }
+            if "delta_a_raw" in outputs:
+                delta_hat["delta_a_raw"] = outputs["delta_a_raw"]
             delta_target = {
                 "delta_q": batch["delta_q_target"],
                 "delta_a": batch["delta_a_target"],
@@ -244,6 +254,7 @@ def train_mm_sft_smoke(
                 f"loss_ctl={metrics['loss_ctl']:.6f} "
                 f"loss_total={metrics['loss_total']:.6f} "
                 f"loss_a_ce={metrics['loss_a_ce']:.6f} "
+                f"loss_a_raw_ce={metrics['loss_a_raw_ce']:.6f} "
                 f"grad_norm_proj={grad_norm:.6f} "
                 f"grad_norm_lora={grad_norm_lora:.6f}"
             )
@@ -270,6 +281,7 @@ def train_mm_sft_smoke(
                         "lambda_a": lambda_a_value,
                         "lambda_p": lambda_p_value,
                         "lambda_assoc_ce": assoc_ce_weight,
+                        "lambda_assoc_raw_ce": assoc_raw_ce_weight,
                     },
                     save_lora=train_lora,
                 )
@@ -293,6 +305,7 @@ def train_mm_sft_smoke(
             "lambda_a": lambda_a_value,
             "lambda_p": lambda_p_value,
             "lambda_assoc_ce": assoc_ce_weight,
+            "lambda_assoc_raw_ce": assoc_raw_ce_weight,
         },
         save_lora=train_lora,
     )
@@ -312,6 +325,8 @@ if __name__ == "__main__":
     parser.add_argument("--train_lora", action="store_true")
     parser.add_argument("--lambda_assoc_ce", type=float, default=None,
                         help="可选 association 分类辅助损失权重，默认使用配置或 0")
+    parser.add_argument("--lambda_assoc_raw_ce", type=float, default=None,
+                        help="可选 raw association logits 分类辅助损失权重，默认使用配置或 0")
     parser.add_argument("--lambda_q", type=float, default=None,
                         help="可选 delta_q 损失权重覆盖值")
     parser.add_argument("--lambda_a", type=float, default=None,
@@ -332,4 +347,5 @@ if __name__ == "__main__":
         lambda_q=args.lambda_q,
         lambda_a=args.lambda_a,
         lambda_p=args.lambda_p,
+        lambda_assoc_raw_ce=args.lambda_assoc_raw_ce,
     )
