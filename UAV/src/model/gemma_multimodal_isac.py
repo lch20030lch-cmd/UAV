@@ -1,7 +1,7 @@
 """
-Gemma3 multimodal UAV-ISAC wrapper for BEV-image smoke.
+BEV-image 分支的 Gemma3 多模态 UAV-ISAC 模型封装。
 
-This is the minimal model-facing bridge for:
+这是当前最小可用的模型侧桥接层：
   prompt + image -> Gemma3ForConditionalGeneration -> control states
   -> ConstraintProjectionHead -> delta_q / delta_a / delta_p
 """
@@ -69,6 +69,7 @@ class Gemma3MultimodalISAC(nn.Module):
         )
 
         self.num_control_tokens = num_control_tokens
+        # 控制 token 只作为控制头读出的锚点，不参与普通自然语言生成目标。
         control_tokens = [f"<ctrl_{i}>" for i in range(num_control_tokens)]
         num_added = self.tokenizer.add_tokens(control_tokens, special_tokens=True)
         if num_added > 0:
@@ -77,6 +78,7 @@ class Gemma3MultimodalISAC(nn.Module):
 
         self.lora_enabled = enable_lora
         if enable_lora:
+            # LoRA 烟雾测试用于确认 backbone 可训练链路；默认训练仍保持只训练投影头。
             if lora_target_modules is None:
                 lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
             if use_4bit:
@@ -163,6 +165,7 @@ class Gemma3MultimodalISAC(nn.Module):
             "output_hidden_states": True,
             "use_cache": False,
             "return_dict": True,
+            # 烟雾测试阶段不使用 token-level CE，尽量少保留 logits 以降低显存峰值。
             "logits_to_keep": 1,
         }
         if token_type_ids is not None:

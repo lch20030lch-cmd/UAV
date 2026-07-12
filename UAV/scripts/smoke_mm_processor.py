@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 """
-Smoke test for multimodal processor inputs.
+多模态处理器输入烟雾测试。
 
-Checks:
-  - one JSONL sample can be read
-  - the BEV image path resolves and opens
-  - AutoProcessor can encode text + image
-  - control token ids can be appended and located by token id
+检查内容：
+  - 能读取一条 JSONL 样本
+  - 能解析并打开 BEV 图片路径
+  - AutoProcessor 能编码 text + image
+  - control token ids 能追加，并能按 token id 定位
 """
 
 import argparse
@@ -77,11 +77,11 @@ def _ensure_one_image_token(processor, prompt: str) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Smoke test multimodal processor")
+    parser = argparse.ArgumentParser(description="测试多模态 processor 输入")
     parser.add_argument("--config", type=str, default="configs/rtx5090_multimodal_smoke.yaml")
     parser.add_argument("--data_dir", type=str, default=None)
     parser.add_argument("--model", type=str, default=None,
-                        help="Override model.backbone from config")
+                        help="覆盖配置文件中的 model.backbone")
     parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--sample_index", type=int, default=0)
     args = parser.parse_args()
@@ -118,6 +118,7 @@ def main():
     if any(tid is None or tid == tokenizer.unk_token_id for tid in control_token_ids):
         raise ValueError("Control tokens were not registered correctly")
 
+    # Gemma3 处理器要求文本中恰好有一个图像占位符，否则文本/图像数量会不匹配。
     prompt = _ensure_one_image_token(processor, item["prompt"])
     encoded = _encode_text_image(processor, prompt, image, max_length)
     input_ids = encoded["input_ids"]

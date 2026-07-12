@@ -1,9 +1,10 @@
 """
-Multimodal datasets for BEV-image UAV-ISAC smoke and training.
+BEV 图像多模态数据集。
 
-The first target is SFT/forward smoke: prompt + BEV image are encoded by the
-model processor, then control tokens and response labels are appended in the
-same solver-facing format as the text-grid baseline.
+当前主要服务于 SFT / 前向传播烟雾测试：
+先用模型 processor 编码 prompt + BEV image，再追加 control tokens 和
+response labels。最终 batch 仍保持与 text-grid baseline 一致的
+solver-facing 字段，便于复用 projection head 与控制损失。
 """
 
 import json
@@ -16,6 +17,7 @@ from torch.utils.data import Dataset
 
 
 def get_image_token(processor) -> str:
+    # 不同 transformers 版本暴露的图像 token 名称不完全一致，这里集中做兼容。
     tokenizer = getattr(processor, "tokenizer", None)
     token = getattr(tokenizer, "boi_token", None) if tokenizer is not None else None
     if token is None and tokenizer is not None:
@@ -64,7 +66,7 @@ def _squeeze_batch(encoded: Dict) -> Dict:
 
 
 class MultimodalSFTDataset(Dataset):
-    """SFT-style dataset for prompt + BEV image + control-token forward."""
+    """用于 prompt + BEV image + control-token forward 的 SFT 风格数据集。"""
 
     def __init__(
         self,
@@ -104,6 +106,7 @@ class MultimodalSFTDataset(Dataset):
         image_path = self.data_dir / item["bev_image_path"]
         image = Image.open(image_path).convert("RGB")
 
+        # 先让官方 processor 处理 text + image，再把控制 token 和监督标签接到序列尾部。
         prompt = ensure_one_image_token(self.processor, item["prompt"])
         encoded = _encode_text_image(self.processor, prompt, image, self.max_length)
         encoded = _squeeze_batch(encoded)

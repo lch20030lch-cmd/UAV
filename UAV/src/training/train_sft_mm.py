@@ -1,15 +1,17 @@
 #!/usr/bin/env python
 """
-Multimodal SFT smoke for BEV-image Gemma3.
+BEV-image Gemma3 多模态 SFT 烟雾测试。
 
-This first smoke is intentionally conservative for RTX 5090 32GB:
-  - freeze the Gemma3 multimodal backbone
-  - train only the projection head
-  - optimize CTL loss only
+首版训练烟雾测试对 RTX 5090 32GB 保持保守：
+  - 默认冻结 Gemma3 多模态 backbone
+  - 默认只训练 projection head
+  - 默认只优化 CTL loss
 
-It verifies the trainable loop after the successful forward smoke:
+它用于在前向传播烟雾测试已通过后验证训练闭环：
   dataset -> multimodal forward -> projection head -> control loss
   -> backward -> optimizer step -> checkpoint
+
+如需测试 LoRA 链路，可显式传入 --train_lora。
 """
 
 import argparse
@@ -146,6 +148,7 @@ def train_mm_sft_smoke(
         lambda_p=model_cfg["loss"]["lambda_p"],
         lambda_sep=model_cfg["loss"]["lambda_sep"],
     )
+    # 默认只训练投影头；传入 --train_lora 时，PEFT 会额外打开 LoRA 参数。
     proj_params = [p for p in model.projection_head.parameters() if p.requires_grad]
     lora_params = [
         p for n, p in model.base_model.named_parameters()
@@ -185,6 +188,7 @@ def train_mm_sft_smoke(
                 }
             }
 
+            # 多模态 smoke 阶段只算控制损失，先确认 delta_q/a/p 的可训练闭环。
             outputs = model(**forward_keys)
             delta_hat = {
                 "delta_q": outputs["delta_q"],
@@ -258,7 +262,7 @@ def train_mm_sft_smoke(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run BEV-image multimodal SFT smoke")
+    parser = argparse.ArgumentParser(description="运行 BEV-image 多模态 SFT smoke")
     parser.add_argument("--config", type=str, default="configs/rtx5090_multimodal_smoke.yaml")
     parser.add_argument("--data_dir", type=str, default=None)
     parser.add_argument("--model", type=str, default=None)

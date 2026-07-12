@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """
-Delta-output diagnostics for BEV-image multimodal smoke checkpoints.
+BEV-image 多模态烟雾测试 checkpoint 的 delta 输出诊断脚本。
 
-This script runs the existing multimodal dataset/model forward path and
-summarizes delta_q / delta_a / delta_p diversity. It does not run SCA-FP.
+该脚本复用现有多模态数据集/模型前向传播路径，统计
+delta_q / delta_a / delta_p 的跨样本多样性。它不运行 SCA-FP，
+因此成本远低于完整评估。
 """
 
 import argparse
@@ -62,6 +63,7 @@ def _summarize_deltas(delta_q: np.ndarray, delta_a: np.ndarray, delta_p: np.ndar
     summary.update(_summarize_tensor("delta_a", delta_a))
     summary.update(_summarize_tensor("delta_p", delta_p))
 
+    # 关联矩阵的 argmax 如果长期不变，说明模型还没有学到“按场景换 UAV”的能力。
     assoc_choice = np.argmax(delta_a, axis=1)
     assoc_unique_counts = [
         int(np.unique(assoc_choice[:, k]).size)
@@ -159,13 +161,13 @@ def _collect_deltas(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze BEV-image multimodal delta outputs")
+    parser = argparse.ArgumentParser(description="分析 BEV-image 多模态 delta 输出")
     parser.add_argument("--config", type=str, default="configs/rtx5090_multimodal_smoke.yaml")
     parser.add_argument("--data_dir", type=str, default=None)
     parser.add_argument("--model", type=str, default=None,
-                        help="Override model.backbone from config")
+                        help="覆盖配置文件中的 model.backbone")
     parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Directory containing projection_head.pt, or the pt file itself")
+                        help="包含 projection_head.pt 的目录，或 projection_head.pt 文件本身")
     parser.add_argument("--name", type=str, default="mm_sft_smoke")
     parser.add_argument("--num_samples", type=int, default=20)
     parser.add_argument("--max_length", type=int, default=None)

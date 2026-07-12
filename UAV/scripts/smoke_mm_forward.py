@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """
-Single-batch BEV-image Gemma3 forward smoke.
+单 batch BEV-image Gemma3 前向传播烟雾测试。
 
-This verifies the minimal model-facing multimodal loop:
+用于验证最小模型侧多模态闭环：
   data + image -> processor/dataset -> Gemma3 multimodal forward
   -> control-token states -> projection head -> delta_q/a/p
 """
@@ -33,11 +33,11 @@ def _move_batch(batch, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run one multimodal model forward smoke")
+    parser = argparse.ArgumentParser(description="运行一次多模态模型 forward smoke")
     parser.add_argument("--config", type=str, default="configs/rtx5090_multimodal_smoke.yaml")
     parser.add_argument("--data_dir", type=str, default=None)
     parser.add_argument("--model", type=str, default=None,
-                        help="Override model.backbone from config")
+                        help="覆盖配置文件中的 model.backbone")
     parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--no_4bit", action="store_true")
     args = parser.parse_args()

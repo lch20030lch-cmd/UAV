@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 """
-Generate a small BEV-image multimodal smoke dataset.
+生成小规模 BEV-image 多模态烟雾测试数据集。
 
-This script is intentionally separate from scripts/generate_data.py so the
-existing text-grid baseline remains reproducible. It reuses the same scenario,
-SCA-FP solver, oracle prior extraction, and JSON response format, but writes a
-multimodal prompt plus a BEV PNG path for each sample.
+该脚本刻意独立于 scripts/generate_data.py，避免破坏既有 text-grid
+baseline 的可复现性。它复用同一套 scenario、SCA-FP solver、oracle prior
+提取逻辑和 JSON response 格式，但会额外为每条样本写入多模态 prompt
+以及 BEV PNG 的相对路径。
 """
 
 import argparse
@@ -176,7 +176,7 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate BEV-image MLLM smoke data")
+    parser = argparse.ArgumentParser(description="生成 BEV-image MLLM smoke 数据")
     parser.add_argument("--config", type=str, default="configs/rtx5090_multimodal_smoke.yaml")
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--num_samples", type=int, default=None)
@@ -217,11 +217,13 @@ def main():
             if path.exists():
                 path.unlink()
 
+    # 烟雾测试数据可能在服务器上被中断；按已写入的 SFT 行数断点续跑。
     start_id = _count_existing(sft_path)
     if start_id >= num_samples:
         print(f"All {num_samples} samples already exist at {output_dir}")
         return
 
+    # 复用 text-grid baseline 的场景生成器与 SCA-FP solver，保证两条路线可对照。
     scenario_gen = ISACScenarioGenerator(
         num_uavs=sim_cfg["num_uavs"],
         num_users=sim_cfg["num_users"],

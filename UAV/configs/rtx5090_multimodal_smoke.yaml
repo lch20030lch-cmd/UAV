@@ -1,7 +1,7 @@
 # ==========================================================================
-# Constraint-Aware MLLM for UAV-ISAC - RTX 5090 32GB multimodal smoke config
-# Goal: validate the BEV-image MLLM data/processor/forward/SFT loop, not final
-# training quality.
+# UAV-ISAC 约束感知 MLLM - RTX 5090 32GB 多模态烟雾测试配置
+# 目标：验证 BEV-image MLLM 的数据、处理器、前向传播、SFT 最小闭环，
+# 不以最终训练质量为判断标准。
 # ==========================================================================
 
 hardware:

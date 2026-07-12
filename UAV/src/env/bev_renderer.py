@@ -1,9 +1,9 @@
 """
-Bird's-eye-view image renderer for UAV-ISAC multimodal data.
+UAV-ISAC 多模态数据的 BEV 鸟瞰图渲染器。
 
-The renderer is intentionally simple and stable: it encodes geometry, not
-presentation. Images are square, use fixed axes, and avoid text-heavy legends so
-the vision model sees spatial relations rather than decorative labels.
+渲染逻辑刻意保持简单、稳定：图像用于表达空间几何关系，而不是做展示图。
+输出图像为正方形、坐标轴固定，并避免大段文字 legend，让视觉模型主要看到
+UAV、用户、目标之间的相对位置。
 """
 
 from pathlib import Path
@@ -29,23 +29,23 @@ def render_bev_image(
     draw_association: bool = True,
     draw_coverage: bool = True,
 ) -> str:
-    """Render UAV/user/target geometry to a BEV PNG.
+    """将 UAV / 用户 / 目标几何关系渲染为 BEV PNG。
 
     Args:
-        q_positions: UAV positions, shape (M, 3).
-        user_positions: Ground user positions, shape (K, 2).
-        target_positions: Target positions, shape (T, 2).
-        save_path: Output PNG path.
-        area_size: Service area width/height in meters.
-        association: Optional association matrix, shape (M, K).
-        target_detected: Optional bool mask for targets, shape (T,).
-        image_size: Output image width/height in pixels.
-        coverage_radius: Visual radius for UAV coverage circles.
-        draw_association: Whether to draw current association lines.
-        draw_coverage: Whether to draw UAV coverage circles.
+        q_positions: UAV 位置，shape (M, 3)。
+        user_positions: 地面用户位置，shape (K, 2)。
+        target_positions: 感知目标位置，shape (T, 2)。
+        save_path: 输出 PNG 路径。
+        area_size: 服务区域宽高，单位米。
+        association: 可选关联矩阵，shape (M, K)。
+        target_detected: 可选目标可见性 bool mask，shape (T,)。
+        image_size: 输出图片宽高，单位像素。
+        coverage_radius: UAV 覆盖圆的可视化半径。
+        draw_association: 是否绘制当前关联线。
+        draw_coverage: 是否绘制 UAV 覆盖圆。
 
     Returns:
-        The output path as a string.
+        输出路径字符串。
     """
     import matplotlib
 
@@ -175,7 +175,7 @@ def render_bev_sample(
     area_size: Tuple[float, float] = (1000.0, 1000.0),
     image_size: int = 224,
 ) -> str:
-    """Render an EnvironmentSample to a BEV PNG."""
+    """将 EnvironmentSample 渲染为 BEV PNG。"""
     return render_bev_image(
         q_positions=env_sample.q_current,
         user_positions=env_sample.u_positions,
