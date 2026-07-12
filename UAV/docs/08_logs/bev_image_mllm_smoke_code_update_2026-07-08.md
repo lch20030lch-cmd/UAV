@@ -1371,3 +1371,107 @@ delta_a_raw_argmax_unique_per_user_mean 是否明显高于 1.05。
 delta_a_argmax_unique_per_user_mean 是否随 raw logits 改善。
 如果 raw CE 仍不改善，则需要改 projection head/readout 结构或训练策略。
 ```
+
+raw association CE 30-step 结果：
+
+```text
+delta_q_per_dim_std_mean: 0.005730161443352699
+delta_a_per_dim_std_mean: 0.0018169686663895845
+delta_p_per_dim_std_mean: 0.000575612997636199
+delta_a_argmax_unique_per_user_mean: 1.05
+delta_a_argmax_fixed_user_count: 19
+delta_a_entropy_mean: 0.6776275186211648
+delta_a_raw_per_dim_std_mean: 0.00575209641829133
+delta_a_raw_argmax_unique_per_user_mean: 1.05
+delta_a_raw_argmax_fixed_user_count: 19
+delta_a_raw_entropy_mean: 0.5590596488995306
+control_states_per_dim_std_mean: 0.4287387728691101
+control_states_per_dim_std_max: 3.4438347816467285
+delta_raw_per_dim_std_mean: 0.005642589647322893
+delta_raw_per_dim_std_max: 0.014938068576157093
+warnings: ['delta_a_argmax_nearly_constant']
+```
+
+target-vs-pred：
+
+```text
+target_delta_a_argmax_unique_per_user_mean: 4.0
+target_delta_a_argmax_fixed_user_count: 0
+pred_delta_a_argmax_unique_per_user_mean: 1.05
+pred_delta_a_argmax_fixed_user_count: 19
+argmax_match_rate_mean: 0.3025
+argmax_match_rate_per_user_min: 0.15
+argmax_match_rate_per_user_max: 0.5
+```
+
+判断：
+
+```text
+直接监督 delta_a_raw 仍没有拉开 association argmax。
+control_states 跨样本方差仍然充足，但 delta_raw / delta_a_raw 方差进一步降低。
+30-step raw CE 不足以让 projection readout 学会 oracle association。
+下一步不应继续叠加 LoRA，而应先做 projection-head-only 小样本过拟合探针。
+```
+
+本轮代码更新：
+
+```text
+src/training/train_sft_mm.py
+  - 新增 --projection_lr。
+  - 新增 --lora_lr。
+  - 用于控制 projection head / LoRA 的学习率，不改变默认值。
+```
+
+下一步建议：projection-head-only association raw CE 过拟合探针。
+
+目的：
+
+```text
+冻结 backbone，不训练 LoRA。
+只训练 projection head。
+关闭 q/p/BCE，只保留 raw association CE。
+提高 projection head 学习率，增加步数，看 20 条样本能否被记住。
+```
+
+建议命令：
+
+```bash
+python src/training/train_sft_mm.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --max_steps 200 \
+  --max_length 3072 \
+  --output_dir /root/autodl-tmp/outputs/mm_smoke_proj_assoc_raw_ce_overfit \
+  --projection_lr 0.01 \
+  --lambda_q 0 \
+  --lambda_a 0 \
+  --lambda_p 0 \
+  --lambda_assoc_ce 0 \
+  --lambda_assoc_raw_ce 1.0
+```
+
+诊断命令：
+
+```bash
+python scripts/analyze_mm_delta_outputs.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --checkpoint /root/autodl-tmp/outputs/mm_smoke_proj_assoc_raw_ce_overfit/mm_sft_smoke_final \
+  --name mm_proj_assoc_raw_ce_overfit \
+  --num_samples 20 \
+  --max_length 3072 \
+  --output /root/autodl-tmp/outputs/mm_smoke_proj_assoc_raw_ce_overfit/delta_diag_mm_proj_assoc_raw_ce_overfit.json \
+  --save_raw
+```
+
+判读：
+
+```text
+如果 projection-only overfit 能显著提高 raw argmax 多样性/匹配率：
+  说明 head 有能力，LoRA 联合训练策略需要调整。
+
+如果 projection-only overfit 仍失败：
+  说明当前 projection head/readout 结构不适合 association，需要改结构，而不是继续调 loss。
+```

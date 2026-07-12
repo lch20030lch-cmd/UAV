@@ -80,6 +80,8 @@ def train_mm_sft_smoke(
     lambda_a: float = None,
     lambda_p: float = None,
     lambda_assoc_raw_ce: float = None,
+    projection_lr: float = None,
+    lora_lr_override: float = None,
 ):
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -175,8 +177,12 @@ def train_mm_sft_smoke(
         p for n, p in model.base_model.named_parameters()
         if p.requires_grad and "lora_" in n
     ]
-    proj_lr = 1e-3
-    lora_lr = train_cfg.get("phase1", {}).get("lr_lora", train_cfg.get("learning_rate", 2e-4))
+    proj_lr = float(projection_lr) if projection_lr is not None else 1e-3
+    lora_lr = (
+        float(lora_lr_override)
+        if lora_lr_override is not None
+        else train_cfg.get("phase1", {}).get("lr_lora", train_cfg.get("learning_rate", 2e-4))
+    )
     if train_lora and not lora_params:
         raise RuntimeError("已传入 --train_lora，但没有发现可训练的 LoRA 参数。")
 
@@ -333,6 +339,10 @@ if __name__ == "__main__":
                         help="可选 delta_a BCE 损失权重覆盖值")
     parser.add_argument("--lambda_p", type=float, default=None,
                         help="可选 delta_p 损失权重覆盖值")
+    parser.add_argument("--projection_lr", type=float, default=None,
+                        help="可选 projection head 学习率覆盖值")
+    parser.add_argument("--lora_lr", type=float, default=None,
+                        help="可选 LoRA 学习率覆盖值")
     args = parser.parse_args()
 
     train_mm_sft_smoke(
@@ -348,4 +358,6 @@ if __name__ == "__main__":
         lambda_a=args.lambda_a,
         lambda_p=args.lambda_p,
         lambda_assoc_raw_ce=args.lambda_assoc_raw_ce,
+        projection_lr=args.projection_lr,
+        lora_lr_override=args.lora_lr,
     )
