@@ -76,6 +76,9 @@ def train_mm_sft_smoke(
     output_dir: str = None,
     train_lora: bool = False,
     lambda_assoc_ce: float = None,
+    lambda_q: float = None,
+    lambda_a: float = None,
+    lambda_p: float = None,
 ):
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -148,11 +151,14 @@ def train_mm_sft_smoke(
         if lambda_assoc_ce is not None
         else float(train_cfg.get("phase1", {}).get("lambda_assoc_ce", 0.0))
     )
+    lambda_q_value = float(lambda_q) if lambda_q is not None else float(model_cfg["loss"]["lambda_q"])
+    lambda_a_value = float(lambda_a) if lambda_a is not None else float(model_cfg["loss"]["lambda_a"])
+    lambda_p_value = float(lambda_p) if lambda_p is not None else float(model_cfg["loss"]["lambda_p"])
     loss_fn = UAVISACLosses(
         lambda_ctl=model_cfg["loss"]["lambda_ctl"],
-        lambda_q=model_cfg["loss"]["lambda_q"],
-        lambda_a=model_cfg["loss"]["lambda_a"],
-        lambda_p=model_cfg["loss"]["lambda_p"],
+        lambda_q=lambda_q_value,
+        lambda_a=lambda_a_value,
+        lambda_p=lambda_p_value,
         lambda_sep=model_cfg["loss"]["lambda_sep"],
         lambda_assoc_ce=assoc_ce_weight,
     )
@@ -178,6 +184,7 @@ def train_mm_sft_smoke(
     print(f"  trainable LoRA tensors:       {len(lora_params)}")
     print(f"  projection lr:                {proj_lr}")
     print(f"  LoRA lr:                      {lora_lr if train_lora else 0.0}")
+    print(f"  lambda_q/a/p:                 {lambda_q_value} / {lambda_a_value} / {lambda_p_value}")
     print(f"  association CE weight:        {assoc_ce_weight}")
 
     device = model.device
@@ -259,6 +266,9 @@ def train_mm_sft_smoke(
                         "lora_lr": lora_lr if train_lora else 0.0,
                         "lora_rank": model_cfg["lora"]["rank"] if train_lora else 0,
                         "lora_alpha": model_cfg["lora"]["alpha"] if train_lora else 0,
+                        "lambda_q": lambda_q_value,
+                        "lambda_a": lambda_a_value,
+                        "lambda_p": lambda_p_value,
                         "lambda_assoc_ce": assoc_ce_weight,
                     },
                     save_lora=train_lora,
@@ -279,6 +289,9 @@ def train_mm_sft_smoke(
             "lora_lr": lora_lr if train_lora else 0.0,
             "lora_rank": model_cfg["lora"]["rank"] if train_lora else 0,
             "lora_alpha": model_cfg["lora"]["alpha"] if train_lora else 0,
+            "lambda_q": lambda_q_value,
+            "lambda_a": lambda_a_value,
+            "lambda_p": lambda_p_value,
             "lambda_assoc_ce": assoc_ce_weight,
         },
         save_lora=train_lora,
@@ -299,6 +312,12 @@ if __name__ == "__main__":
     parser.add_argument("--train_lora", action="store_true")
     parser.add_argument("--lambda_assoc_ce", type=float, default=None,
                         help="可选 association 分类辅助损失权重，默认使用配置或 0")
+    parser.add_argument("--lambda_q", type=float, default=None,
+                        help="可选 delta_q 损失权重覆盖值")
+    parser.add_argument("--lambda_a", type=float, default=None,
+                        help="可选 delta_a BCE 损失权重覆盖值")
+    parser.add_argument("--lambda_p", type=float, default=None,
+                        help="可选 delta_p 损失权重覆盖值")
     args = parser.parse_args()
 
     train_mm_sft_smoke(
@@ -310,4 +329,7 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         train_lora=args.train_lora,
         lambda_assoc_ce=args.lambda_assoc_ce,
+        lambda_q=args.lambda_q,
+        lambda_a=args.lambda_a,
+        lambda_p=args.lambda_p,
     )

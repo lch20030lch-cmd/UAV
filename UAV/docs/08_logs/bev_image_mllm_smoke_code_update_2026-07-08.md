@@ -1144,3 +1144,83 @@ argmax_match_rate_mean
 argmax_match_rate_per_user_min
 argmax_match_rate_per_user_max
 ```
+
+target-vs-pred 对比输出：
+
+```text
+pred_delta_a_argmax_unique_per_user_mean: 1.05
+pred_delta_a_argmax_fixed_user_count: 19
+argmax_match_rate_mean: 0.3025
+argmax_match_rate_per_user_min: 0.05
+argmax_match_rate_per_user_max: 0.5
+```
+
+判断：
+
+```text
+prediction 侧 20 个用户里有 19 个用户的 argmax 完全固定。
+target 侧每个用户都覆盖 4 个 UAV，但 prediction 侧几乎没有跟随。
+argmax_match_rate_mean=0.3025，仅略高于 4 类随机选择的 0.25。
+这说明 association CE=0.5 作为辅助项仍然不足以让模型学习 oracle association。
+```
+
+下一步代码更新：
+
+```text
+src/training/train_sft_mm.py
+  - 新增 --lambda_q / --lambda_a / --lambda_p 覆盖参数。
+  - 旧配置默认不变。
+  - 用于跑 association-only smoke：关闭 q/p 与 BCE 干扰，只保留 association CE。
+```
+
+association-only smoke 建议命令：
+
+```bash
+python src/training/train_sft_mm.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --max_steps 30 \
+  --max_length 3072 \
+  --output_dir /root/autodl-tmp/outputs/mm_smoke_lora_assoc_only_30step \
+  --train_lora \
+  --lambda_q 0 \
+  --lambda_a 0 \
+  --lambda_p 0 \
+  --lambda_assoc_ce 1.0
+```
+
+对应诊断命令：
+
+```bash
+python scripts/analyze_mm_delta_outputs.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --checkpoint /root/autodl-tmp/outputs/mm_smoke_lora_assoc_only_30step/mm_sft_lora_smoke_final \
+  --name mm_sft_lora_assoc_only_30step \
+  --num_samples 20 \
+  --max_length 3072 \
+  --output /root/autodl-tmp/outputs/mm_smoke_lora_assoc_only_30step/delta_diag_mm_sft_lora_assoc_only_30step.json \
+  --save_raw
+```
+
+再做 target-vs-pred：
+
+```bash
+python scripts/analyze_mm_target_distribution.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --prediction_npz /root/autodl-tmp/outputs/mm_smoke_lora_assoc_only_30step/delta_diag_mm_sft_lora_assoc_only_30step.npz \
+  --output /root/autodl-tmp/outputs/mm_smoke_lora_assoc_only_30step/target_vs_pred_assoc_only_30step.json
+```
+
+验收重点：
+
+```text
+如果 association-only 仍然 argmax 固定：
+  问题更可能在投影头 / control state 表达 / Sinkhorn 后梯度。
+
+如果 association-only 明显改善：
+  问题是 q/p 与 BCE 目标在联合 CTL 中压制了 association 学习。
+```
