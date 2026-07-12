@@ -684,3 +684,109 @@ delta_q / delta_a / delta_p shape 正确
 无 OOM
 无 NaN
 ```
+
+---
+
+## 9. 2026-07-12：LoRA 3-step 烟雾测试服务器结果
+
+训练命令：
+
+```bash
+python src/training/train_sft_mm.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --max_steps 3 \
+  --max_length 3072 \
+  --train_lora
+```
+
+训练输出摘要：
+
+```text
+trainable projection tensors: 17
+trainable LoRA tensors:       434
+projection lr:                0.001
+LoRA lr:                      0.0005
+
+step=1 loss_ctl=72.921425 grad_norm_proj=344.476310 grad_norm_lora=59.234765
+step=2 loss_ctl=86.507225 grad_norm_proj=256.141179 grad_norm_lora=57.440685
+step=3 loss_ctl=69.128632 grad_norm_proj=227.342428 grad_norm_lora=23.161257
+
+final_checkpoint: /root/autodl-tmp/outputs/mm_smoke/mm_sft_lora_smoke_final
+```
+
+结论：
+
+```text
+LoRA 3-step 训练烟雾测试 PASS。
+LoRA 参数数量非零，LoRA 梯度全程有数值。
+无 OOM。
+无 NaN。
+checkpoint 成功保存。
+```
+
+带 checkpoint 的单 batch 前向传播验证：
+
+```text
+loaded_projection: /root/autodl-tmp/outputs/mm_smoke/mm_sft_lora_smoke_final/projection_head.pt
+loaded_control_embeddings: {'ctrl_embed': '/root/autodl-tmp/outputs/mm_smoke/mm_sft_lora_smoke_final/ctrl_embed.pt'}
+loaded_lora_checkpoint: /root/autodl-tmp/outputs/mm_smoke/mm_sft_lora_smoke_final/lora
+control_token_count: 8
+control_states: (1, 8, 2560)
+delta_q: (1, 4, 3)
+delta_a: (1, 4, 20)
+delta_p: (1, 4, 21)
+```
+
+结论：
+
+```text
+LoRA checkpoint 加载链路 PASS。
+projection_head.pt、ctrl_embed.pt、lora adapter 均被成功加载。
+模型输出 shape 正确。
+```
+
+LoRA 3-step delta 诊断摘要：
+
+```text
+delta_q_per_dim_std_mean: 0.0464276485145092
+delta_a_per_dim_std_mean: 0.00784333422780037
+delta_p_per_dim_std_mean: 0.001915224944241345
+delta_a_argmax_unique_per_user_mean: 1.05
+delta_a_entropy_mean: 0.648697207038731
+delta_p_entropy_mean: 1.7171620636059495
+warnings: ['delta_a_argmax_nearly_constant']
+```
+
+与上一轮 30-step projection-head-only 诊断对比：
+
+```text
+projection-only 30-step:
+  delta_q_per_dim_std_mean: 0.2534600794315338
+  delta_a_per_dim_std_mean: 0.028002941980957985
+  delta_p_per_dim_std_mean: 0.008766541257500648
+  delta_a_argmax_unique_per_user_mean: 1.15
+
+LoRA 3-step:
+  delta_q_per_dim_std_mean: 0.0464276485145092
+  delta_a_per_dim_std_mean: 0.00784333422780037
+  delta_p_per_dim_std_mean: 0.001915224944241345
+  delta_a_argmax_unique_per_user_mean: 1.05
+```
+
+解释：
+
+```text
+LoRA 3-step 的目标是链路验证，不是效果验证。
+当前 LoRA 链路已经通过，但训练步数太短，delta 多样性没有改善，association argmax 仍然几乎固定。
+这不构成失败；它说明可以进入更长 LoRA 烟雾训练。
+```
+
+下一步：
+
+```text
+建议运行 LoRA 10-step。
+如果 10-step 无 OOM / NaN，再做同样的 checkpoint forward smoke 和 delta 诊断。
+重点观察 delta_a_argmax_unique_per_user_mean 是否高于 1.05，以及 delta_a_per_dim_std_mean 是否回升。
+```
