@@ -57,25 +57,39 @@ def _summarize_tensor(name: str, values: np.ndarray) -> Dict:
     }
 
 
-def _summarize_deltas(delta_q: np.ndarray, delta_a: np.ndarray, delta_p: np.ndarray) -> Dict:
+def _summarize_association(prefix: str, delta_a: np.ndarray) -> Dict:
+    assoc_choice = np.argmax(delta_a, axis=1)
+    assoc_unique_counts = [
+        int(np.unique(assoc_choice[:, k]).size)
+        for k in range(assoc_choice.shape[1])
+    ]
+    assoc_entropy = _entropy_from_probs(delta_a, axis=1)
+    return {
+        f"{prefix}_argmax_unique_per_user_mean": float(np.mean(assoc_unique_counts)),
+        f"{prefix}_argmax_unique_per_user_min": int(np.min(assoc_unique_counts)),
+        f"{prefix}_argmax_unique_per_user_max": int(np.max(assoc_unique_counts)),
+        f"{prefix}_argmax_fixed_user_count": int(sum(v == 1 for v in assoc_unique_counts)),
+        f"{prefix}_entropy_mean": float(assoc_entropy.mean()),
+        f"{prefix}_entropy_std": float(assoc_entropy.std()),
+    }
+
+
+def _summarize_deltas(
+    delta_q: np.ndarray,
+    delta_a: np.ndarray,
+    delta_p: np.ndarray,
+    delta_a_raw: np.ndarray = None,
+) -> Dict:
     summary = {}
     summary.update(_summarize_tensor("delta_q", delta_q))
     summary.update(_summarize_tensor("delta_a", delta_a))
     summary.update(_summarize_tensor("delta_p", delta_p))
 
     # 关联矩阵的 argmax 如果长期不变，说明模型还没有学到“按场景换 UAV”的能力。
-    assoc_choice = np.argmax(delta_a, axis=1)
-    assoc_unique_counts = [
-        int(np.unique(assoc_choice[:, k]).size)
-        for k in range(assoc_choice.shape[1])
-    ]
-    summary["delta_a_argmax_unique_per_user_mean"] = float(np.mean(assoc_unique_counts))
-    summary["delta_a_argmax_unique_per_user_min"] = int(np.min(assoc_unique_counts))
-    summary["delta_a_argmax_unique_per_user_max"] = int(np.max(assoc_unique_counts))
-
-    assoc_entropy = _entropy_from_probs(delta_a, axis=1)
-    summary["delta_a_entropy_mean"] = float(assoc_entropy.mean())
-    summary["delta_a_entropy_std"] = float(assoc_entropy.std())
+    summary.update(_summarize_association("delta_a", delta_a))
+    if delta_a_raw is not None:
+        summary.update(_summarize_tensor("delta_a_raw", delta_a_raw))
+        summary.update(_summarize_association("delta_a_raw", delta_a_raw))
 
     p = np.clip(delta_p, 0.0, None)
     p_sum = p.sum(axis=2, keepdims=True)
@@ -153,6 +167,7 @@ def _collect_deltas(
     delta_qs: List[np.ndarray] = []
     delta_as: List[np.ndarray] = []
     delta_ps: List[np.ndarray] = []
+    delta_a_raws: List[np.ndarray] = []
 
     for idx, batch in enumerate(tqdm(dataloader, desc="MM delta inference")):
         if idx >= num_samples:
@@ -174,12 +189,17 @@ def _collect_deltas(
         delta_qs.append(_as_np(outputs["delta_q"].squeeze(0)))
         delta_as.append(_as_np(outputs["delta_a"].squeeze(0)))
         delta_ps.append(_as_np(outputs["delta_p"].squeeze(0)))
+        if "delta_a_raw" in outputs:
+            delta_a_raws.append(_as_np(outputs["delta_a_raw"].squeeze(0)))
 
-    return {
+    result = {
         "delta_q": np.stack(delta_qs, axis=0),
         "delta_a": np.stack(delta_as, axis=0),
         "delta_p": np.stack(delta_ps, axis=0),
     }
+    if delta_a_raws:
+        result["delta_a_raw"] = np.stack(delta_a_raws, axis=0)
+    return result
 
 
 def main():
@@ -240,7 +260,12 @@ def main():
 
     num_samples = min(args.num_samples, len(dataset))
     deltas = _collect_deltas(model, dataset, num_samples)
-    summary = _summarize_deltas(deltas["delta_q"], deltas["delta_a"], deltas["delta_p"])
+    summary = _summarize_deltas(
+        deltas["delta_q"],
+        deltas["delta_a"],
+        deltas["delta_p"],
+        deltas.get("delta_a_raw"),
+    )
 
     result = {
         "name": args.name,
@@ -267,9 +292,7 @@ def main():
         raw_path = output_path.with_suffix(".npz")
         np.savez_compressed(
             raw_path,
-            delta_q=deltas["delta_q"],
-            delta_a=deltas["delta_a"],
-            delta_p=deltas["delta_p"],
+            **deltas,
         )
         print(f"Saved raw deltas to {raw_path}")
 
@@ -282,11 +305,17 @@ def main():
         "delta_a_per_dim_std_mean",
         "delta_p_per_dim_std_mean",
         "delta_a_argmax_unique_per_user_mean",
+        "delta_a_argmax_fixed_user_count",
         "delta_a_entropy_mean",
+        "delta_a_raw_per_dim_std_mean",
+        "delta_a_raw_argmax_unique_per_user_mean",
+        "delta_a_raw_argmax_fixed_user_count",
+        "delta_a_raw_entropy_mean",
         "delta_p_entropy_mean",
         "warnings",
     ):
-        print(f"  {key}: {summary[key]}")
+        if key in summary:
+            print(f"  {key}: {summary[key]}")
 
 
 if __name__ == "__main__":

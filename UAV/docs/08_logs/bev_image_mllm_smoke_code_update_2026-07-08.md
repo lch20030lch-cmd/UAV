@@ -1224,3 +1224,69 @@ python scripts/analyze_mm_target_distribution.py \
 如果 association-only 明显改善：
   问题是 q/p 与 BCE 目标在联合 CTL 中压制了 association 学习。
 ```
+
+association-only 30-step 结果：
+
+```text
+delta_q_per_dim_std_mean: 0.010421131737530231
+delta_a_per_dim_std_mean: 0.003573885653167963
+delta_p_per_dim_std_mean: 0.0008602032321505249
+delta_a_argmax_unique_per_user_mean: 1.05
+delta_a_entropy_mean: 0.7535383877451344
+delta_p_entropy_mean: 2.2482486100282686
+warnings: ['delta_a_argmax_nearly_constant']
+```
+
+target-vs-pred 对比：
+
+```text
+target_delta_a_argmax_unique_per_user_mean: 4.0
+target_delta_a_argmax_fixed_user_count: 0
+pred_delta_a_argmax_unique_per_user_mean: 1.05
+pred_delta_a_argmax_fixed_user_count: 19
+argmax_match_rate_mean: 0.3175
+argmax_match_rate_per_user_min: 0.15
+argmax_match_rate_per_user_max: 0.5
+```
+
+判断：
+
+```text
+association-only 训练仍然没有解决 argmax 固定。
+关闭 q/p/BCE 后，match rate 只从 0.3025 提升到 0.3175，仍然接近随机。
+因此主要问题不是 q/p 与 BCE 联合目标压制 association。
+下一步需要区分：raw delta_a 是否已经固定，还是 Sinkhorn/AssociationProjection 后固定。
+```
+
+本轮代码更新：
+
+```text
+scripts/analyze_mm_delta_outputs.py
+  - 新增 delta_a_raw 收集。
+  - 保存 raw npz 时包含 delta_a_raw。
+  - summary 打印 projected delta_a 与 raw delta_a 的 argmax 多样性。
+```
+
+建议重跑 association-only checkpoint 诊断，不需要重新训练：
+
+```bash
+python scripts/analyze_mm_delta_outputs.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --checkpoint /root/autodl-tmp/outputs/mm_smoke_lora_assoc_only_30step/mm_sft_lora_smoke_final \
+  --name mm_sft_lora_assoc_only_30step_raw \
+  --num_samples 20 \
+  --max_length 3072 \
+  --output /root/autodl-tmp/outputs/mm_smoke_lora_assoc_only_30step/delta_diag_mm_sft_lora_assoc_only_30step_raw.json \
+  --save_raw
+```
+
+关注：
+
+```text
+delta_a_argmax_unique_per_user_mean
+delta_a_raw_argmax_unique_per_user_mean
+delta_a_raw_per_dim_std_mean
+delta_a_raw_entropy_mean
+```
