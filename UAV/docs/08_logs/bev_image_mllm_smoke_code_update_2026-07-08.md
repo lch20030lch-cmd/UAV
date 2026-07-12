@@ -1046,3 +1046,101 @@ delta_a_argmax_unique_per_user_mean 是否高于 1.0。
 delta_a_per_dim_std_mean 是否高于 0.00347。
 warnings 是否仍包含 delta_a_argmax_nearly_constant。
 ```
+
+---
+
+## 12. 2026-07-12：LoRA + association CE 30-step 诊断结果
+
+训练配置：
+
+```text
+train_lora: true
+max_steps: 30
+max_length: 3072
+lambda_assoc_ce: 0.5
+output_dir: /root/autodl-tmp/outputs/mm_smoke_lora_assoc_ce_30step
+```
+
+checkpoint 文件确认：
+
+```text
+ctrl_embed.pt
+lora/
+metadata.json
+processor/
+projection_head.pt
+```
+
+delta 诊断摘要：
+
+```text
+loaded_projection: /root/autodl-tmp/outputs/mm_smoke_lora_assoc_ce_30step/mm_sft_lora_smoke_final/projection_head.pt
+loaded_control_embeddings: {'ctrl_embed': '/root/autodl-tmp/outputs/mm_smoke_lora_assoc_ce_30step/mm_sft_lora_smoke_final/ctrl_embed.pt'}
+loaded_lora_checkpoint: /root/autodl-tmp/outputs/mm_smoke_lora_assoc_ce_30step/mm_sft_lora_smoke_final/lora
+
+delta_q_per_dim_std_mean: 0.028537364676594734
+delta_a_per_dim_std_mean: 0.0038104660343378782
+delta_p_per_dim_std_mean: 4.487502155825496e-05
+delta_a_argmax_unique_per_user_mean: 1.05
+delta_a_entropy_mean: 0.40056678648214716
+delta_p_entropy_mean: 1.0658598775733887
+warnings: ['delta_p_low_cross_sample_variance', 'delta_a_argmax_nearly_constant']
+```
+
+与 LoRA 30-step 无 association CE 对比：
+
+```text
+LoRA 30-step:
+  delta_q_per_dim_std_mean: 0.02685587666928768
+  delta_a_per_dim_std_mean: 0.0034748991020023823
+  delta_p_per_dim_std_mean: 0.0009771875338628888
+  delta_a_argmax_unique_per_user_mean: 1.0
+  warnings: ['delta_a_argmax_nearly_constant']
+
+LoRA + association CE 30-step:
+  delta_q_per_dim_std_mean: 0.028537364676594734
+  delta_a_per_dim_std_mean: 0.0038104660343378782
+  delta_p_per_dim_std_mean: 4.487502155825496e-05
+  delta_a_argmax_unique_per_user_mean: 1.05
+  warnings: ['delta_p_low_cross_sample_variance', 'delta_a_argmax_nearly_constant']
+```
+
+判断：
+
+```text
+association CE 辅助项带来轻微改善：
+  - delta_a_per_dim_std_mean 从 0.00347 升到 0.00381。
+  - delta_a_argmax_unique_per_user_mean 从 1.0 升到 1.05。
+
+但改善幅度很小，association argmax 仍然近似固定。
+同时 delta_p_per_dim_std_mean 降到 4.49e-05，触发 delta_p_low_cross_sample_variance。
+因此不建议直接继续加大 lambda_assoc_ce 或继续堆步数。
+```
+
+下一步建议：
+
+```text
+用 analyze_mm_target_distribution.py 对 LoRA + association CE 30-step 的 raw npz 做 target-vs-pred argmax 对比。
+如果 argmax_match_rate 很低，说明模型输出没有跟随 oracle association。
+如果 match_rate 高但 unique 仍低，则可能是预测排序在少量用户上塌缩，需要进一步看 per-user hist。
+```
+
+建议命令：
+
+```bash
+python scripts/analyze_mm_target_distribution.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --prediction_npz /root/autodl-tmp/outputs/mm_smoke_lora_assoc_ce_30step/delta_diag_mm_sft_lora_assoc_ce_30step.npz \
+  --output /root/autodl-tmp/outputs/mm_smoke_lora_assoc_ce_30step/target_vs_pred_assoc_ce_30step.json
+```
+
+关注：
+
+```text
+pred_delta_a_argmax_unique_per_user_mean
+pred_delta_a_argmax_fixed_user_count
+argmax_match_rate_mean
+argmax_match_rate_per_user_min
+argmax_match_rate_per_user_max
+```
