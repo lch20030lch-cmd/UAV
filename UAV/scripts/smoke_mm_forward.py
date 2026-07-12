@@ -22,6 +22,41 @@ from src.data.multimodal_dataset import MultimodalSFTDataset
 from src.model import Gemma3MultimodalISAC, build_proj_head_config
 
 
+def _resolve_lora_checkpoint(checkpoint: str, lora_checkpoint: str):
+    if lora_checkpoint:
+        return str(Path(lora_checkpoint))
+    if not checkpoint:
+        return None
+    ckpt_path = Path(checkpoint)
+    if ckpt_path.is_file():
+        return None
+    candidate = ckpt_path / "lora"
+    if (candidate / "adapter_config.json").exists():
+        return str(candidate)
+    return None
+
+
+def _load_projection_head(model: Gemma3MultimodalISAC, checkpoint: str):
+    if not checkpoint:
+        return None
+    ckpt_path = Path(checkpoint)
+    if ckpt_path.is_dir():
+        ckpt_path = ckpt_path / "projection_head.pt"
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"projection_head checkpoint not found: {ckpt_path}")
+    state = torch.load(ckpt_path, map_location="cpu")
+    model.projection_head.load_state_dict(state)
+    return str(ckpt_path)
+
+
+def _load_control_token_embeddings(model: Gemma3MultimodalISAC, checkpoint: str):
+    if not checkpoint:
+        return {}
+    ckpt_path = Path(checkpoint)
+    ckpt_root = ckpt_path if ckpt_path.is_dir() else ckpt_path.parent
+    return model.load_control_token_embeddings(ckpt_root)
+
+
 def _move_batch(batch, device):
     result = {}
     for key, value in batch.items():
@@ -33,11 +68,15 @@ def _move_batch(batch, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="运行一次多模态模型 forward smoke")
+    parser = argparse.ArgumentParser(description="运行一次多模态模型前向传播烟雾测试")
     parser.add_argument("--config", type=str, default="configs/rtx5090_multimodal_smoke.yaml")
     parser.add_argument("--data_dir", type=str, default=None)
     parser.add_argument("--model", type=str, default=None,
                         help="覆盖配置文件中的 model.backbone")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="包含 projection_head.pt 的目录，或 projection_head.pt 文件本身")
+    parser.add_argument("--lora_checkpoint", type=str, default=None,
+                        help="LoRA adapter 目录；不填时会尝试从 --checkpoint/lora 自动发现")
     parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--no_4bit", action="store_true")
     args = parser.parse_args()
@@ -54,6 +93,7 @@ def main():
     data_dir = Path(args.data_dir or data_cfg["output_dir"])
     data_path = data_dir / data_cfg.get("sft_file", "sft_dataset.jsonl")
     max_length = args.max_length or train_cfg["max_seq_length"]
+    lora_checkpoint = _resolve_lora_checkpoint(args.checkpoint, args.lora_checkpoint)
 
     model = Gemma3MultimodalISAC(
         model_name_or_path=model_name,
@@ -62,7 +102,14 @@ def main():
         proj_head_config=build_proj_head_config(model_cfg, sim_cfg),
         attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
         freeze_vision_tower=model_cfg.get("freeze_vision_tower", True),
+        lora_rank=model_cfg["lora"]["rank"],
+        lora_alpha=model_cfg["lora"]["alpha"],
+        lora_dropout=model_cfg["lora"].get("dropout", 0.0),
+        lora_target_modules=model_cfg["lora"]["target_modules"],
+        lora_checkpoint=lora_checkpoint,
     )
+    loaded_projection = _load_projection_head(model, args.checkpoint)
+    loaded_control_embeddings = _load_control_token_embeddings(model, args.checkpoint)
     model.eval()
 
     dataset = MultimodalSFTDataset(
@@ -93,6 +140,9 @@ def main():
 
     print("OK: multimodal model forward smoke")
     print(f"  data: {data_path}")
+    print(f"  loaded_projection: {loaded_projection}")
+    print(f"  loaded_control_embeddings: {loaded_control_embeddings}")
+    print(f"  loaded_lora_checkpoint: {model.loaded_lora_checkpoint}")
     print(f"  max_length: {max_length}")
     print(f"  input_ids: {tuple(batch['input_ids'].shape)}")
     print(f"  attention_mask: {tuple(batch['attention_mask'].shape)}")

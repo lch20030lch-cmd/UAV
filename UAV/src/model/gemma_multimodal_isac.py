@@ -6,6 +6,7 @@ BEV-image 分支的 Gemma3 多模态 UAV-ISAC 模型封装。
   -> ConstraintProjectionHead -> delta_q / delta_a / delta_p
 """
 
+from pathlib import Path
 from typing import Dict, Optional
 
 import torch
@@ -36,6 +37,7 @@ class Gemma3MultimodalISAC(nn.Module):
         lora_alpha: int = 32,
         lora_dropout: float = 0.0,
         lora_target_modules: Optional[list] = None,
+        lora_checkpoint: Optional[str] = None,
     ):
         super().__init__()
 
@@ -76,25 +78,40 @@ class Gemma3MultimodalISAC(nn.Module):
             self.base_model.resize_token_embeddings(len(self.tokenizer))
         self.control_token_ids = self.tokenizer.convert_tokens_to_ids(control_tokens)
 
-        self.lora_enabled = enable_lora
-        if enable_lora:
-            # LoRA 烟雾测试用于确认 backbone 可训练链路；默认训练仍保持只训练投影头。
+        self.lora_enabled = enable_lora or lora_checkpoint is not None
+        self.loaded_lora_checkpoint = None
+        if self.lora_enabled:
             if lora_target_modules is None:
                 lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
-            if use_4bit:
-                from peft import prepare_model_for_kbit_training
+            if lora_checkpoint is not None:
+                # 诊断和续跑时直接挂载已保存的 adapter，避免只评估原始 backbone。
+                from peft import PeftModel
 
-                self.base_model = prepare_model_for_kbit_training(self.base_model)
-            from peft import LoraConfig, get_peft_model
+                lora_path = Path(lora_checkpoint)
+                if not lora_path.exists():
+                    raise FileNotFoundError(f"LoRA checkpoint not found: {lora_path}")
+                self.base_model = PeftModel.from_pretrained(
+                    self.base_model,
+                    str(lora_path),
+                    is_trainable=enable_lora,
+                )
+                self.loaded_lora_checkpoint = str(lora_path)
+            else:
+                # LoRA 烟雾测试用于确认 backbone 可训练链路；默认训练仍保持只训练投影头。
+                if use_4bit:
+                    from peft import prepare_model_for_kbit_training
 
-            peft_config = LoraConfig(
-                r=lora_rank,
-                lora_alpha=lora_alpha,
-                target_modules=lora_target_modules,
-                lora_dropout=lora_dropout,
-                bias="none",
-            )
-            self.base_model = get_peft_model(self.base_model, peft_config)
+                    self.base_model = prepare_model_for_kbit_training(self.base_model)
+                from peft import LoraConfig, get_peft_model
+
+                peft_config = LoraConfig(
+                    r=lora_rank,
+                    lora_alpha=lora_alpha,
+                    target_modules=lora_target_modules,
+                    lora_dropout=lora_dropout,
+                    bias="none",
+                )
+                self.base_model = get_peft_model(self.base_model, peft_config)
 
         config = self.base_model.config
         if hasattr(config, "text_config") and hasattr(config.text_config, "hidden_size"):
@@ -125,6 +142,51 @@ class Gemma3MultimodalISAC(nn.Module):
     @property
     def device(self) -> torch.device:
         return _first_device(self.base_model)
+
+    def save_control_token_embeddings(self, save_dir: str) -> Dict[str, str]:
+        """只保存新增控制 token 对应的 embedding 行。"""
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+
+        embed = self.base_model.get_input_embeddings()
+        ctrl_embed = embed.weight.data[self.control_token_ids].detach().clone().cpu()
+        ctrl_embed_path = save_path / "ctrl_embed.pt"
+        torch.save(ctrl_embed, ctrl_embed_path)
+
+        saved = {"ctrl_embed": str(ctrl_embed_path)}
+        output_embeds = self.base_model.get_output_embeddings()
+        if output_embeds is not None and output_embeds.weight.data_ptr() != embed.weight.data_ptr():
+            ctrl_lm = output_embeds.weight.data[self.control_token_ids].detach().clone().cpu()
+            ctrl_lm_path = save_path / "ctrl_lm_head.pt"
+            torch.save(ctrl_lm, ctrl_lm_path)
+            saved["ctrl_lm_head"] = str(ctrl_lm_path)
+        return saved
+
+    def load_control_token_embeddings(self, load_dir: str) -> Dict[str, str]:
+        """恢复 checkpoint 中保存的控制 token embedding 行。"""
+        load_path = Path(load_dir)
+        ctrl_embed_path = load_path / "ctrl_embed.pt"
+        loaded = {}
+        if ctrl_embed_path.exists():
+            ctrl_embed = torch.load(ctrl_embed_path, map_location="cpu")
+            embed = self.base_model.get_input_embeddings()
+            embed.weight.data[self.control_token_ids] = ctrl_embed.to(
+                dtype=embed.weight.dtype,
+                device=embed.weight.device,
+            )
+            loaded["ctrl_embed"] = str(ctrl_embed_path)
+
+        ctrl_lm_path = load_path / "ctrl_lm_head.pt"
+        if ctrl_lm_path.exists():
+            ctrl_lm = torch.load(ctrl_lm_path, map_location="cpu")
+            output_embeds = self.base_model.get_output_embeddings()
+            if output_embeds is not None:
+                output_embeds.weight.data[self.control_token_ids] = ctrl_lm.to(
+                    dtype=output_embeds.weight.dtype,
+                    device=output_embeds.weight.device,
+                )
+                loaded["ctrl_lm_head"] = str(ctrl_lm_path)
+        return loaded
 
     def _extract_control_states(
         self,

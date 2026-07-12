@@ -599,3 +599,88 @@ python src/training/train_sft_mm.py \
 优先将 max_length 从 3072 降到 2304。
 其次考虑减小 image_size 或进一步缩短 prompt。
 ```
+
+---
+
+## 8. 2026-07-12：LoRA checkpoint 诊断链路补强
+
+背景：
+
+```text
+train_sft_mm.py 已经支持 --train_lora，并会保存 lora/ adapter。
+但此前 smoke_mm_forward.py 和 analyze_mm_delta_outputs.py 只加载 projection_head.pt。
+如果 LoRA 烟雾测试后直接做 delta 诊断，可能没有真正评估 LoRA adapter 的影响。
+```
+
+本轮代码更新：
+
+```text
+src/model/gemma_multimodal_isac.py
+  - 新增 lora_checkpoint 参数。
+  - 支持从 checkpoint/lora 加载 PEFT adapter。
+  - 新增控制 token embedding 的保存与恢复函数。
+
+src/training/train_sft_mm.py
+  - 保存 projection_head.pt 时同步保存 ctrl_embed.pt。
+  - --train_lora 时强制检查可训练 LoRA 参数数量。
+  - LoRA 学习率优先使用 training.sft.phase1.lr_lora。
+
+scripts/smoke_mm_forward.py
+  - 新增 --checkpoint 和 --lora_checkpoint。
+  - 可自动加载 checkpoint/lora、projection_head.pt、ctrl_embed.pt。
+
+scripts/analyze_mm_delta_outputs.py
+  - 新增 --lora_checkpoint。
+  - 可自动从 --checkpoint/lora 发现并加载 LoRA adapter。
+  - delta 诊断输出会打印 loaded_projection、loaded_control_embeddings、loaded_lora_checkpoint。
+```
+
+服务器下一步建议命令：
+
+```bash
+python src/training/train_sft_mm.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --max_steps 3 \
+  --max_length 3072 \
+  --train_lora
+```
+
+3-step 成功后，先做带 checkpoint 的单 batch 前向传播验证：
+
+```bash
+python scripts/smoke_mm_forward.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --checkpoint /root/autodl-tmp/outputs/mm_smoke/mm_sft_lora_smoke_final \
+  --max_length 3072
+```
+
+再做 LoRA checkpoint 的 delta 诊断：
+
+```bash
+python scripts/analyze_mm_delta_outputs.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --checkpoint /root/autodl-tmp/outputs/mm_smoke/mm_sft_lora_smoke_final \
+  --name mm_sft_lora_smoke_3step \
+  --num_samples 20 \
+  --max_length 3072 \
+  --output /root/autodl-tmp/outputs/mm_smoke/delta_diag_mm_sft_lora_smoke_3step.json \
+  --save_raw
+```
+
+验收关注点：
+
+```text
+trainable LoRA tensors > 0
+grad_norm_lora 有数值
+loaded_lora_checkpoint 指向 checkpoint/lora
+loaded_control_embeddings 包含 ctrl_embed.pt
+delta_q / delta_a / delta_p shape 正确
+无 OOM
+无 NaN
+```

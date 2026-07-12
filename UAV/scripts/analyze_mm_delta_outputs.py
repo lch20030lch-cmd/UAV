@@ -120,6 +120,28 @@ def _load_projection_head(model: Gemma3MultimodalISAC, checkpoint: str):
     return str(ckpt_path)
 
 
+def _load_control_token_embeddings(model: Gemma3MultimodalISAC, checkpoint: str):
+    if not checkpoint:
+        return {}
+    ckpt_path = Path(checkpoint)
+    ckpt_root = ckpt_path if ckpt_path.is_dir() else ckpt_path.parent
+    return model.load_control_token_embeddings(ckpt_root)
+
+
+def _resolve_lora_checkpoint(checkpoint: str, lora_checkpoint: str):
+    if lora_checkpoint:
+        return str(Path(lora_checkpoint))
+    if not checkpoint:
+        return None
+    ckpt_path = Path(checkpoint)
+    if ckpt_path.is_file():
+        return None
+    candidate = ckpt_path / "lora"
+    if (candidate / "adapter_config.json").exists():
+        return str(candidate)
+    return None
+
+
 def _collect_deltas(
     model: Gemma3MultimodalISAC,
     dataset: MultimodalSFTDataset,
@@ -168,6 +190,8 @@ def main():
                         help="覆盖配置文件中的 model.backbone")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="包含 projection_head.pt 的目录，或 projection_head.pt 文件本身")
+    parser.add_argument("--lora_checkpoint", type=str, default=None,
+                        help="LoRA adapter 目录；不填时会尝试从 --checkpoint/lora 自动发现")
     parser.add_argument("--name", type=str, default="mm_sft_smoke")
     parser.add_argument("--num_samples", type=int, default=20)
     parser.add_argument("--max_length", type=int, default=None)
@@ -187,6 +211,7 @@ def main():
     data_path = data_dir / data_cfg.get("sft_file", "sft_dataset.jsonl")
     model_name = args.model or model_cfg["backbone"]
     max_length = args.max_length or train_cfg["max_seq_length"]
+    lora_checkpoint = _resolve_lora_checkpoint(args.checkpoint, args.lora_checkpoint)
 
     model = Gemma3MultimodalISAC(
         model_name_or_path=model_name,
@@ -195,8 +220,14 @@ def main():
         proj_head_config=build_proj_head_config(model_cfg, sim_cfg),
         attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
         freeze_vision_tower=model_cfg.get("freeze_vision_tower", True),
+        lora_rank=model_cfg["lora"]["rank"],
+        lora_alpha=model_cfg["lora"]["alpha"],
+        lora_dropout=model_cfg["lora"].get("dropout", 0.0),
+        lora_target_modules=model_cfg["lora"]["target_modules"],
+        lora_checkpoint=lora_checkpoint,
     )
     loaded_projection = _load_projection_head(model, args.checkpoint)
+    loaded_control_embeddings = _load_control_token_embeddings(model, args.checkpoint)
     model.eval()
 
     dataset = MultimodalSFTDataset(
@@ -218,6 +249,9 @@ def main():
         "model": model_name,
         "checkpoint": args.checkpoint,
         "loaded_projection": loaded_projection,
+        "loaded_control_embeddings": loaded_control_embeddings,
+        "lora_checkpoint": lora_checkpoint,
+        "loaded_lora_checkpoint": model.loaded_lora_checkpoint,
         "num_samples": num_samples,
         "max_length": max_length,
         "summary": summary,
@@ -240,6 +274,9 @@ def main():
         print(f"Saved raw deltas to {raw_path}")
 
     print("\n=== Multimodal Delta Diagnostic Summary ===")
+    print(f"  loaded_projection: {loaded_projection}")
+    print(f"  loaded_control_embeddings: {loaded_control_embeddings}")
+    print(f"  loaded_lora_checkpoint: {model.loaded_lora_checkpoint}")
     for key in (
         "delta_q_per_dim_std_mean",
         "delta_a_per_dim_std_mean",

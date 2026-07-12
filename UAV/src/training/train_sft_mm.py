@@ -59,6 +59,7 @@ def _grad_norm(parameters) -> float:
 def _save_mm_smoke(model, save_dir: Path, metadata: dict, save_lora: bool = False):
     save_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.projection_head.state_dict(), save_dir / "projection_head.pt")
+    metadata["control_token_embeddings"] = model.save_control_token_embeddings(save_dir)
     model.processor.save_pretrained(save_dir / "processor")
     if save_lora and hasattr(model.base_model, "save_pretrained"):
         model.base_model.save_pretrained(save_dir / "lora")
@@ -154,15 +155,22 @@ def train_mm_sft_smoke(
         p for n, p in model.base_model.named_parameters()
         if p.requires_grad and "lora_" in n
     ]
-    param_groups = [{"params": proj_params, "lr": 1e-3}]
+    proj_lr = 1e-3
+    lora_lr = train_cfg.get("phase1", {}).get("lr_lora", train_cfg.get("learning_rate", 2e-4))
+    if train_lora and not lora_params:
+        raise RuntimeError("已传入 --train_lora，但没有发现可训练的 LoRA 参数。")
+
+    param_groups = [{"params": proj_params, "lr": proj_lr}]
     if train_lora and lora_params:
-        param_groups.append({"params": lora_params, "lr": train_cfg.get("learning_rate", 2e-4)})
+        param_groups.append({"params": lora_params, "lr": lora_lr})
     optimizer = torch.optim.AdamW(
         param_groups,
         weight_decay=train_cfg.get("weight_decay", 0.01),
     )
     print(f"  trainable projection tensors: {len(proj_params)}")
     print(f"  trainable LoRA tensors:       {len(lora_params)}")
+    print(f"  projection lr:                {proj_lr}")
+    print(f"  LoRA lr:                      {lora_lr if train_lora else 0.0}")
 
     device = model.device
     global_step = 0
@@ -238,6 +246,10 @@ def train_mm_sft_smoke(
                         "grad_norm_proj": grad_norm,
                         "grad_norm_lora": grad_norm_lora,
                         "trainable": "projection_head_lora" if train_lora else "projection_head_only",
+                        "projection_lr": proj_lr,
+                        "lora_lr": lora_lr if train_lora else 0.0,
+                        "lora_rank": model_cfg["lora"]["rank"] if train_lora else 0,
+                        "lora_alpha": model_cfg["lora"]["alpha"] if train_lora else 0,
                     },
                     save_lora=train_lora,
                 )
@@ -253,6 +265,10 @@ def train_mm_sft_smoke(
             "max_steps": steps_limit,
             "max_seq_length": max_seq_length,
             "trainable": "projection_head_lora" if train_lora else "projection_head_only",
+            "projection_lr": proj_lr,
+            "lora_lr": lora_lr if train_lora else 0.0,
+            "lora_rank": model_cfg["lora"]["rank"] if train_lora else 0,
+            "lora_alpha": model_cfg["lora"]["alpha"] if train_lora else 0,
         },
         save_lora=train_lora,
     )
