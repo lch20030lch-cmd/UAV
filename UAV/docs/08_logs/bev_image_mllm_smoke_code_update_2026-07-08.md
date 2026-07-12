@@ -1475,3 +1475,73 @@ python scripts/analyze_mm_delta_outputs.py \
 如果 projection-only overfit 仍失败：
   说明当前 projection head/readout 结构不适合 association，需要改结构，而不是继续调 loss。
 ```
+
+projection-head-only overfit 诊断结果：
+
+```text
+loaded_projection: /root/autodl-tmp/outputs/mm_smoke_proj_assoc_raw_ce_overfit/mm_sft_smoke_final/projection_head.pt
+loaded_control_embeddings: {'ctrl_embed': '/root/autodl-tmp/outputs/mm_smoke_proj_assoc_raw_ce_overfit/mm_sft_smoke_final/ctrl_embed.pt'}
+loaded_lora_checkpoint: None
+
+delta_q_per_dim_std_mean: 0.6999961733818054
+delta_a_per_dim_std_mean: 0.21381434798240662
+delta_p_per_dim_std_mean: 0.0431474968791008
+delta_a_argmax_unique_per_user_mean: 2.8
+delta_a_argmax_fixed_user_count: 0
+delta_a_entropy_mean: 0.7091241647464382
+delta_a_raw_per_dim_std_mean: 0.8353487253189087
+delta_a_raw_argmax_unique_per_user_mean: 2.8
+delta_a_raw_argmax_fixed_user_count: 0
+delta_a_raw_entropy_mean: 0.46499050065949205
+control_states_per_dim_std_mean: 0.4281654357910156
+control_states_per_dim_std_max: 9.766557693481445
+delta_raw_per_dim_std_mean: 0.7198388576507568
+delta_raw_per_dim_std_max: 1.493327260017395
+delta_p_entropy_mean: 2.1486335615708456
+warnings: []
+```
+
+判断：
+
+```text
+projection-head-only overfit 探针 PASS。
+只训练 projection head、提高 projection_lr、只保留 raw association CE 后：
+  - projected delta_a 与 raw delta_a 的跨样本方差显著上升。
+  - delta_a_argmax_fixed_user_count 从 19 降到 0。
+  - delta_a_argmax_unique_per_user_mean 从 1.05 升到 2.8。
+  - warnings 清空。
+
+这说明 control_states 中有足够信息，projection head/readout 也有能力读出 association。
+前面 LoRA 联合训练失败，主要不是结构必然不行，而是训练策略/优化强度不合适。
+```
+
+阶段性结论：
+
+```text
+不要再优先改 Sinkhorn。
+不要再盲目增加 LoRA CE 权重。
+下一步应把有效因素迁回正式 smoke：
+  1. projection head 使用更高 LR。
+  2. 先做 projection-head-only association warmup。
+  3. warmup 后再考虑打开 LoRA 或恢复 q/p 联合目标。
+```
+
+下一步建议：
+
+```text
+先对 overfit checkpoint 做 target-vs-pred argmax 诊断，确认 match_rate 是否也明显上升。
+如果 match_rate 明显上升，再设计 staged training：
+  Stage A: projection-only raw association CE warmup。
+  Stage B: projection + q/p CTL。
+  Stage C: 可选 LoRA 小 LR 联合微调。
+```
+
+建议命令：
+
+```bash
+python scripts/analyze_mm_target_distribution.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --prediction_npz /root/autodl-tmp/outputs/mm_smoke_proj_assoc_raw_ce_overfit/delta_diag_mm_proj_assoc_raw_ce_overfit.npz \
+  --output /root/autodl-tmp/outputs/mm_smoke_proj_assoc_raw_ce_overfit/target_vs_pred_proj_assoc_raw_ce_overfit.json
+```
