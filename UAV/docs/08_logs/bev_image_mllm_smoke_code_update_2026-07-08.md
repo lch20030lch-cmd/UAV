@@ -418,3 +418,201 @@ One-line summary:
 ```text
 The project now has the first BEV-image MLLM smoke slice in place: image rendering, multimodal prompts, smoke data generation, and processor-level validation hooks, while preserving the existing text-grid baseline.
 ```
+
+---
+
+## 8. Server Smoke Results
+
+> Date: 2026-07-12  
+> Server path: `/root/Projects/UAV/UAV`  
+> Data path: `/root/autodl-tmp/data/mm_smoke`  
+> Model path: `/root/autodl-tmp/huggingface/models/gemma-3-4b-it`
+
+### 8.1 BEV-image data generation
+
+Command:
+
+```bash
+python scripts/generate_mm_smoke.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --output_dir /root/autodl-tmp/data/mm_smoke \
+  --num_samples 20 \
+  --num_restarts 3 \
+  --overwrite
+```
+
+Result:
+
+```text
+sft_dataset.jsonl generated
+dpo_dataset.jsonl generated
+images/env_000000.png ... generated
+checkpoint.txt generated
+```
+
+Observed files:
+
+```text
+/root/autodl-tmp/data/mm_smoke/sft_dataset.jsonl
+/root/autodl-tmp/data/mm_smoke/dpo_dataset.jsonl
+/root/autodl-tmp/data/mm_smoke/images/env_000000.png
+```
+
+The JSONL samples contain:
+
+```text
+prompt
+response
+bev_image_path
+prompt_type="multimodal_bev_image"
+q_current
+delta_q / delta_a / delta_p
+```
+
+### 8.2 Processor smoke
+
+Initial issue:
+
+```text
+ValueError: Prompt contained 0 image tokens but received 1 images.
+```
+
+Cause:
+
+```text
+Gemma3 processor requires a model-specific image token in the text prompt.
+The script was patched to inject the Gemma BOI image token before the
+[Bird's-Eye-View Image] marker.
+```
+
+Second issue:
+
+```text
+Mismatch in image token count between text and input_ids.
+Likely due to truncation='max_length'.
+```
+
+Cause:
+
+```text
+The original max_seq_length=1024 was too short after Gemma3 expanded the image
+tokens. The smoke was rerun with max_length=4096, then the config was updated
+to max_seq_length=3072 for the next stage.
+```
+
+Successful command:
+
+```bash
+python scripts/smoke_mm_processor.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --max_length 4096
+```
+
+Successful output:
+
+```text
+OK: multimodal processor smoke
+  data: /root/autodl-tmp/data/mm_smoke/sft_dataset.jsonl
+  image: /root/autodl-tmp/data/mm_smoke/images/env_000000.png size=(224, 224)
+  input_ids: (1, 2025)
+  attention_mask: (1, 2025)
+  token_type_ids: (1, 2017)
+  pixel_values: (1, 3, 896, 896)
+  control_token_count: 8
+```
+
+Conclusion:
+
+```text
+Prompt + BEV image can be encoded by the local Gemma3 processor.
+Control tokens are correctly appended and located.
+1024 tokens is insufficient; 3072 is the current smoke default.
+Gemma3 internally converts the 224 x 224 BEV image to pixel_values shape
+(1, 3, 896, 896), which increases multimodal memory pressure.
+```
+
+### 8.3 Multimodal model forward smoke
+
+Added files used in this smoke:
+
+```text
+src/data/multimodal_dataset.py
+src/model/gemma_multimodal_isac.py
+scripts/smoke_mm_forward.py
+```
+
+Command:
+
+```bash
+python scripts/smoke_mm_forward.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --max_length 3072
+```
+
+Successful output:
+
+```text
+OK: multimodal model forward smoke
+  data: /root/autodl-tmp/data/mm_smoke/sft_dataset.jsonl
+  max_length: 3072
+  input_ids: (1, 3072)
+  attention_mask: (1, 3072)
+  pixel_values: (1, 3, 896, 896)
+  control_token_count: 8
+  control_states: (1, 8, 2560)
+  delta_q: (1, 4, 3)
+  delta_a: (1, 4, 20)
+  delta_p: (1, 4, 21)
+```
+
+Conclusion:
+
+```text
+The BEV-image MLLM minimal forward loop is now validated:
+
+BEV image + text prompt
+  -> Gemma3 multimodal processor
+  -> Gemma3 multimodal model
+  -> control-token hidden states
+  -> projection head
+  -> delta_q / delta_a / delta_p
+```
+
+This confirms that the solver-facing interface remains unchanged:
+
+```text
+delta_q: (B, M, 3)
+delta_a: (B, M, K)
+delta_p: (B, M, K+1)
+```
+
+### 8.4 Current milestone status
+
+Completed:
+
+```text
+Step 1: generate_mm_smoke.py       PASS
+Step 2: smoke_mm_processor.py      PASS
+Step 3: smoke_mm_forward.py        PASS
+```
+
+Next step:
+
+```text
+Step 4: multimodal SFT smoke
+```
+
+Step 4 acceptance targets:
+
+```text
+10-30 training steps complete
+no OOM
+no NaN
+loss_ctl has numeric values
+grad_norm has numeric values
+checkpoint can be saved
+```
