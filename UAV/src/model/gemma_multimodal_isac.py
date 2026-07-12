@@ -31,6 +31,11 @@ class Gemma3MultimodalISAC(nn.Module):
         torch_dtype: torch.dtype = torch.bfloat16,
         attn_implementation: str = "sdpa",
         freeze_vision_tower: bool = True,
+        enable_lora: bool = False,
+        lora_rank: int = 16,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.0,
+        lora_target_modules: Optional[list] = None,
     ):
         super().__init__()
 
@@ -69,6 +74,25 @@ class Gemma3MultimodalISAC(nn.Module):
         if num_added > 0:
             self.base_model.resize_token_embeddings(len(self.tokenizer))
         self.control_token_ids = self.tokenizer.convert_tokens_to_ids(control_tokens)
+
+        self.lora_enabled = enable_lora
+        if enable_lora:
+            if lora_target_modules is None:
+                lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+            if use_4bit:
+                from peft import prepare_model_for_kbit_training
+
+                self.base_model = prepare_model_for_kbit_training(self.base_model)
+            from peft import LoraConfig, get_peft_model
+
+            peft_config = LoraConfig(
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                target_modules=lora_target_modules,
+                lora_dropout=lora_dropout,
+                bias="none",
+            )
+            self.base_model = get_peft_model(self.base_model, peft_config)
 
         config = self.base_model.config
         if hasattr(config, "text_config") and hasattr(config.text_config, "hidden_size"):
@@ -139,6 +163,7 @@ class Gemma3MultimodalISAC(nn.Module):
             "output_hidden_states": True,
             "use_cache": False,
             "return_dict": True,
+            "logits_to_keep": 1,
         }
         if token_type_ids is not None:
             model_inputs["token_type_ids"] = token_type_ids
@@ -148,7 +173,13 @@ class Gemma3MultimodalISAC(nn.Module):
             if hasattr(value, "shape"):
                 model_inputs[key] = value
 
-        outputs = self.base_model(**model_inputs)
+        try:
+            outputs = self.base_model(**model_inputs)
+        except TypeError as exc:
+            if "logits_to_keep" not in str(exc):
+                raise
+            model_inputs.pop("logits_to_keep", None)
+            outputs = self.base_model(**model_inputs)
         if getattr(outputs, "hidden_states", None) is None:
             raise RuntimeError("Gemma3 forward did not return hidden_states.")
         last_hidden = outputs.hidden_states[-1]

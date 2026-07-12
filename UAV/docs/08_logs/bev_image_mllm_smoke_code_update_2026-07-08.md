@@ -797,3 +797,58 @@ on the RTX 5090 setup. The next meaningful engineering step is either to add
 delta-output diagnostics for the multimodal smoke checkpoint or to enable a
 small LoRA training smoke.
 ```
+
+### 8.7 Multimodal delta diagnostic
+
+Command:
+
+```bash
+python scripts/analyze_mm_delta_outputs.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --checkpoint /root/autodl-tmp/outputs/mm_smoke/mm_sft_smoke_final \
+  --name mm_sft_smoke_30step \
+  --num_samples 20 \
+  --max_length 3072 \
+  --output /root/autodl-tmp/outputs/mm_smoke/delta_diag_mm_sft_smoke_20.json \
+  --save_raw
+```
+
+Observed summary:
+
+```text
+delta_q_per_dim_std_mean: 0.2534600794315338
+delta_a_per_dim_std_mean: 0.028002941980957985
+delta_p_per_dim_std_mean: 0.008766541257500648
+delta_a_argmax_unique_per_user_mean: 1.15
+delta_a_entropy_mean: 0.8596800911881917
+delta_p_entropy_mean: 1.9475480959227327
+warnings: ['delta_a_argmax_nearly_constant']
+```
+
+Interpretation:
+
+```text
+delta_q has clear cross-sample variation.
+delta_p has nonzero cross-sample variation and a smooth power split.
+delta_a has soft-value variation, but the argmax UAV choice is nearly fixed.
+```
+
+Conclusion:
+
+```text
+The projection-head-only multimodal smoke checkpoint does not show global
+delta collapse, but association argmax behavior is still too conservative.
+This is expected because the Gemma3 backbone is frozen, LoRA is not enabled,
+and only 20 smoke samples / 30 projection-head steps were used.
+```
+
+Next action:
+
+```text
+Enable a small LoRA multimodal SFT smoke with CTL-only loss first.
+The goal is not final performance; it is to verify memory, gradients, and
+whether backbone adaptation can start improving environment-conditioned
+association behavior.
+```

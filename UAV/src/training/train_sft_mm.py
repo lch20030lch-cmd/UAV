@@ -54,10 +54,12 @@ def _grad_norm(parameters) -> float:
     return total ** 0.5
 
 
-def _save_projection_smoke(model, save_dir: Path, metadata: dict):
+def _save_mm_smoke(model, save_dir: Path, metadata: dict, save_lora: bool = False):
     save_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.projection_head.state_dict(), save_dir / "projection_head.pt")
     model.processor.save_pretrained(save_dir / "processor")
+    if save_lora and hasattr(model.base_model, "save_pretrained"):
+        model.base_model.save_pretrained(save_dir / "lora")
     with (save_dir / "metadata.json").open("w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
@@ -69,6 +71,7 @@ def train_mm_sft_smoke(
     max_steps: int = None,
     max_length: int = None,
     output_dir: str = None,
+    train_lora: bool = False,
 ):
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -96,7 +99,7 @@ def train_mm_sft_smoke(
     print(f"  model:      {model_name}")
     print(f"  max_length: {max_seq_length}")
     print(f"  steps:      {steps_limit}")
-    print("  trainable:  projection_head only")
+    print(f"  trainable:  {'projection_head + LoRA' if train_lora else 'projection_head only'}")
     print()
 
     model = Gemma3MultimodalISAC(
@@ -106,11 +109,19 @@ def train_mm_sft_smoke(
         proj_head_config=build_proj_head_config(model_cfg, sim_cfg),
         attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
         freeze_vision_tower=model_cfg.get("freeze_vision_tower", True),
+        enable_lora=train_lora,
+        lora_rank=model_cfg["lora"]["rank"],
+        lora_alpha=model_cfg["lora"]["alpha"],
+        lora_dropout=model_cfg["lora"].get("dropout", 0.0),
+        lora_target_modules=model_cfg["lora"]["target_modules"],
     )
 
-    for param in model.base_model.parameters():
-        param.requires_grad = False
-    model.base_model.eval()
+    if train_lora:
+        model.base_model.train()
+    else:
+        for param in model.base_model.parameters():
+            param.requires_grad = False
+        model.base_model.eval()
     model.projection_head.train()
 
     dataset = MultimodalSFTDataset(
@@ -135,11 +146,20 @@ def train_mm_sft_smoke(
         lambda_p=model_cfg["loss"]["lambda_p"],
         lambda_sep=model_cfg["loss"]["lambda_sep"],
     )
+    proj_params = [p for p in model.projection_head.parameters() if p.requires_grad]
+    lora_params = [
+        p for n, p in model.base_model.named_parameters()
+        if p.requires_grad and "lora_" in n
+    ]
+    param_groups = [{"params": proj_params, "lr": 1e-3}]
+    if train_lora and lora_params:
+        param_groups.append({"params": lora_params, "lr": train_cfg.get("learning_rate", 2e-4)})
     optimizer = torch.optim.AdamW(
-        model.projection_head.parameters(),
-        lr=train_cfg.get("learning_rate", 2e-4),
+        param_groups,
         weight_decay=train_cfg.get("weight_decay", 0.01),
     )
+    print(f"  trainable projection tensors: {len(proj_params)}")
+    print(f"  trainable LoRA tensors:       {len(lora_params)}")
 
     device = model.device
     global_step = 0
@@ -185,10 +205,9 @@ def train_mm_sft_smoke(
             optimizer.zero_grad(set_to_none=True)
             total_loss.backward()
             grad_norm = _grad_norm(model.projection_head.parameters())
-            torch.nn.utils.clip_grad_norm_(
-                model.projection_head.parameters(),
-                cfg["hardware"].get("max_grad_norm", 1.0),
-            )
+            grad_norm_lora = _grad_norm(lora_params) if train_lora else 0.0
+            clip_params = list(model.projection_head.parameters()) + lora_params
+            torch.nn.utils.clip_grad_norm_(clip_params, cfg["hardware"].get("max_grad_norm", 1.0))
             optimizer.step()
 
             global_step += 1
@@ -197,37 +216,41 @@ def train_mm_sft_smoke(
                 f"step={global_step} epoch={epoch} "
                 f"loss_ctl={metrics['loss_ctl']:.6f} "
                 f"loss_total={metrics['loss_total']:.6f} "
-                f"grad_norm_proj={grad_norm:.6f}"
+                f"grad_norm_proj={grad_norm:.6f} "
+                f"grad_norm_lora={grad_norm_lora:.6f}"
             )
 
             if torch.isnan(total_loss):
                 raise RuntimeError("NaN loss detected in multimodal SFT smoke.")
 
             if global_step % train_cfg.get("save_steps", 10) == 0:
-                _save_projection_smoke(
+                _save_mm_smoke(
                     model,
-                    ckpt_root / f"mm_sft_smoke_step_{global_step}",
+                    ckpt_root / f"mm_sft_{'lora_' if train_lora else ''}smoke_step_{global_step}",
                     {
                         "global_step": global_step,
                         "loss_ctl": metrics["loss_ctl"],
                         "loss_total": metrics["loss_total"],
                         "grad_norm_proj": grad_norm,
-                        "trainable": "projection_head_only",
+                        "grad_norm_lora": grad_norm_lora,
+                        "trainable": "projection_head_lora" if train_lora else "projection_head_only",
                     },
+                    save_lora=train_lora,
                 )
 
     pbar.close()
 
-    final_dir = out_root / "mm_sft_smoke_final"
-    _save_projection_smoke(
+    final_dir = out_root / ("mm_sft_lora_smoke_final" if train_lora else "mm_sft_smoke_final")
+    _save_mm_smoke(
         model,
         final_dir,
         {
             "global_step": global_step,
             "max_steps": steps_limit,
             "max_seq_length": max_seq_length,
-            "trainable": "projection_head_only",
+            "trainable": "projection_head_lora" if train_lora else "projection_head_only",
         },
+        save_lora=train_lora,
     )
     print()
     print("OK: multimodal SFT smoke complete")
@@ -242,6 +265,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--train_lora", action="store_true")
     args = parser.parse_args()
 
     train_mm_sft_smoke(
@@ -251,4 +275,5 @@ if __name__ == "__main__":
         max_steps=args.max_steps,
         max_length=args.max_length,
         output_dir=args.output_dir,
+        train_lora=args.train_lora,
     )
