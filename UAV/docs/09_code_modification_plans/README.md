@@ -7,6 +7,7 @@
 | 文件 | 内容 |
 |---|---|
 | `bev_image_mllm_implementation_plan_2026-07-07.md` | BEV-image MLLM 分支实现方案，包含需要保留/新增/改造的模块、训练烟测顺序、风险与验收标准 |
+| `rtx5090_32g_mllm_smoke_plan_2026-07-08.md` | RTX 5090 32GB 省钱路线：先跑通 BEV-image MLLM 最小闭环，只做数据、processor、forward、SFT smoke，不做正式大训练 |
 
 使用建议：
 

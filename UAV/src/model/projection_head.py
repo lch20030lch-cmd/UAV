@@ -341,7 +341,7 @@ class ConstraintProjectionHead(nn.Module):
 
     def __init__(
         self,
-        hidden_dim: int = 3840,
+        hidden_dim: int = 2560,  # Gemma 3 4B hidden_size
         num_control_tokens: int = 8,
         mlp_hidden: list = None,
         readout_out_dim: int = 128,

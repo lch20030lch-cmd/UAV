@@ -43,6 +43,7 @@ class EnvironmentSample:
     comm_summary: Dict               # c(t)
     sensing_summary: Dict            # r(t)
     bev_grid_text: str               # V(t) — 文本格式的 BEV
+    bev_image_path: Optional[str] = None  # V(t) — optional rendered BEV image path
 
 
 class ISACScenarioGenerator:

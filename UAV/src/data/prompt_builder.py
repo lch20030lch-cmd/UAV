@@ -122,6 +122,34 @@ def build_full_prompt(
     return "\n\n".join(parts)
 
 
+def build_multimodal_prompt(
+    env_sample,
+    config: dict,
+) -> str:
+    """
+    Build the text part of a BEV-image multimodal prompt.
+
+    This keeps c(t) and r(t) as text, but replaces the full text-grid BEV with a
+    short description of the attached image. Model-specific image placeholders
+    are intentionally left to the processor/chat-template layer.
+    """
+    parts = []
+
+    parts.append(build_system_prompt(config))
+    parts.append(build_communication_summary_str(env_sample.comm_summary))
+    parts.append(build_sensing_summary_str(env_sample.sensing_summary))
+    parts.append(
+        "[Bird's-Eye-View Image]\n"
+        "The attached BEV image encodes the spatial geometry of UAVs, ground "
+        "users, and sensing targets over the service area. Use it together "
+        "with the communication and sensing summaries to infer coverage holes, "
+        "load imbalance, target proximity, and movement directions."
+    )
+    parts.append("\nNow propose the warm-start decision prior delta in JSON format.")
+
+    return "\n\n".join(parts)
+
+
 def format_oracle_response(sample_id: int, delta_q, delta_a, delta_p) -> str:
     """
     将 Oracle prior 序列化为 JSON 响应字符串
