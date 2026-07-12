@@ -22,7 +22,7 @@ training:
     lr_scheduler: "cosine"
     warmup_ratio: 0.03
     weight_decay: 0.01
-    max_seq_length: 1024
+    max_seq_length: 3072
     save_steps: 10
     save_total_limit: 2
     logging_steps: 1
@@ -44,7 +44,7 @@ training:
     warmup_ratio: 0.03
     beta: 0.1
     mu: 0.0
-    max_seq_length: 1024
+    max_seq_length: 3072
     save_steps: 10
     logging_steps: 1
 
