@@ -790,3 +790,70 @@ LoRA 3-step 的目标是链路验证，不是效果验证。
 如果 10-step 无 OOM / NaN，再做同样的 checkpoint forward smoke 和 delta 诊断。
 重点观察 delta_a_argmax_unique_per_user_mean 是否高于 1.05，以及 delta_a_per_dim_std_mean 是否回升。
 ```
+
+---
+
+## 10. 2026-07-12：LoRA 10-step delta 诊断结果
+
+LoRA 10-step 训练完成，并使用同一 final checkpoint 跑完 delta 诊断。
+
+checkpoint 加载确认：
+
+```text
+loaded_projection: /root/autodl-tmp/outputs/mm_smoke/mm_sft_lora_smoke_final/projection_head.pt
+loaded_control_embeddings: {'ctrl_embed': '/root/autodl-tmp/outputs/mm_smoke/mm_sft_lora_smoke_final/ctrl_embed.pt'}
+loaded_lora_checkpoint: /root/autodl-tmp/outputs/mm_smoke/mm_sft_lora_smoke_final/lora
+```
+
+delta 诊断摘要：
+
+```text
+delta_q_per_dim_std_mean: 0.04045112803578377
+delta_a_per_dim_std_mean: 0.006317050661891699
+delta_p_per_dim_std_mean: 0.001469331793487072
+delta_a_argmax_unique_per_user_mean: 1.15
+delta_a_entropy_mean: 0.5970468373315758
+delta_p_entropy_mean: 1.6385927804566645
+warnings: ['delta_a_argmax_nearly_constant']
+```
+
+与 LoRA 3-step 对比：
+
+```text
+LoRA 3-step:
+  delta_q_per_dim_std_mean: 0.0464276485145092
+  delta_a_per_dim_std_mean: 0.00784333422780037
+  delta_p_per_dim_std_mean: 0.001915224944241345
+  delta_a_argmax_unique_per_user_mean: 1.05
+
+LoRA 10-step:
+  delta_q_per_dim_std_mean: 0.04045112803578377
+  delta_a_per_dim_std_mean: 0.006317050661891699
+  delta_p_per_dim_std_mean: 0.001469331793487072
+  delta_a_argmax_unique_per_user_mean: 1.15
+```
+
+判断：
+
+```text
+LoRA 10-step 训练与 checkpoint 诊断链路 PASS。
+association argmax 唯一性从 1.05 回到 1.15，与 projection-head-only 30-step 持平。
+但 delta_q / delta_a / delta_p 的跨样本 soft 方差仍低于 projection-head-only 30-step。
+warnings 仍包含 delta_a_argmax_nearly_constant。
+```
+
+解释：
+
+```text
+10-step LoRA 已经不只是链路验证；它开始恢复少量 association argmax 多样性。
+但样本数只有 20，训练步数仍短，且当前只做 CTL-only 监督，没有 DPO 或 SCA-FP 闭环评估。
+因此不应据此判断 LoRA 效果不好，只能判断：LoRA 10-step 仍未解决 association argmax 保守问题。
+```
+
+下一步建议：
+
+```text
+建议运行 LoRA 30-step，和此前 projection-head-only 30-step 做同步步数对照。
+为了避免覆盖 10-step checkpoint，建议给 30-step 单独 output_dir。
+如果 LoRA 30-step 仍然低方差，则下一轮重点转向数据量和监督信号，而不是继续盲目加步数。
+```
