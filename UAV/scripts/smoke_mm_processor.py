@@ -55,7 +55,12 @@ def _encode_text_image(processor, prompt: str, image, max_length: int):
 
 
 def _get_image_token(processor) -> str:
-    token = getattr(processor, "image_token", None)
+    tokenizer = getattr(processor, "tokenizer", None)
+    token = getattr(tokenizer, "boi_token", None) if tokenizer is not None else None
+    if token is None and tokenizer is not None:
+        token = getattr(tokenizer, "image_token", None)
+    if token is None:
+        token = getattr(processor, "image_token", None)
     if token is None:
         token = "<start_of_image>"
     return str(token)
