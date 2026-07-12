@@ -1263,8 +1263,9 @@ association-only 训练仍然没有解决 argmax 固定。
 ```text
 scripts/analyze_mm_delta_outputs.py
   - 新增 delta_a_raw 收集。
+  - 新增 control_states 与 delta_raw 收集。
   - 保存 raw npz 时包含 delta_a_raw。
-  - summary 打印 projected delta_a 与 raw delta_a 的 argmax 多样性。
+  - summary 打印 projected delta_a、raw delta_a、control_states、delta_raw 的跨样本多样性。
 ```
 
 建议重跑 association-only checkpoint 诊断，不需要重新训练：
@@ -1289,4 +1290,6 @@ delta_a_argmax_unique_per_user_mean
 delta_a_raw_argmax_unique_per_user_mean
 delta_a_raw_per_dim_std_mean
 delta_a_raw_entropy_mean
+control_states_per_dim_std_mean
+delta_raw_per_dim_std_mean
 ```

@@ -79,6 +79,8 @@ def _summarize_deltas(
     delta_a: np.ndarray,
     delta_p: np.ndarray,
     delta_a_raw: np.ndarray = None,
+    control_states: np.ndarray = None,
+    delta_raw: np.ndarray = None,
 ) -> Dict:
     summary = {}
     summary.update(_summarize_tensor("delta_q", delta_q))
@@ -90,6 +92,10 @@ def _summarize_deltas(
     if delta_a_raw is not None:
         summary.update(_summarize_tensor("delta_a_raw", delta_a_raw))
         summary.update(_summarize_association("delta_a_raw", delta_a_raw))
+    if control_states is not None:
+        summary.update(_summarize_tensor("control_states", control_states))
+    if delta_raw is not None:
+        summary.update(_summarize_tensor("delta_raw", delta_raw))
 
     p = np.clip(delta_p, 0.0, None)
     p_sum = p.sum(axis=2, keepdims=True)
@@ -168,6 +174,8 @@ def _collect_deltas(
     delta_as: List[np.ndarray] = []
     delta_ps: List[np.ndarray] = []
     delta_a_raws: List[np.ndarray] = []
+    control_states_list: List[np.ndarray] = []
+    delta_raws: List[np.ndarray] = []
 
     for idx, batch in enumerate(tqdm(dataloader, desc="MM delta inference")):
         if idx >= num_samples:
@@ -191,6 +199,10 @@ def _collect_deltas(
         delta_ps.append(_as_np(outputs["delta_p"].squeeze(0)))
         if "delta_a_raw" in outputs:
             delta_a_raws.append(_as_np(outputs["delta_a_raw"].squeeze(0)))
+        if "control_states" in outputs:
+            control_states_list.append(_as_np(outputs["control_states"].squeeze(0)))
+        if "delta_raw" in outputs:
+            delta_raws.append(_as_np(outputs["delta_raw"].squeeze(0)))
 
     result = {
         "delta_q": np.stack(delta_qs, axis=0),
@@ -199,6 +211,10 @@ def _collect_deltas(
     }
     if delta_a_raws:
         result["delta_a_raw"] = np.stack(delta_a_raws, axis=0)
+    if control_states_list:
+        result["control_states"] = np.stack(control_states_list, axis=0)
+    if delta_raws:
+        result["delta_raw"] = np.stack(delta_raws, axis=0)
     return result
 
 
@@ -265,6 +281,8 @@ def main():
         deltas["delta_a"],
         deltas["delta_p"],
         deltas.get("delta_a_raw"),
+        deltas.get("control_states"),
+        deltas.get("delta_raw"),
     )
 
     result = {
@@ -311,6 +329,10 @@ def main():
         "delta_a_raw_argmax_unique_per_user_mean",
         "delta_a_raw_argmax_fixed_user_count",
         "delta_a_raw_entropy_mean",
+        "control_states_per_dim_std_mean",
+        "control_states_per_dim_std_max",
+        "delta_raw_per_dim_std_mean",
+        "delta_raw_per_dim_std_max",
         "delta_p_entropy_mean",
         "warnings",
     ):
