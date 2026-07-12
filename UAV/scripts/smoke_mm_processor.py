@@ -54,6 +54,23 @@ def _encode_text_image(processor, prompt: str, image, max_length: int):
         return processor(**kwargs)
 
 
+def _get_image_token(processor) -> str:
+    token = getattr(processor, "image_token", None)
+    if token is None:
+        token = "<start_of_image>"
+    return str(token)
+
+
+def _ensure_one_image_token(processor, prompt: str) -> str:
+    image_token = _get_image_token(processor)
+    if image_token in prompt:
+        return prompt
+    marker = "[Bird's-Eye-View Image]"
+    if marker in prompt:
+        return prompt.replace(marker, f"{image_token}\n{marker}", 1)
+    return f"{image_token}\n{prompt}"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Smoke test multimodal processor")
     parser.add_argument("--config", type=str, default="configs/rtx5090_multimodal_smoke.yaml")
@@ -96,7 +113,8 @@ def main():
     if any(tid is None or tid == tokenizer.unk_token_id for tid in control_token_ids):
         raise ValueError("Control tokens were not registered correctly")
 
-    encoded = _encode_text_image(processor, item["prompt"], image, max_length)
+    prompt = _ensure_one_image_token(processor, item["prompt"])
+    encoded = _encode_text_image(processor, prompt, image, max_length)
     input_ids = encoded["input_ids"]
     attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids))
 
