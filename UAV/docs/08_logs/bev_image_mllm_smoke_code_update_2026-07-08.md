@@ -616,3 +616,105 @@ loss_ctl has numeric values
 grad_norm has numeric values
 checkpoint can be saved
 ```
+
+### 8.5 Multimodal SFT smoke
+
+Added file used in this smoke:
+
+```text
+src/training/train_sft_mm.py
+```
+
+Training mode:
+
+```text
+projection-head-only CTL smoke
+Gemma3 multimodal backbone frozen
+vision tower frozen
+no token-level CE loss
+no LoRA update yet
+```
+
+Rationale:
+
+```text
+This is the lowest-risk RTX 5090 32GB training smoke. It validates the training
+shell around the already-passing multimodal forward path before adding LoRA
+or token-level SFT losses.
+```
+
+Command:
+
+```bash
+python src/training/train_sft_mm.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --max_steps 10 \
+  --max_length 3072
+```
+
+Observed training output:
+
+```text
+step=1  loss_ctl=72.270164   grad_norm_proj=348.923516
+step=2  loss_ctl=92.060333   grad_norm_proj=354.783184
+step=3  loss_ctl=68.496063   grad_norm_proj=295.408330
+step=4  loss_ctl=83.245941   grad_norm_proj=305.034217
+step=5  loss_ctl=56.014587   grad_norm_proj=239.805846
+step=6  loss_ctl=76.060646   grad_norm_proj=263.420681
+step=7  loss_ctl=71.136230   grad_norm_proj=248.398176
+step=8  loss_ctl=107.080132  grad_norm_proj=281.475067
+step=9  loss_ctl=75.074249   grad_norm_proj=246.545792
+step=10 loss_ctl=76.983398   grad_norm_proj=244.714702
+```
+
+Final output:
+
+```text
+OK: multimodal SFT smoke complete
+final_checkpoint: /root/autodl-tmp/outputs/mm_smoke/mm_sft_smoke_final
+```
+
+Checkpoint paths:
+
+```text
+/root/autodl-tmp/outputs/mm_smoke/mm_sft_smoke_final
+/root/autodl-tmp/checkpoints/mm_smoke/mm_sft_smoke_step_10
+```
+
+Result:
+
+```text
+10 training steps completed.
+No OOM observed.
+No NaN observed.
+loss_ctl produced numeric values.
+grad_norm_proj produced numeric values.
+Final checkpoint was saved.
+```
+
+Updated milestone status:
+
+```text
+Step 1: generate_mm_smoke.py              PASS
+Step 2: smoke_mm_processor.py             PASS
+Step 3: smoke_mm_forward.py               PASS
+Step 4: train_sft_mm.py, 10-step smoke    PASS
+```
+
+Current conclusion:
+
+```text
+The BEV-image MLLM minimal training loop is now validated at projection-head
+level. The project has moved beyond data/processor/forward smoke and can now
+test longer CTL smoke or a LoRA-enabled multimodal SFT smoke.
+```
+
+Recommended next options:
+
+```text
+1. Run projection-head-only smoke for 30 steps to check stability.
+2. Add a delta diagnostic path for mm_sft_smoke_final.
+3. Add LoRA-enabled multimodal SFT smoke after confirming memory headroom.
+```
