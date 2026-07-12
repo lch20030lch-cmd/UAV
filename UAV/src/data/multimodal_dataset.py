@@ -111,6 +111,11 @@ class MultimodalSFTDataset(Dataset):
         prompt_ids = encoded["input_ids"].tolist()
         prompt_attention = encoded.get("attention_mask", torch.ones_like(encoded["input_ids"])).tolist()
         prompt_token_type = encoded.get("token_type_ids", torch.ones_like(encoded["input_ids"])).tolist()
+        if len(prompt_token_type) < len(prompt_ids):
+            fill_value = prompt_token_type[-1] if prompt_token_type else 1
+            prompt_token_type += [fill_value] * (len(prompt_ids) - len(prompt_token_type))
+        elif len(prompt_token_type) > len(prompt_ids):
+            prompt_token_type = prompt_token_type[:len(prompt_ids)]
 
         response_enc = self.tokenizer(
             item["response"],
@@ -143,6 +148,9 @@ class MultimodalSFTDataset(Dataset):
             labels = labels[:self.max_length]
             label_mask = label_mask[:self.max_length]
             control_mask = control_mask[:self.max_length]
+
+        if not (len(input_ids) == len(attention_mask) == len(token_type_ids) == len(labels) == len(control_mask)):
+            raise RuntimeError("Multimodal token fields have inconsistent lengths after padding/truncation.")
 
         result = {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
