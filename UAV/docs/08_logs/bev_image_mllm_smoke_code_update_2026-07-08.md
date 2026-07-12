@@ -1545,3 +1545,92 @@ python scripts/analyze_mm_target_distribution.py \
   --prediction_npz /root/autodl-tmp/outputs/mm_smoke_proj_assoc_raw_ce_overfit/delta_diag_mm_proj_assoc_raw_ce_overfit.npz \
   --output /root/autodl-tmp/outputs/mm_smoke_proj_assoc_raw_ce_overfit/target_vs_pred_proj_assoc_raw_ce_overfit.json
 ```
+
+target-vs-pred 结果：
+
+```text
+pred_delta_a_argmax_unique_per_user_mean: 2.8
+pred_delta_a_argmax_fixed_user_count: 0
+argmax_match_rate_mean: 0.45
+argmax_match_rate_per_user_min: 0.2
+argmax_match_rate_per_user_max: 0.7
+```
+
+判断：
+
+```text
+projection-head-only overfit 不仅提高了输出多样性，也提高了 target-vs-pred argmax 匹配率。
+argmax_match_rate_mean 从 association-only / raw-CE LoRA 的约 0.30-0.32 提升到 0.45。
+这仍不是最终可用精度，但已经明显高于 4 类随机基线 0.25。
+```
+
+下一步：
+
+```text
+进入 staged smoke，而不是继续单一目标 overfit。
+推荐先复用这个有效 checkpoint，恢复 q/p CTL，但仍保持 backbone 冻结：
+  - 加载 overfit checkpoint 的 projection_head.pt / ctrl_embed.pt。
+  - projection_lr 降到 0.001 或 0.002。
+  - 打开 lambda_q/lambda_a/lambda_p。
+  - 保留较小 lambda_assoc_raw_ce，防止 association 退回固定解。
+```
+
+建议 staged smoke 命令：
+
+```bash
+python src/training/train_sft_mm.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --max_steps 100 \
+  --max_length 3072 \
+  --output_dir /root/autodl-tmp/outputs/mm_smoke_proj_staged_ctl \
+  --projection_lr 0.002 \
+  --lambda_q 1.0 \
+  --lambda_a 0.5 \
+  --lambda_p 0.3 \
+  --lambda_assoc_ce 0 \
+  --lambda_assoc_raw_ce 0.2
+```
+
+注意：
+
+```text
+已给 train_sft_mm.py 新增 --init_checkpoint。
+它会从已有 mm smoke checkpoint 加载 projection_head.pt 与 ctrl_embed.pt。
+如果同时开启 --train_lora 且 checkpoint 内存在 lora/，也会挂载 LoRA adapter。
+```
+
+更新后的严格 staged smoke 命令：
+
+```bash
+python src/training/train_sft_mm.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --init_checkpoint /root/autodl-tmp/outputs/mm_smoke_proj_assoc_raw_ce_overfit/mm_sft_smoke_final \
+  --max_steps 100 \
+  --max_length 3072 \
+  --output_dir /root/autodl-tmp/outputs/mm_smoke_proj_staged_ctl \
+  --projection_lr 0.002 \
+  --lambda_q 1.0 \
+  --lambda_a 0.5 \
+  --lambda_p 0.3 \
+  --lambda_assoc_ce 0 \
+  --lambda_assoc_raw_ce 0.2
+```
+
+对应诊断：
+
+```bash
+python scripts/analyze_mm_delta_outputs.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --checkpoint /root/autodl-tmp/outputs/mm_smoke_proj_staged_ctl/mm_sft_smoke_final \
+  --name mm_proj_staged_ctl \
+  --num_samples 20 \
+  --max_length 3072 \
+  --output /root/autodl-tmp/outputs/mm_smoke_proj_staged_ctl/delta_diag_mm_proj_staged_ctl.json \
+  --save_raw
+```

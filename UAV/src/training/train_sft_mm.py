@@ -67,6 +67,35 @@ def _save_mm_smoke(model, save_dir: Path, metadata: dict, save_lora: bool = Fals
         json.dump(metadata, f, indent=2)
 
 
+def _resolve_lora_checkpoint(init_checkpoint: str, train_lora: bool):
+    if not init_checkpoint or not train_lora:
+        return None
+    candidate = Path(init_checkpoint) / "lora"
+    if (candidate / "adapter_config.json").exists():
+        return str(candidate)
+    return None
+
+
+def _load_mm_smoke_checkpoint(model, init_checkpoint: str) -> dict:
+    if not init_checkpoint:
+        return {}
+    ckpt_dir = Path(init_checkpoint)
+    if not ckpt_dir.exists():
+        raise FileNotFoundError(f"init checkpoint not found: {ckpt_dir}")
+
+    loaded = {"init_checkpoint": str(ckpt_dir)}
+    proj_path = ckpt_dir / "projection_head.pt"
+    if proj_path.exists():
+        state = torch.load(proj_path, map_location="cpu")
+        model.projection_head.load_state_dict(state)
+        loaded["projection_head"] = str(proj_path)
+
+    loaded_ctrl = model.load_control_token_embeddings(ckpt_dir)
+    if loaded_ctrl:
+        loaded["control_token_embeddings"] = loaded_ctrl
+    return loaded
+
+
 def train_mm_sft_smoke(
     config_path: str,
     data_dir: str = None,
@@ -82,6 +111,7 @@ def train_mm_sft_smoke(
     lambda_assoc_raw_ce: float = None,
     projection_lr: float = None,
     lora_lr_override: float = None,
+    init_checkpoint: str = None,
 ):
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -101,6 +131,7 @@ def train_mm_sft_smoke(
     out_root = Path(output_dir or cfg.get("output_dir", "/root/autodl-tmp/outputs/mm_smoke"))
     ckpt_root = Path(cfg.get("checkpoint_dir", "/root/autodl-tmp/checkpoints/mm_smoke"))
     ckpt_root.mkdir(parents=True, exist_ok=True)
+    init_lora_checkpoint = _resolve_lora_checkpoint(init_checkpoint, train_lora)
 
     print("=" * 60)
     print("BEV-image multimodal SFT smoke")
@@ -124,7 +155,11 @@ def train_mm_sft_smoke(
         lora_alpha=model_cfg["lora"]["alpha"],
         lora_dropout=model_cfg["lora"].get("dropout", 0.0),
         lora_target_modules=model_cfg["lora"]["target_modules"],
+        lora_checkpoint=init_lora_checkpoint,
     )
+    loaded_init = _load_mm_smoke_checkpoint(model, init_checkpoint)
+    if loaded_init:
+        print(f"  init_checkpoint: {loaded_init}")
 
     if train_lora:
         model.base_model.train()
@@ -288,6 +323,7 @@ def train_mm_sft_smoke(
                         "lambda_p": lambda_p_value,
                         "lambda_assoc_ce": assoc_ce_weight,
                         "lambda_assoc_raw_ce": assoc_raw_ce_weight,
+                        "loaded_init": loaded_init,
                     },
                     save_lora=train_lora,
                 )
@@ -312,6 +348,7 @@ def train_mm_sft_smoke(
             "lambda_p": lambda_p_value,
             "lambda_assoc_ce": assoc_ce_weight,
             "lambda_assoc_raw_ce": assoc_raw_ce_weight,
+            "loaded_init": loaded_init,
         },
         save_lora=train_lora,
     )
@@ -343,6 +380,8 @@ if __name__ == "__main__":
                         help="可选 projection head 学习率覆盖值")
     parser.add_argument("--lora_lr", type=float, default=None,
                         help="可选 LoRA 学习率覆盖值")
+    parser.add_argument("--init_checkpoint", type=str, default=None,
+                        help="可选：从已有 mm smoke checkpoint 加载 projection head / control token / LoRA")
     args = parser.parse_args()
 
     train_mm_sft_smoke(
@@ -360,4 +399,5 @@ if __name__ == "__main__":
         lambda_assoc_raw_ce=args.lambda_assoc_raw_ce,
         projection_lr=args.projection_lr,
         lora_lr_override=args.lora_lr,
+        init_checkpoint=args.init_checkpoint,
     )
