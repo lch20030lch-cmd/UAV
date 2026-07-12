@@ -1634,3 +1634,83 @@ python scripts/analyze_mm_delta_outputs.py \
   --output /root/autodl-tmp/outputs/mm_smoke_proj_staged_ctl/delta_diag_mm_proj_staged_ctl.json \
   --save_raw
 ```
+
+---
+
+## 13. 2026-07-12：阶段性原因总结与暂停点
+
+今天最终定位：
+
+```text
+association argmax 固定不是由 oracle 标签单一导致。
+oracle target 本身具备足够多样性：
+  target_delta_a_argmax_unique_per_user_mean: 4.0
+  target_delta_a_argmax_fixed_user_count: 0
+
+association argmax 固定也不是 Sinkhorn / AssociationProjection 投影后压塌导致。
+delta_a_raw 投影前已经近乎固定：
+  delta_a_raw_argmax_unique_per_user_mean: 1.05
+  delta_a_raw_argmax_fixed_user_count: 19
+
+control token 表示本身不是完全无信息。
+control_states 跨样本方差明显：
+  control_states_per_dim_std_mean: 约 0.41 - 0.43
+```
+
+核心判断：
+
+```text
+问题主要发生在 projection head/readout 的训练与优化阶段。
+常规 LoRA + CTL、association CE、raw association CE 训练下，
+readout 没有把 control_states 中的样本差异映射到 association logits。
+表现为：
+  delta_raw 方差低
+  delta_a_raw 方差低
+  association argmax 基本固定
+```
+
+排除项：
+
+```text
+不是数据标签缺多样性。
+不是 BEV-image processor / forward 链路问题。
+不是 checkpoint 加载问题。
+不是 Sinkhorn 投影单独导致。
+不是 projection head 结构完全不可用。
+```
+
+关键正结果：
+
+```text
+projection-head-only overfit 探针成功。
+冻结 backbone、不训练 LoRA、提高 projection_lr、只使用 raw association CE 后：
+  delta_a_argmax_unique_per_user_mean: 2.8
+  delta_a_argmax_fixed_user_count: 0
+  argmax_match_rate_mean: 0.45
+  warnings: []
+
+这说明：
+  control_states 中有可用信息。
+  projection head/readout 有能力读出 association。
+  当前失败更偏训练策略 / 优化配置问题，而不是模型结构完全错误。
+```
+
+最可能原因：
+
+```text
+1. 默认 projection_lr=1e-3 对 association readout 偏弱。
+2. q/p/BCE 联合 CTL 目标会把 projection head 推向低方差保守解。
+3. 20 条 smoke 数据上 LoRA 联合训练没有带来帮助，反而可能扰动 projection head 优化。
+4. association 需要先独立 warmup，再恢复 q/p 联合目标。
+```
+
+当前暂停点：
+
+```text
+今天不继续跑 staged training。
+代码已经支持 --init_checkpoint，可从 overfit checkpoint 恢复 projection_head.pt / ctrl_embed.pt。
+下一次建议从 staged smoke 开始：
+  Stage A: projection-only raw association CE warmup 已完成。
+  Stage B: 从 warmup checkpoint 恢复 q/p CTL，观察 association 是否保住。
+  Stage C: 再考虑小 LR LoRA 联合微调。
+```
