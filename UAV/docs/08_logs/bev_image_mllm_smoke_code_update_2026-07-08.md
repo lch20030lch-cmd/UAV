@@ -718,3 +718,82 @@ Recommended next options:
 2. Add a delta diagnostic path for mm_sft_smoke_final.
 3. Add LoRA-enabled multimodal SFT smoke after confirming memory headroom.
 ```
+
+### 8.6 Multimodal SFT smoke, 30-step stability check
+
+Command:
+
+```bash
+python src/training/train_sft_mm.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --max_steps 30 \
+  --max_length 3072
+```
+
+Training mode:
+
+```text
+projection-head-only CTL smoke
+Gemma3 multimodal backbone frozen
+vision tower frozen
+no token-level CE loss
+no LoRA update yet
+```
+
+Observed output summary:
+
+```text
+Loading weights completed.
+30 / 30 training steps completed.
+Runtime: about 26 seconds.
+Throughput: about 1.12 it/s.
+No OOM observed.
+No NaN observed.
+```
+
+Selected metrics:
+
+```text
+step=1  loss_ctl=72.270164   grad_norm_proj=348.923516
+step=10 loss_ctl=76.983398   grad_norm_proj=244.714702
+step=20 loss_ctl=65.143181   grad_norm_proj=201.112136
+step=30 loss_ctl=69.149162   grad_norm_proj=199.785992
+```
+
+Metric trend:
+
+```text
+loss_ctl remains noisy across the 20-sample smoke dataset, which is expected
+for projection-head-only training with shuffled small data.
+
+grad_norm_proj remains finite and generally decreases from the initial
+~350 range toward the ~200 range, indicating that backward and optimizer
+updates are functioning.
+```
+
+Final status:
+
+```text
+OK: multimodal SFT smoke complete
+```
+
+Updated milestone status:
+
+```text
+Step 1: generate_mm_smoke.py                    PASS
+Step 2: smoke_mm_processor.py                   PASS
+Step 3: smoke_mm_forward.py                     PASS
+Step 4a: train_sft_mm.py, 10-step smoke         PASS
+Step 4b: train_sft_mm.py, 30-step stability     PASS
+```
+
+Current conclusion:
+
+```text
+The projection-head-only BEV-image MLLM training smoke is stable for 30 steps
+on the RTX 5090 setup. The next meaningful engineering step is either to add
+delta-output diagnostics for the multimodal smoke checkpoint or to enable a
+small LoRA training smoke.
+```
