@@ -857,3 +857,118 @@ warnings 仍包含 delta_a_argmax_nearly_constant。
 为了避免覆盖 10-step checkpoint，建议给 30-step 单独 output_dir。
 如果 LoRA 30-step 仍然低方差，则下一轮重点转向数据量和监督信号，而不是继续盲目加步数。
 ```
+
+---
+
+## 11. 2026-07-12：LoRA 30-step delta 诊断结果
+
+LoRA 30-step 使用独立输出目录：
+
+```text
+/root/autodl-tmp/outputs/mm_smoke_lora_30step/mm_sft_lora_smoke_final
+```
+
+checkpoint 加载确认：
+
+```text
+loaded_projection: /root/autodl-tmp/outputs/mm_smoke_lora_30step/mm_sft_lora_smoke_final/projection_head.pt
+loaded_control_embeddings: {'ctrl_embed': '/root/autodl-tmp/outputs/mm_smoke_lora_30step/mm_sft_lora_smoke_final/ctrl_embed.pt'}
+loaded_lora_checkpoint: /root/autodl-tmp/outputs/mm_smoke_lora_30step/mm_sft_lora_smoke_final/lora
+```
+
+delta 诊断摘要：
+
+```text
+delta_q_per_dim_std_mean: 0.02685587666928768
+delta_a_per_dim_std_mean: 0.0034748991020023823
+delta_p_per_dim_std_mean: 0.0009771875338628888
+delta_a_argmax_unique_per_user_mean: 1.0
+delta_a_entropy_mean: 0.5788906493657344
+delta_p_entropy_mean: 1.897453458410468
+warnings: ['delta_a_argmax_nearly_constant']
+```
+
+3-step / 10-step / 30-step 对比：
+
+```text
+LoRA 3-step:
+  delta_q_per_dim_std_mean: 0.0464276485145092
+  delta_a_per_dim_std_mean: 0.00784333422780037
+  delta_p_per_dim_std_mean: 0.001915224944241345
+  delta_a_argmax_unique_per_user_mean: 1.05
+
+LoRA 10-step:
+  delta_q_per_dim_std_mean: 0.04045112803578377
+  delta_a_per_dim_std_mean: 0.006317050661891699
+  delta_p_per_dim_std_mean: 0.001469331793487072
+  delta_a_argmax_unique_per_user_mean: 1.15
+
+LoRA 30-step:
+  delta_q_per_dim_std_mean: 0.02685587666928768
+  delta_a_per_dim_std_mean: 0.0034748991020023823
+  delta_p_per_dim_std_mean: 0.0009771875338628888
+  delta_a_argmax_unique_per_user_mean: 1.0
+```
+
+判断：
+
+```text
+LoRA 30-step 训练与 checkpoint 诊断链路 PASS。
+但效果侧没有改善，association argmax 从 10-step 的 1.15 降到 1.0，变成完全固定。
+delta_q / delta_a / delta_p 的跨样本方差继续下降。
+继续单纯增加 LoRA CTL-only 训练步数不是当前最优方向。
+```
+
+解释：
+
+```text
+当前瓶颈更像是监督信号与数据分布问题，而不是模型是否可训练的问题。
+20 条 smoke 数据太少，且 CTL-only 目标可能鼓励模型靠平均化/保守 association 降低损失。
+LoRA 链路已经验证完成，下一步应转向数据/标签诊断和更有针对性的 association 多样性改造。
+```
+
+下一步建议：
+
+```text
+停止继续盲目加 LoRA 步数。
+优先新增 association 标签分布诊断脚本：
+  - 统计 oracle delta_a / association target 的 argmax 多样性。
+  - 判断数据本身是否就偏向固定 UAV。
+  - 对比模型输出 argmax 与 target argmax。
+如果 target 本身单一，则需要增加数据量或改采样。
+如果 target 多样但模型输出单一，则需要调整 association loss / 增加分类或熵正则诊断。
+```
+
+本轮已新增脚本：
+
+```text
+scripts/analyze_mm_target_distribution.py
+```
+
+用途：
+
+```text
+不加载大模型，只读取 sft_dataset.jsonl 中的 oracle delta_q / delta_a / delta_p。
+统计 target delta_a 的 argmax 多样性、固定用户数、dominant ratio 与 entropy。
+可选读取 analyze_mm_delta_outputs.py --save_raw 生成的 npz，对比模型输出和 target 的 association argmax。
+```
+
+建议服务器命令：
+
+```bash
+python scripts/analyze_mm_target_distribution.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --prediction_npz /root/autodl-tmp/outputs/mm_smoke_lora_30step/delta_diag_mm_sft_lora_smoke_30step.npz \
+  --output /root/autodl-tmp/outputs/mm_smoke_lora_30step/target_distribution_mm_smoke_20.json
+```
+
+关注指标：
+
+```text
+target_delta_a_argmax_unique_per_user_mean
+target_delta_a_argmax_fixed_user_count
+target_delta_a_argmax_dominant_ratio_mean
+pred_delta_a_argmax_unique_per_user_mean
+argmax_match_rate_mean
+```
