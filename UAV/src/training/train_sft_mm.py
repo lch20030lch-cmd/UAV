@@ -75,6 +75,7 @@ def train_mm_sft_smoke(
     max_length: int = None,
     output_dir: str = None,
     train_lora: bool = False,
+    lambda_assoc_ce: float = None,
 ):
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -142,12 +143,18 @@ def train_mm_sft_smoke(
         pin_memory=True,
     )
 
+    assoc_ce_weight = (
+        float(lambda_assoc_ce)
+        if lambda_assoc_ce is not None
+        else float(train_cfg.get("phase1", {}).get("lambda_assoc_ce", 0.0))
+    )
     loss_fn = UAVISACLosses(
         lambda_ctl=model_cfg["loss"]["lambda_ctl"],
         lambda_q=model_cfg["loss"]["lambda_q"],
         lambda_a=model_cfg["loss"]["lambda_a"],
         lambda_p=model_cfg["loss"]["lambda_p"],
         lambda_sep=model_cfg["loss"]["lambda_sep"],
+        lambda_assoc_ce=assoc_ce_weight,
     )
     # 默认只训练投影头；传入 --train_lora 时，PEFT 会额外打开 LoRA 参数。
     proj_params = [p for p in model.projection_head.parameters() if p.requires_grad]
@@ -171,6 +178,7 @@ def train_mm_sft_smoke(
     print(f"  trainable LoRA tensors:       {len(lora_params)}")
     print(f"  projection lr:                {proj_lr}")
     print(f"  LoRA lr:                      {lora_lr if train_lora else 0.0}")
+    print(f"  association CE weight:        {assoc_ce_weight}")
 
     device = model.device
     global_step = 0
@@ -228,6 +236,7 @@ def train_mm_sft_smoke(
                 f"step={global_step} epoch={epoch} "
                 f"loss_ctl={metrics['loss_ctl']:.6f} "
                 f"loss_total={metrics['loss_total']:.6f} "
+                f"loss_a_ce={metrics['loss_a_ce']:.6f} "
                 f"grad_norm_proj={grad_norm:.6f} "
                 f"grad_norm_lora={grad_norm_lora:.6f}"
             )
@@ -250,6 +259,7 @@ def train_mm_sft_smoke(
                         "lora_lr": lora_lr if train_lora else 0.0,
                         "lora_rank": model_cfg["lora"]["rank"] if train_lora else 0,
                         "lora_alpha": model_cfg["lora"]["alpha"] if train_lora else 0,
+                        "lambda_assoc_ce": assoc_ce_weight,
                     },
                     save_lora=train_lora,
                 )
@@ -269,6 +279,7 @@ def train_mm_sft_smoke(
             "lora_lr": lora_lr if train_lora else 0.0,
             "lora_rank": model_cfg["lora"]["rank"] if train_lora else 0,
             "lora_alpha": model_cfg["lora"]["alpha"] if train_lora else 0,
+            "lambda_assoc_ce": assoc_ce_weight,
         },
         save_lora=train_lora,
     )
@@ -286,6 +297,8 @@ if __name__ == "__main__":
     parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--train_lora", action="store_true")
+    parser.add_argument("--lambda_assoc_ce", type=float, default=None,
+                        help="可选 association 分类辅助损失权重，默认使用配置或 0")
     args = parser.parse_args()
 
     train_mm_sft_smoke(
@@ -296,4 +309,5 @@ if __name__ == "__main__":
         max_length=args.max_length,
         output_dir=args.output_dir,
         train_lora=args.train_lora,
+        lambda_assoc_ce=args.lambda_assoc_ce,
     )

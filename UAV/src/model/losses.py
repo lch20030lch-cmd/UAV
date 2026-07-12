@@ -38,6 +38,7 @@ class UAVISACLosses:
         lambda_a: float = 0.5,
         lambda_p: float = 0.3,
         lambda_sep: float = 0.1,
+        lambda_assoc_ce: float = 0.0,
         dpo_beta: float = 0.1,
         sft_anchor_mu: float = 0.05,
     ):
@@ -46,14 +47,35 @@ class UAVISACLosses:
         self.lambda_a = lambda_a
         self.lambda_p = lambda_p
         self.lambda_sep = lambda_sep
+        self.lambda_assoc_ce = lambda_assoc_ce
         self.dpo_beta = dpo_beta
         self.sft_anchor_mu = sft_anchor_mu
+
+    def compute_association_ce_loss(
+        self,
+        delta_a_hat: torch.Tensor,
+        delta_a_target: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        按用户计算 association 分类损失。
+
+        delta_a 的列表示用户，行表示 UAV。oracle target 是近似 one-hot，
+        因此可以把每个用户的 UAV 选择视为 M 类分类问题。
+        """
+        pred = torch.clamp(delta_a_hat, min=1e-8, max=1.0)
+        pred = pred.permute(0, 2, 1).contiguous()  # (B, K, M)
+        target_idx = torch.argmax(delta_a_target, dim=1).contiguous()  # (B, K)
+        return F.nll_loss(
+            torch.log(pred).view(-1, pred.shape[-1]),
+            target_idx.view(-1),
+        )
 
     def compute_control_loss(
         self,
         delta_hat: Dict[str, torch.Tensor],
         delta_target: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
+        return_components: bool = False,
+    ):
         """
         连续控制损失 L_ctl (公式 28)
 
@@ -78,10 +100,27 @@ class UAVISACLosses:
         # 关联 loss (BCE: 软关联 vs 二值 oracle)
         loss_a = F.binary_cross_entropy(da_hat, da_tgt)
 
+        # 可选辅助项: 按用户做 UAV 分类，专门约束 association argmax。
+        loss_a_ce = self.compute_association_ce_loss(da_hat, da_tgt)
+
         # 功率 loss (MSE)
         loss_p = F.mse_loss(dp_hat, dp_tgt)
 
-        return self.lambda_q * loss_q + self.lambda_a * loss_a + self.lambda_p * loss_p
+        total = (
+            self.lambda_q * loss_q
+            + self.lambda_a * loss_a
+            + self.lambda_p * loss_p
+            + self.lambda_assoc_ce * loss_a_ce
+        )
+
+        if return_components:
+            return total, {
+                "loss_q": loss_q,
+                "loss_a_bce": loss_a,
+                "loss_a_ce": loss_a_ce,
+                "loss_p": loss_p,
+            }
+        return total
 
     def compute_separation_penalty(
         self,
@@ -202,13 +241,22 @@ class UAVISACLosses:
             total_loss, metrics_dict
         """
         lambda_ctl = phase1_lambda_ctl if phase1_lambda_ctl is not None else self.lambda_ctl
-        loss_ctl = self.compute_control_loss(delta_hat, delta_target)
+        loss_ctl, ctl_parts = self.compute_control_loss(
+            delta_hat,
+            delta_target,
+            return_components=True,
+        )
         total = lambda_ctl * loss_ctl
 
         metrics = {
             "loss_ctl": loss_ctl.item(),
             "loss_total": total.item(),
             "phase": "phase1",
+            "loss_q": ctl_parts["loss_q"].item(),
+            "loss_a_bce": ctl_parts["loss_a_bce"].item(),
+            "loss_a_ce": ctl_parts["loss_a_ce"].item(),
+            "loss_p": ctl_parts["loss_p"].item(),
+            "lambda_assoc_ce": self.lambda_assoc_ce,
         }
         return total, metrics
 

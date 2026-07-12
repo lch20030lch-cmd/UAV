@@ -972,3 +972,77 @@ target_delta_a_argmax_dominant_ratio_mean
 pred_delta_a_argmax_unique_per_user_mean
 argmax_match_rate_mean
 ```
+
+服务器临时脚本诊断结果：
+
+```text
+num_samples: 20
+target_delta_a_per_dim_std_mean: 0.418897807598114
+target_delta_a_argmax_unique_per_user_mean: 4.0
+target_delta_a_argmax_unique_per_user_min: 4
+target_delta_a_argmax_unique_per_user_max: 4
+target_delta_a_argmax_fixed_user_count: 0
+target_delta_a_argmax_dominant_ratio_mean: 0.365
+target_delta_a_entropy_mean: 8.289306741016134e-11
+```
+
+判断：
+
+```text
+oracle association target 本身并不单一。
+20 条样本中，每个用户的 target argmax 都覆盖了 4 个 UAV。
+因此模型输出 association argmax 固定不是数据标签单一导致的。
+当前更可能是 BCE-style association loss、投影头输出或 CTL-only 训练目标导致模型走向保守平均解。
+```
+
+本轮代码更新：
+
+```text
+src/model/losses.py
+  - 新增 compute_association_ce_loss。
+  - 保留原 BCE association loss。
+  - 新增可选 lambda_assoc_ce，用于按用户做 UAV 分类辅助监督。
+
+src/training/train_sft_mm.py
+  - 新增 --lambda_assoc_ce。
+  - 默认不开启，避免影响既有 smoke 结论。
+  - 训练日志新增 loss_a_ce 与 association CE weight。
+```
+
+下一步建议命令：
+
+```bash
+python src/training/train_sft_mm.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --max_steps 30 \
+  --max_length 3072 \
+  --output_dir /root/autodl-tmp/outputs/mm_smoke_lora_assoc_ce_30step \
+  --train_lora \
+  --lambda_assoc_ce 0.5
+```
+
+对应诊断命令：
+
+```bash
+python scripts/analyze_mm_delta_outputs.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --checkpoint /root/autodl-tmp/outputs/mm_smoke_lora_assoc_ce_30step/mm_sft_lora_smoke_final \
+  --name mm_sft_lora_assoc_ce_30step \
+  --num_samples 20 \
+  --max_length 3072 \
+  --output /root/autodl-tmp/outputs/mm_smoke_lora_assoc_ce_30step/delta_diag_mm_sft_lora_assoc_ce_30step.json \
+  --save_raw
+```
+
+验收重点：
+
+```text
+loss_a_ce 是否下降。
+delta_a_argmax_unique_per_user_mean 是否高于 1.0。
+delta_a_per_dim_std_mean 是否高于 0.00347。
+warnings 是否仍包含 delta_a_argmax_nearly_constant。
+```
