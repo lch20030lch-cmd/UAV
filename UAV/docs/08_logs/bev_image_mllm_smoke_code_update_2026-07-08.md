@@ -1714,3 +1714,77 @@ projection-head-only overfit 探针成功。
   Stage B: 从 warmup checkpoint 恢复 q/p CTL，观察 association 是否保住。
   Stage C: 再考虑小 LR LoRA 联合微调。
 ```
+
+---
+
+## 14. 2026-07-14：Stage B staged CTL 结果
+
+Stage B 从 Stage A 的 projection-only association warmup checkpoint 恢复：
+
+```text
+init_checkpoint: /root/autodl-tmp/outputs/mm_smoke_proj_assoc_raw_ce_overfit/mm_sft_smoke_final
+train_lora: false
+projection_lr: 0.002
+lambda_q: 1.0
+lambda_a: 0.5
+lambda_p: 0.3
+lambda_assoc_raw_ce: 0.2
+```
+
+delta 诊断结果：
+
+```text
+delta_q_per_dim_std_mean: 1.1909527778625488
+delta_a_per_dim_std_mean: 0.2516266703605652
+delta_p_per_dim_std_mean: 0.04994671046733856
+delta_a_argmax_unique_per_user_mean: 3.65
+delta_a_argmax_fixed_user_count: 0
+delta_a_entropy_mean: 0.6465999112236456
+delta_a_raw_per_dim_std_mean: 1.4397764205932617
+delta_a_raw_argmax_unique_per_user_mean: 3.55
+delta_a_raw_argmax_fixed_user_count: 0
+delta_a_raw_entropy_mean: 0.627618346199047
+control_states_per_dim_std_mean: 0.4281654357910156
+delta_raw_per_dim_std_mean: 0.9158594012260437
+delta_p_entropy_mean: 1.9526428388518617
+warnings: []
+```
+
+target-vs-pred 结果：
+
+```text
+pred_delta_a_argmax_unique_per_user_mean: 3.65
+pred_delta_a_argmax_fixed_user_count: 0
+argmax_match_rate_mean: 0.5
+argmax_match_rate_per_user_min: 0.35
+argmax_match_rate_per_user_max: 0.7
+```
+
+判断：
+
+```text
+Stage B PASS。
+从 Stage A warmup checkpoint 恢复 q/p CTL 后，association 没有退回固定解。
+相反，delta_a_argmax_unique_per_user_mean 从 Stage A 的 2.8 提升到 3.65。
+argmax_match_rate_mean 从 Stage A 的 0.45 提升到 0.5。
+delta_q / delta_p 的跨样本多样性也恢复，warnings 清空。
+```
+
+阶段性结论：
+
+```text
+staged training 路线有效：
+  Stage A 先训练 projection head 的 raw association CE。
+  Stage B 再恢复完整 q/a/p CTL，并保留较小 raw association CE。
+
+这说明此前 association 固定主要是训练顺序和优化强度问题。
+当前不需要优先改 projection head 结构。
+```
+
+下一步建议：
+
+```text
+Stage C 可以尝试小 LR LoRA 联合微调，但必须谨慎。
+目标不是大幅提升，而是验证打开 LoRA 后不会破坏 Stage B 已经学到的 association。
+建议 LoRA lr 从 5e-5 开始，projection_lr 降到 0.001，lambda_assoc_raw_ce 保留 0.1。
+```
