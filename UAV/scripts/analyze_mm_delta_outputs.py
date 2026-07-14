@@ -233,6 +233,8 @@ def main():
     parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--save_raw", action="store_true")
+    parser.add_argument("--projection_head_type", type=str, choices=["shared", "split"], default=None,
+                        help="可选 projection head 类型；分析 split checkpoint 时需要传 split")
     args = parser.parse_args()
 
     with (PROJECT_ROOT / args.config).open("r", encoding="utf-8") as f:
@@ -248,12 +250,15 @@ def main():
     model_name = args.model or model_cfg["backbone"]
     max_length = args.max_length or train_cfg["max_seq_length"]
     lora_checkpoint = _resolve_lora_checkpoint(args.checkpoint, args.lora_checkpoint)
+    proj_head_config = build_proj_head_config(model_cfg, sim_cfg)
+    if args.projection_head_type is not None:
+        proj_head_config["head_type"] = args.projection_head_type
 
     model = Gemma3MultimodalISAC(
         model_name_or_path=model_name,
         use_4bit=cfg["hardware"].get("use_4bit", True),
         num_control_tokens=model_cfg["control_token"]["num_tokens"],
-        proj_head_config=build_proj_head_config(model_cfg, sim_cfg),
+        proj_head_config=proj_head_config,
         attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
         freeze_vision_tower=model_cfg.get("freeze_vision_tower", True),
         lora_rank=model_cfg["lora"]["rank"],
@@ -291,6 +296,7 @@ def main():
         "data_path": str(data_path),
         "model": model_name,
         "checkpoint": args.checkpoint,
+        "projection_head_type": proj_head_config.get("head_type", "shared"),
         "loaded_projection": loaded_projection,
         "loaded_control_embeddings": loaded_control_embeddings,
         "lora_checkpoint": lora_checkpoint,

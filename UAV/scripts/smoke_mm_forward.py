@@ -79,6 +79,8 @@ def main():
                         help="LoRA adapter 目录；不填时会尝试从 --checkpoint/lora 自动发现")
     parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--no_4bit", action="store_true")
+    parser.add_argument("--projection_head_type", type=str, choices=["shared", "split"], default=None,
+                        help="可选 projection head 类型；加载 split checkpoint 时需要传 split")
     args = parser.parse_args()
 
     with (PROJECT_ROOT / args.config).open("r", encoding="utf-8") as f:
@@ -94,12 +96,15 @@ def main():
     data_path = data_dir / data_cfg.get("sft_file", "sft_dataset.jsonl")
     max_length = args.max_length or train_cfg["max_seq_length"]
     lora_checkpoint = _resolve_lora_checkpoint(args.checkpoint, args.lora_checkpoint)
+    proj_head_config = build_proj_head_config(model_cfg, sim_cfg)
+    if args.projection_head_type is not None:
+        proj_head_config["head_type"] = args.projection_head_type
 
     model = Gemma3MultimodalISAC(
         model_name_or_path=model_name,
         use_4bit=cfg["hardware"].get("use_4bit", True) and not args.no_4bit,
         num_control_tokens=model_cfg["control_token"]["num_tokens"],
-        proj_head_config=build_proj_head_config(model_cfg, sim_cfg),
+        proj_head_config=proj_head_config,
         attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
         freeze_vision_tower=model_cfg.get("freeze_vision_tower", True),
         lora_rank=model_cfg["lora"]["rank"],
@@ -143,6 +148,7 @@ def main():
     print(f"  loaded_projection: {loaded_projection}")
     print(f"  loaded_control_embeddings: {loaded_control_embeddings}")
     print(f"  loaded_lora_checkpoint: {model.loaded_lora_checkpoint}")
+    print(f"  projection_head_type: {proj_head_config.get('head_type', 'shared')}")
     print(f"  max_length: {max_length}")
     print(f"  input_ids: {tuple(batch['input_ids'].shape)}")
     print(f"  attention_mask: {tuple(batch['attention_mask'].shape)}")

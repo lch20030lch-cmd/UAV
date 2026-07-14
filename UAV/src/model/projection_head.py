@@ -334,9 +334,16 @@ class ConstraintProjectionHead(nn.Module):
     """
     完整投影头 h_Φ (公式 23)
 
-    Pipeline:
+    默认 shared 模式保持原论文链路:
       Z_c → ControlReadout → δ̃ → ResidualMLP → δ̃'
       δ̃' → [Proj_Q, Proj_A, Proj_P] → δ̂
+
+    split 模式用于多模态 smoke 中的分阶段训练:
+      Z_c → q/a/p 三个独立 ControlReadout → 三个独立 ResidualMLP
+      → [Proj_Q, Proj_A, Proj_P] → δ̂
+
+    split 模式把离散关联任务和连续 q/p 回归任务解耦，避免 Stage B 训练 q/p 时
+    通过共享 MLP 破坏 Stage A 已学到的 association 读出能力。
     """
 
     def __init__(
@@ -357,19 +364,33 @@ class ConstraintProjectionHead(nn.Module):
         tau_power: float = 0.5,
         tau_assoc: float = 0.5,
         sinkhorn_iters: int = 20,
+        head_type: str = "shared",
     ):
         super().__init__()
         self.M = M
         self.K = K
+        if head_type not in {"shared", "split"}:
+            raise ValueError(f"Unsupported projection head_type: {head_type}")
+        self.head_type = head_type
 
         # 读出维度 = M*3 (位移) + M*K (关联) + M*(K+1) (功率)
-        total_delta_dim = M * 3 + M * K + M * (K + 1)
+        self.q_dim = M * 3
+        self.a_dim = M * K
+        self.p_dim = M * (K + 1)
+        self.total_delta_dim = self.q_dim + self.a_dim + self.p_dim
 
-        # 控制 Token 读出 (M 个 query, 每 UAV 一个)
-        self.readout = ControlReadout(hidden_dim, num_control_tokens, total_delta_dim, num_queries=M)
-
-        # 残差 MLP
-        self.mlp = ResidualMLP(total_delta_dim, mlp_hidden or [256, 256])
+        if self.head_type == "shared":
+            # 旧结构: 三个任务共用一个读出和一个残差修正器。
+            self.readout = ControlReadout(hidden_dim, num_control_tokens, self.total_delta_dim, num_queries=M)
+            self.mlp = ResidualMLP(self.total_delta_dim, mlp_hidden or [256, 256])
+        else:
+            # 新结构: q/a/p 分支完全解耦，便于分阶段冻结和诊断。
+            self.readout_q = ControlReadout(hidden_dim, num_control_tokens, self.q_dim, num_queries=M)
+            self.readout_a = ControlReadout(hidden_dim, num_control_tokens, self.a_dim, num_queries=M)
+            self.readout_p = ControlReadout(hidden_dim, num_control_tokens, self.p_dim, num_queries=M)
+            self.q_mlp = ResidualMLP(self.q_dim, mlp_hidden or [256, 256])
+            self.a_mlp = ResidualMLP(self.a_dim, mlp_hidden or [256, 256])
+            self.p_mlp = ResidualMLP(self.p_dim, mlp_hidden or [256, 256])
 
         # 投影模块
         self.proj_q = DeploymentProjection(area_w, area_h, h_min, h_max, v_max_dt)
@@ -413,14 +434,25 @@ class ConstraintProjectionHead(nn.Module):
               "delta_p": (B, M, K+1) 功率先验
               "delta_raw": (B, total_dim) 未投影的原始 prior
         """
-        # Step 1: 读出
-        delta_raw = self.readout(control_states)  # (B, total_dim)
+        if self.head_type == "shared":
+            # Step 1: 读出
+            delta_raw = self.readout(control_states)  # (B, total_dim)
 
-        # Step 2: MLP 修正
-        delta_corrected = self.mlp(delta_raw)     # (B, total_dim)
+            # Step 2: MLP 修正
+            delta_corrected = self.mlp(delta_raw)     # (B, total_dim)
 
-        # Step 3: 拆分 + 分别投影
-        dq, da, dp = self._unflatten(delta_corrected)
+            # Step 3: 拆分 + 分别投影
+            dq, da, dp = self._unflatten(delta_corrected)
+        else:
+            # split 模式下三条分支独立读出、独立修正。
+            dq_raw = self.readout_q(control_states)
+            da_raw = self.readout_a(control_states)
+            dp_raw = self.readout_p(control_states)
+            delta_raw = torch.cat([dq_raw, da_raw, dp_raw], dim=-1)
+
+            dq = self.q_mlp(dq_raw).reshape(control_states.shape[0], self.M, 3)
+            da = self.a_mlp(da_raw).reshape(control_states.shape[0], self.M, self.K)
+            dp = self.p_mlp(dp_raw).reshape(control_states.shape[0], self.M, self.K + 1)
 
         dq_proj = self.proj_q(dq, q_current)
         da_proj = self.proj_a(da)
