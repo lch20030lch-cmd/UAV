@@ -1788,3 +1788,86 @@ Stage C 可以尝试小 LR LoRA 联合微调，但必须谨慎。
 目标不是大幅提升，而是验证打开 LoRA 后不会破坏 Stage B 已经学到的 association。
 建议 LoRA lr 从 5e-5 开始，projection_lr 降到 0.001，lambda_assoc_raw_ce 保留 0.1。
 ```
+
+---
+
+## 15. 2026-07-14：Stage C 小 LR LoRA 联合微调结果
+
+Stage C 从 Stage B checkpoint 恢复，并打开小学习率 LoRA：
+
+```text
+init_checkpoint: /root/autodl-tmp/outputs/mm_smoke_proj_staged_ctl/mm_sft_smoke_final
+train_lora: true
+projection_lr: 0.001
+lora_lr: 0.00005
+lambda_q: 1.0
+lambda_a: 0.5
+lambda_p: 0.3
+lambda_assoc_raw_ce: 0.1
+```
+
+delta 诊断结果：
+
+```text
+loaded_projection: /root/autodl-tmp/outputs/mm_smoke_stage_c_lora/mm_sft_lora_smoke_final/projection_head.pt
+loaded_control_embeddings: {'ctrl_embed': '/root/autodl-tmp/outputs/mm_smoke_stage_c_lora/mm_sft_lora_smoke_final/ctrl_embed.pt'}
+loaded_lora_checkpoint: /root/autodl-tmp/outputs/mm_smoke_stage_c_lora/mm_sft_lora_smoke_final/lora
+delta_q_per_dim_std_mean: 1.6528916358947754
+delta_a_per_dim_std_mean: 0.24633362889289856
+delta_p_per_dim_std_mean: 0.050456784665584564
+delta_a_argmax_unique_per_user_mean: 3.8
+delta_a_argmax_fixed_user_count: 0
+delta_a_entropy_mean: 0.6820952764253534
+delta_a_raw_per_dim_std_mean: 1.7709858417510986
+delta_a_raw_argmax_unique_per_user_mean: 3.55
+delta_a_raw_argmax_fixed_user_count: 0
+delta_a_raw_entropy_mean: 0.6318133922858514
+control_states_per_dim_std_mean: 0.4653351902961731
+delta_raw_per_dim_std_mean: 1.0123263597488403
+delta_p_entropy_mean: 2.0574598927352454
+warnings: []
+```
+
+target-vs-pred 结果：
+
+```text
+pred_delta_a_argmax_unique_per_user_mean: 3.8
+pred_delta_a_argmax_fixed_user_count: 0
+argmax_match_rate_mean: 0.5525
+argmax_match_rate_per_user_min: 0.35
+argmax_match_rate_per_user_max: 0.75
+```
+
+判断：
+
+```text
+Stage C PASS。
+小 LR LoRA 没有破坏 Stage B 已经学到的 association。
+相反，projected delta_a 多样性从 Stage B 的 3.65 提升到 3.8。
+argmax_match_rate_mean 从 Stage B 的 0.5 提升到 0.5525。
+delta_q / delta_p 多样性保持，warnings 仍为空。
+```
+
+20-sample staged smoke 总结：
+
+```text
+直接 LoRA + CTL:
+  association 固定，失败。
+
+Stage A projection-only raw association CE warmup:
+  association 被拉开，fixed_user_count=0，match_rate=0.45。
+
+Stage B 从 A 恢复 q/p CTL:
+  association 保住并继续改善，match_rate=0.5。
+
+Stage C 从 B 打开小 LR LoRA:
+  association 未被破坏，match_rate=0.5525。
+```
+
+阶段性结论：
+
+```text
+staged training 是当前 20-sample smoke 下最有效路线。
+下一步不应继续只在 20 条数据上堆步数。
+建议扩大到 100-sample 或 200-sample smoke，复验 A/B/C 是否仍然有效。
+```
