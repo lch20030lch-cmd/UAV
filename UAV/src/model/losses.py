@@ -113,14 +113,24 @@ class UAVISACLosses:
         da_tgt = delta_target["delta_a"].to(dtype=common_dtype)
         dp_tgt = delta_target["delta_p"].to(dtype=common_dtype)
 
-        # 位移 loss (MSE)
-        loss_q = F.mse_loss(dq_hat, dq_tgt)
+        # 位移 loss (MSE)。权重为 0 时跳过实际计算，避免无关分支的数值问题影响 smoke。
+        loss_q = F.mse_loss(dq_hat, dq_tgt) if self.lambda_q != 0 else dq_hat.new_tensor(0.0)
 
-        # 关联 loss (BCE: 软关联 vs 二值 oracle)
-        loss_a = F.binary_cross_entropy(da_hat, da_tgt)
+        # 关联 loss (BCE: 软关联 vs 二值 oracle)。投影输出理论上在 [0,1]，
+        # 这里仍做一次 clamp，防止 Sinkhorn 数值误差触发 CUDA BCE assert。
+        da_prob = torch.clamp(torch.nan_to_num(da_hat, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+        loss_a = (
+            F.binary_cross_entropy(da_prob, da_tgt)
+            if self.lambda_a != 0
+            else da_hat.new_tensor(0.0)
+        )
 
         # 可选辅助项: 按用户做 UAV 分类，专门约束 association argmax。
-        loss_a_ce = self.compute_association_ce_loss(da_hat, da_tgt)
+        loss_a_ce = (
+            self.compute_association_ce_loss(da_prob, da_tgt)
+            if self.lambda_assoc_ce != 0
+            else da_hat.new_tensor(0.0)
+        )
         if "delta_a_raw" in delta_hat:
             da_raw = delta_hat["delta_a_raw"].to(dtype=common_dtype)
             loss_a_raw_ce = self.compute_association_raw_ce_loss(da_raw, da_tgt)
@@ -128,7 +138,7 @@ class UAVISACLosses:
             loss_a_raw_ce = da_hat.new_tensor(0.0)
 
         # 功率 loss (MSE)
-        loss_p = F.mse_loss(dp_hat, dp_tgt)
+        loss_p = F.mse_loss(dp_hat, dp_tgt) if self.lambda_p != 0 else dp_hat.new_tensor(0.0)
 
         total = (
             self.lambda_q * loss_q

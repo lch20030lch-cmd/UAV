@@ -292,8 +292,11 @@ class AssociationProjection(nn.Module):
         """
         B, M, K = a_tilde.shape
 
-        # Step 1: exp 缩放
-        S = torch.exp(a_tilde / self.tau)  # (B, M, K)
+        # Step 1: 稳定的 exp 缩放。减去每个用户列内最大值不改变后续列归一化结果，
+        # 但能避免 raw logits 变大后 exp 溢出为 inf/nan。
+        scaled = a_tilde / self.tau
+        scaled = scaled - scaled.amax(dim=1, keepdim=True)
+        S = torch.exp(scaled)  # (B, M, K)
 
         # Step 2: Sinkhorn 迭代 (列归一化 + 行容量裁剪)
         for _ in range(self.n_iters):
@@ -310,7 +313,7 @@ class AssociationProjection(nn.Module):
             )
             S = S * scale
 
-        return S
+        return torch.nan_to_num(S, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
     @staticmethod
     def discretize(z_hat: torch.Tensor) -> torch.Tensor:
