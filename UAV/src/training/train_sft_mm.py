@@ -119,6 +119,7 @@ def train_mm_sft_smoke(
     lambda_a: float = None,
     lambda_p: float = None,
     lambda_assoc_raw_ce: float = None,
+    lambda_q_dir: float = None,
     projection_lr: float = None,
     lora_lr_override: float = None,
     init_checkpoint: str = None,
@@ -233,6 +234,11 @@ def train_mm_sft_smoke(
     lambda_q_value = float(lambda_q) if lambda_q is not None else float(model_cfg["loss"]["lambda_q"])
     lambda_a_value = float(lambda_a) if lambda_a is not None else float(model_cfg["loss"]["lambda_a"])
     lambda_p_value = float(lambda_p) if lambda_p is not None else float(model_cfg["loss"]["lambda_p"])
+    lambda_q_dir_value = (
+        float(lambda_q_dir)
+        if lambda_q_dir is not None
+        else float(train_cfg.get("phase1", {}).get("lambda_q_dir", 0.0))
+    )
     loss_fn = UAVISACLosses(
         lambda_ctl=model_cfg["loss"]["lambda_ctl"],
         lambda_q=lambda_q_value,
@@ -241,6 +247,7 @@ def train_mm_sft_smoke(
         lambda_sep=model_cfg["loss"]["lambda_sep"],
         lambda_assoc_ce=assoc_ce_weight,
         lambda_assoc_raw_ce=assoc_raw_ce_weight,
+        lambda_q_dir=lambda_q_dir_value,
     )
     # 默认只训练投影头；传入 --train_lora 时，PEFT 会额外打开 LoRA 参数。
     proj_params = [p for p in model.projection_head.parameters() if p.requires_grad]
@@ -271,6 +278,7 @@ def train_mm_sft_smoke(
     print(f"  projection head type:         {head_type}")
     print(f"  frozen projection tensors:    {len(frozen_projection_branches)}")
     print(f"  lambda_q/a/p:                 {lambda_q_value} / {lambda_a_value} / {lambda_p_value}")
+    print(f"  q direction weight:           {lambda_q_dir_value}")
     print(f"  association CE weight:        {assoc_ce_weight}")
     print(f"  association raw CE weight:    {assoc_raw_ce_weight}")
 
@@ -307,6 +315,8 @@ def train_mm_sft_smoke(
             }
             if "delta_a_raw" in outputs:
                 delta_hat["delta_a_raw"] = outputs["delta_a_raw"]
+            if "delta_q_raw" in outputs:
+                delta_hat["delta_q_raw"] = outputs["delta_q_raw"]
             delta_target = {
                 "delta_q": batch["delta_q_target"],
                 "delta_a": batch["delta_a_target"],
@@ -334,6 +344,7 @@ def train_mm_sft_smoke(
                 f"loss_total={metrics['loss_total']:.6f} "
                 f"loss_a_ce={metrics['loss_a_ce']:.6f} "
                 f"loss_a_raw_ce={metrics['loss_a_raw_ce']:.6f} "
+                f"loss_q_dir={metrics['loss_q_dir']:.6f} "
                 f"grad_norm_proj={grad_norm:.6f} "
                 f"grad_norm_lora={grad_norm_lora:.6f}"
             )
@@ -363,6 +374,7 @@ def train_mm_sft_smoke(
                         "lambda_q": lambda_q_value,
                         "lambda_a": lambda_a_value,
                         "lambda_p": lambda_p_value,
+                        "lambda_q_dir": lambda_q_dir_value,
                         "lambda_assoc_ce": assoc_ce_weight,
                         "lambda_assoc_raw_ce": assoc_raw_ce_weight,
                         "loaded_init": loaded_init,
@@ -392,6 +404,7 @@ def train_mm_sft_smoke(
             "lambda_q": lambda_q_value,
             "lambda_a": lambda_a_value,
             "lambda_p": lambda_p_value,
+            "lambda_q_dir": lambda_q_dir_value,
             "lambda_assoc_ce": assoc_ce_weight,
             "lambda_assoc_raw_ce": assoc_raw_ce_weight,
             "loaded_init": loaded_init,
@@ -422,6 +435,8 @@ if __name__ == "__main__":
                         help="可选 delta_a BCE 损失权重覆盖值")
     parser.add_argument("--lambda_p", type=float, default=None,
                         help="可选 delta_p 损失权重覆盖值")
+    parser.add_argument("--lambda_q_dir", type=float, default=None,
+                        help="可选 delta_q raw 方向辅助损失权重，适用于 q target 贴移动边界的 smoke")
     parser.add_argument("--projection_lr", type=float, default=None,
                         help="可选 projection head 学习率覆盖值")
     parser.add_argument("--lora_lr", type=float, default=None,
@@ -449,6 +464,7 @@ if __name__ == "__main__":
         lambda_a=args.lambda_a,
         lambda_p=args.lambda_p,
         lambda_assoc_raw_ce=args.lambda_assoc_raw_ce,
+        lambda_q_dir=args.lambda_q_dir,
         projection_lr=args.projection_lr,
         lora_lr_override=args.lora_lr,
         init_checkpoint=args.init_checkpoint,

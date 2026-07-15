@@ -78,7 +78,9 @@ def _summarize_deltas(
     delta_q: np.ndarray,
     delta_a: np.ndarray,
     delta_p: np.ndarray,
+    delta_q_raw: np.ndarray = None,
     delta_a_raw: np.ndarray = None,
+    delta_q_target: np.ndarray = None,
     control_states: np.ndarray = None,
     delta_raw: np.ndarray = None,
 ) -> Dict:
@@ -89,6 +91,16 @@ def _summarize_deltas(
 
     # 关联矩阵的 argmax 如果长期不变，说明模型还没有学到“按场景换 UAV”的能力。
     summary.update(_summarize_association("delta_a", delta_a))
+    if delta_q_raw is not None:
+        summary.update(_summarize_tensor("delta_q_raw", delta_q_raw))
+    if delta_q_raw is not None and delta_q_target is not None:
+        pred = delta_q_raw / np.maximum(np.linalg.norm(delta_q_raw, axis=-1, keepdims=True), 1e-8)
+        target = delta_q_target / np.maximum(np.linalg.norm(delta_q_target, axis=-1, keepdims=True), 1e-8)
+        cos = (pred * target).sum(axis=-1)
+        mse = ((pred - target) ** 2).mean(axis=-1)
+        summary["delta_q_raw_dir_cosine_mean"] = float(cos.mean())
+        summary["delta_q_raw_dir_cosine_std"] = float(cos.std())
+        summary["delta_q_raw_dir_mse_mean"] = float(mse.mean())
     if delta_a_raw is not None:
         summary.update(_summarize_tensor("delta_a_raw", delta_a_raw))
         summary.update(_summarize_association("delta_a_raw", delta_a_raw))
@@ -173,7 +185,9 @@ def _collect_deltas(
     delta_qs: List[np.ndarray] = []
     delta_as: List[np.ndarray] = []
     delta_ps: List[np.ndarray] = []
+    delta_q_raws: List[np.ndarray] = []
     delta_a_raws: List[np.ndarray] = []
+    delta_q_targets: List[np.ndarray] = []
     control_states_list: List[np.ndarray] = []
     delta_raws: List[np.ndarray] = []
 
@@ -197,8 +211,12 @@ def _collect_deltas(
         delta_qs.append(_as_np(outputs["delta_q"].squeeze(0)))
         delta_as.append(_as_np(outputs["delta_a"].squeeze(0)))
         delta_ps.append(_as_np(outputs["delta_p"].squeeze(0)))
+        if "delta_q_raw" in outputs:
+            delta_q_raws.append(_as_np(outputs["delta_q_raw"].squeeze(0)))
         if "delta_a_raw" in outputs:
             delta_a_raws.append(_as_np(outputs["delta_a_raw"].squeeze(0)))
+        if "delta_q_target" in batch:
+            delta_q_targets.append(_as_np(batch["delta_q_target"].squeeze(0)))
         if "control_states" in outputs:
             control_states_list.append(_as_np(outputs["control_states"].squeeze(0)))
         if "delta_raw" in outputs:
@@ -211,6 +229,10 @@ def _collect_deltas(
     }
     if delta_a_raws:
         result["delta_a_raw"] = np.stack(delta_a_raws, axis=0)
+    if delta_q_raws:
+        result["delta_q_raw"] = np.stack(delta_q_raws, axis=0)
+    if delta_q_targets:
+        result["delta_q_target"] = np.stack(delta_q_targets, axis=0)
     if control_states_list:
         result["control_states"] = np.stack(control_states_list, axis=0)
     if delta_raws:
@@ -285,7 +307,9 @@ def main():
         deltas["delta_q"],
         deltas["delta_a"],
         deltas["delta_p"],
+        deltas.get("delta_q_raw"),
         deltas.get("delta_a_raw"),
+        deltas.get("delta_q_target"),
         deltas.get("control_states"),
         deltas.get("delta_raw"),
     )
@@ -328,6 +352,9 @@ def main():
         "delta_q_per_dim_std_mean",
         "delta_a_per_dim_std_mean",
         "delta_p_per_dim_std_mean",
+        "delta_q_raw_per_dim_std_mean",
+        "delta_q_raw_dir_cosine_mean",
+        "delta_q_raw_dir_mse_mean",
         "delta_a_argmax_unique_per_user_mean",
         "delta_a_argmax_fixed_user_count",
         "delta_a_entropy_mean",

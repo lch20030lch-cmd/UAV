@@ -40,6 +40,7 @@ class UAVISACLosses:
         lambda_sep: float = 0.1,
         lambda_assoc_ce: float = 0.0,
         lambda_assoc_raw_ce: float = 0.0,
+        lambda_q_dir: float = 0.0,
         dpo_beta: float = 0.1,
         sft_anchor_mu: float = 0.05,
     ):
@@ -50,6 +51,7 @@ class UAVISACLosses:
         self.lambda_sep = lambda_sep
         self.lambda_assoc_ce = lambda_assoc_ce
         self.lambda_assoc_raw_ce = lambda_assoc_raw_ce
+        self.lambda_q_dir = lambda_q_dir
         self.dpo_beta = dpo_beta
         self.sft_anchor_mu = sft_anchor_mu
 
@@ -88,6 +90,22 @@ class UAVISACLosses:
             logits.view(-1, logits.shape[-1]),
             target_idx.view(-1),
         )
+
+    def compute_q_direction_loss(
+        self,
+        delta_q_raw: torch.Tensor,
+        delta_q_target: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        对 UAV 位移方向做归一化监督。
+
+        mm_smoke_100 中 delta_q target 几乎全部贴着 15m 移动边界，
+        因此 q 学习本质上更接近方向学习，而不是自由位移回归。
+        该损失绕开 Proj_Q 的半径裁剪，直接约束 raw q 分支输出方向。
+        """
+        pred_dir = F.normalize(delta_q_raw, p=2, dim=-1, eps=1e-6)
+        target_dir = F.normalize(delta_q_target, p=2, dim=-1, eps=1e-6)
+        return F.mse_loss(pred_dir, target_dir)
 
     def compute_control_loss(
         self,
@@ -137,6 +155,12 @@ class UAVISACLosses:
         else:
             loss_a_raw_ce = da_hat.new_tensor(0.0)
 
+        if "delta_q_raw" in delta_hat and self.lambda_q_dir != 0:
+            dq_raw = delta_hat["delta_q_raw"].to(dtype=common_dtype)
+            loss_q_dir = self.compute_q_direction_loss(dq_raw, dq_tgt)
+        else:
+            loss_q_dir = dq_hat.new_tensor(0.0)
+
         # 功率 loss (MSE)
         loss_p = F.mse_loss(dp_hat, dp_tgt) if self.lambda_p != 0 else dp_hat.new_tensor(0.0)
 
@@ -146,6 +170,7 @@ class UAVISACLosses:
             + self.lambda_p * loss_p
             + self.lambda_assoc_ce * loss_a_ce
             + self.lambda_assoc_raw_ce * loss_a_raw_ce
+            + self.lambda_q_dir * loss_q_dir
         )
 
         if return_components:
@@ -154,6 +179,7 @@ class UAVISACLosses:
                 "loss_a_bce": loss_a,
                 "loss_a_ce": loss_a_ce,
                 "loss_a_raw_ce": loss_a_raw_ce,
+                "loss_q_dir": loss_q_dir,
                 "loss_p": loss_p,
             }
         return total
@@ -292,9 +318,11 @@ class UAVISACLosses:
             "loss_a_bce": ctl_parts["loss_a_bce"].item(),
             "loss_a_ce": ctl_parts["loss_a_ce"].item(),
             "loss_a_raw_ce": ctl_parts["loss_a_raw_ce"].item(),
+            "loss_q_dir": ctl_parts["loss_q_dir"].item(),
             "loss_p": ctl_parts["loss_p"].item(),
             "lambda_assoc_ce": self.lambda_assoc_ce,
             "lambda_assoc_raw_ce": self.lambda_assoc_raw_ce,
+            "lambda_q_dir": self.lambda_q_dir,
         }
         return total, metrics
 
