@@ -23,11 +23,16 @@ def render_bev_image(
     save_path: str,
     area_size: Tuple[float, float] = (1000.0, 1000.0),
     association: Optional[Sequence] = None,
+    user_weights: Optional[Sequence] = None,
+    channel_gains_users: Optional[Sequence] = None,
+    sensing_sinrs: Optional[Sequence] = None,
     target_detected: Optional[Sequence] = None,
     image_size: int = 224,
     coverage_radius: float = 250.0,
+    movement_radius: float = 15.0,
     draw_association: bool = True,
     draw_coverage: bool = True,
+    draw_guidance: bool = True,
 ) -> str:
     """将 UAV / 用户 / 目标几何关系渲染为 BEV PNG。
 
@@ -38,11 +43,16 @@ def render_bev_image(
         save_path: 输出 PNG 路径。
         area_size: 服务区域宽高，单位米。
         association: 可选关联矩阵，shape (M, K)。
+        user_weights: 可选用户需求权重，shape (K,)，用于调整用户点大小。
+        channel_gains_users: 可选 UAV-用户信道增益，shape (M, K)，用于画候选通信线。
+        sensing_sinrs: 可选 UAV-目标感知 SINR，shape (M, T)，用于画候选感知线。
         target_detected: 可选目标可见性 bool mask，shape (T,)。
         image_size: 输出图片宽高，单位像素。
         coverage_radius: UAV 覆盖圆的可视化半径。
+        movement_radius: 单槽移动半径，通常为 v_max * Δt = 15m。
         draw_association: 是否绘制当前关联线。
         draw_coverage: 是否绘制 UAV 覆盖圆。
+        draw_guidance: 是否绘制候选移动方向视觉线索。
 
     Returns:
         输出路径字符串。
@@ -57,6 +67,9 @@ def render_bev_image(
     users = _as_array(user_positions)
     targets = _as_array(target_positions)
     assoc = None if association is None else _as_array(association)
+    weights = None if user_weights is None else _as_array(user_weights)
+    gains = None if channel_gains_users is None else _as_array(channel_gains_users)
+    sensing = None if sensing_sinrs is None else _as_array(sensing_sinrs)
 
     if target_detected is None:
         detected = np.ones((targets.shape[0],), dtype=bool)
@@ -90,6 +103,66 @@ def render_bev_image(
                 )
             )
 
+    if draw_guidance and q.size > 0:
+        # 真实移动半径很小，但它直接对应 delta_q 的物理上限。
+        for x, y, _h in q:
+            ax.add_patch(
+                Circle(
+                    (float(x), float(y)),
+                    movement_radius,
+                    facecolor="none",
+                    edgecolor="#1d4ed8",
+                    alpha=0.9,
+                    linewidth=1.0,
+                    linestyle="--",
+                    zorder=6,
+                )
+            )
+
+        # 通信候选线: 每架 UAV 指向几何近邻和信道强用户的并集。
+        if users.size > 0:
+            for m in range(q.shape[0]):
+                q_xy = q[m, :2]
+                d_user = np.linalg.norm(users - q_xy[None, :], axis=1)
+                candidates = list(np.argsort(d_user)[:2])
+                if gains is not None and gains.size > 0:
+                    for k in np.argsort(-gains[m])[:2]:
+                        if int(k) not in candidates:
+                            candidates.append(int(k))
+                        if len(candidates) >= 3:
+                            break
+                for k in candidates[:3]:
+                    ax.plot(
+                        [q[m, 0], users[k, 0]],
+                        [q[m, 1], users[k, 1]],
+                        color="#22c55e",
+                        linewidth=0.7,
+                        alpha=0.42,
+                        linestyle="-",
+                        zorder=2,
+                    )
+
+        # 感知候选线: 每架 UAV 指向最强/最近目标。
+        if targets.size > 0:
+            for m in range(q.shape[0]):
+                q_xy = q[m, :2]
+                d_target = np.linalg.norm(targets - q_xy[None, :], axis=1)
+                target_candidates = [int(np.argmin(d_target))]
+                if sensing is not None and sensing.size > 0:
+                    best_t = int(np.argmax(sensing[m]))
+                    if best_t not in target_candidates:
+                        target_candidates.append(best_t)
+                for t in target_candidates[:2]:
+                    ax.plot(
+                        [q[m, 0], targets[t, 0]],
+                        [q[m, 1], targets[t, 1]],
+                        color="#f97316",
+                        linewidth=0.8,
+                        alpha=0.48,
+                        linestyle="--",
+                        zorder=2,
+                    )
+
     if draw_association and assoc is not None and assoc.size > 0:
         best_uav = np.argmax(assoc, axis=0)
         for k, m in enumerate(best_uav):
@@ -105,10 +178,16 @@ def render_bev_image(
             )
 
     if users.size > 0:
+        if weights is not None and weights.size == users.shape[0]:
+            w = weights.astype(np.float32)
+            w = (w - w.min()) / (w.max() - w.min() + 1e-8)
+            user_sizes = 14.0 + 18.0 * w
+        else:
+            user_sizes = 18
         ax.scatter(
             users[:, 0],
             users[:, 1],
-            s=18,
+            s=user_sizes,
             marker="o",
             c="#16a34a",
             edgecolors="white",
@@ -174,6 +253,7 @@ def render_bev_sample(
     save_path: str,
     area_size: Tuple[float, float] = (1000.0, 1000.0),
     image_size: int = 224,
+    movement_radius: float = 15.0,
 ) -> str:
     """将 EnvironmentSample 渲染为 BEV PNG。"""
     return render_bev_image(
@@ -181,7 +261,11 @@ def render_bev_sample(
         user_positions=env_sample.u_positions,
         target_positions=env_sample.s_positions,
         association=env_sample.association,
+        user_weights=env_sample.user_weights,
+        channel_gains_users=env_sample.channel_gains_users,
+        sensing_sinrs=env_sample.sensing_sinrs,
         save_path=save_path,
         area_size=area_size,
         image_size=image_size,
+        movement_radius=movement_radius,
     )

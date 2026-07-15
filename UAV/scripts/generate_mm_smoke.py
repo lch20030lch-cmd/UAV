@@ -109,6 +109,7 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
         save_path=str(image_path),
         area_size=tuple(sim_cfg["area_size"]),
         image_size=image_size,
+        movement_radius=sim_cfg.get("uav_max_speed_ms", 15.0) * sim_cfg.get("slot_duration_s", 1.0),
     )
     env_sample.bev_image_path = rel_image_path.as_posix()
 
@@ -132,7 +133,7 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
 
     common = {
         "bev_image_path": env_sample.bev_image_path,
-        "prompt_type": "multimodal_bev_image",
+        "prompt_type": "multimodal_bev_image_v2_geometry_guided",
         "bev_grid_text": env_sample.bev_grid_text,
         "q_current": q_current.tolist(),
         "delta_q": delta_q.tolist(),
