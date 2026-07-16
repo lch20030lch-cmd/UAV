@@ -119,49 +119,63 @@ def render_bev_image(
                 )
             )
 
-        # 通信候选线: 每架 UAV 指向几何近邻和信道强用户的并集。
+        # 紧凑通信几何线: 每架 UAV 指向加权用户中心和最近用户。
         if users.size > 0:
+            if weights is not None and weights.size == users.shape[0]:
+                w = np.maximum(weights.astype(np.float32), 1e-6)
+                weighted_center = (users * w[:, None]).sum(axis=0) / w.sum()
+                ax.scatter(
+                    [weighted_center[0]],
+                    [weighted_center[1]],
+                    s=46,
+                    marker="*",
+                    c="#7c3aed",
+                    edgecolors="white",
+                    linewidths=0.45,
+                    alpha=0.95,
+                    zorder=4,
+                )
+            else:
+                weighted_center = users.mean(axis=0)
+
             for m in range(q.shape[0]):
                 q_xy = q[m, :2]
                 d_user = np.linalg.norm(users - q_xy[None, :], axis=1)
-                candidates = list(np.argsort(d_user)[:2])
-                if gains is not None and gains.size > 0:
-                    for k in np.argsort(-gains[m])[:2]:
-                        if int(k) not in candidates:
-                            candidates.append(int(k))
-                        if len(candidates) >= 3:
-                            break
-                for k in candidates[:3]:
-                    ax.plot(
-                        [q[m, 0], users[k, 0]],
-                        [q[m, 1], users[k, 1]],
-                        color="#22c55e",
-                        linewidth=0.7,
-                        alpha=0.42,
-                        linestyle="-",
-                        zorder=2,
-                    )
+                nearest_user = int(np.argmin(d_user))
+                ax.plot(
+                    [q[m, 0], weighted_center[0]],
+                    [q[m, 1], weighted_center[1]],
+                    color="#7c3aed",
+                    linewidth=0.75,
+                    alpha=0.38,
+                    linestyle=":",
+                    zorder=2,
+                )
+                ax.plot(
+                    [q[m, 0], users[nearest_user, 0]],
+                    [q[m, 1], users[nearest_user, 1]],
+                    color="#22c55e",
+                    linewidth=0.8,
+                    alpha=0.45,
+                    linestyle="-",
+                    zorder=2,
+                )
 
-        # 感知候选线: 每架 UAV 指向最强/最近目标。
+        # 紧凑感知几何线: 每架 UAV 只指向最近目标。
         if targets.size > 0:
             for m in range(q.shape[0]):
                 q_xy = q[m, :2]
                 d_target = np.linalg.norm(targets - q_xy[None, :], axis=1)
-                target_candidates = [int(np.argmin(d_target))]
-                if sensing is not None and sensing.size > 0:
-                    best_t = int(np.argmax(sensing[m]))
-                    if best_t not in target_candidates:
-                        target_candidates.append(best_t)
-                for t in target_candidates[:2]:
-                    ax.plot(
-                        [q[m, 0], targets[t, 0]],
-                        [q[m, 1], targets[t, 1]],
-                        color="#f97316",
-                        linewidth=0.8,
-                        alpha=0.48,
-                        linestyle="--",
-                        zorder=2,
-                    )
+                nearest_t = int(np.argmin(d_target))
+                ax.plot(
+                    [q[m, 0], targets[nearest_t, 0]],
+                    [q[m, 1], targets[nearest_t, 1]],
+                    color="#f97316",
+                    linewidth=0.8,
+                    alpha=0.48,
+                    linestyle="--",
+                    zorder=2,
+                )
 
     if draw_association and assoc is not None and assoc.size > 0:
         best_uav = np.argmax(assoc, axis=0)
@@ -268,4 +282,5 @@ def render_bev_sample(
         area_size=area_size,
         image_size=image_size,
         movement_radius=movement_radius,
+        draw_association=False,
     )

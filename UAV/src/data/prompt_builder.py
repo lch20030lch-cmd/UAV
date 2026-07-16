@@ -98,28 +98,27 @@ def _fmt_vec(vec, ndigits: int = 3) -> str:
     return "[" + ", ".join(f"{float(v):.{ndigits}f}" for v in vec) + "]"
 
 
-def build_geometry_guidance_str(env_sample, config: dict, top_k_users: int = 3) -> str:
+def build_geometry_guidance_str(env_sample, config: dict) -> str:
     """
-    构造与 BEV 图像互补的几何提示。
+    构造与 BEV 图像互补的紧凑几何提示。
 
-    这里刻意使用“方向 + 距离 + 候选对象”的形式，和增强 BEV 中的候选线一致：
-    文本告诉模型每架 UAV 应关注哪些用户/目标，图像提供对应空间关系。
+    v2 曾把 top-k 用户、信道强用户和多个目标都写入 prompt，信息量大但噪声也大。
+    v3 只保留高信噪比方向：加权用户中心、最近用户、最近目标。
     """
     q = np.asarray(env_sample.q_current, dtype=np.float32)
     users = np.asarray(env_sample.u_positions, dtype=np.float32)
     targets = np.asarray(env_sample.s_positions, dtype=np.float32)
     assoc = np.asarray(env_sample.association, dtype=np.float32)
-    gains = np.asarray(env_sample.channel_gains_users, dtype=np.float32)
-    sensing = np.asarray(env_sample.sensing_sinrs, dtype=np.float32)
     weights = np.asarray(env_sample.user_weights, dtype=np.float32)
 
     max_move = float(config.get("uav_max_speed_ms", 15.0)) * float(config.get("slot_duration_s", 1.0))
     lines = ["[Geometry Guidance g(t)]"]
     lines.append(
-        f"  Movement target: oracle delta_q is usually a direction choice with a {max_move:.1f}m mobility radius; "
-        "prioritize moving toward dense/high-demand users or sensing targets while balancing load."
+        f"  Compact movement cues: delta_q is a {max_move:.1f}m direction choice. "
+        "Use the same three cues shown in the BEV image: weighted user center, nearest user, nearest target."
     )
 
+    weighted_centroid = None
     if users.size > 0:
         user_centroid = users.mean(axis=0)
         weights_safe = np.maximum(weights, 1e-6)
@@ -131,39 +130,34 @@ def build_geometry_guidance_str(env_sample, config: dict, top_k_users: int = 3) 
     for m in range(q.shape[0]):
         q_xy = q[m, :2]
 
-        # 用户候选：几何近邻与信道强用户分别排序，取并集。
-        d_user = np.linalg.norm(users - q_xy[None, :], axis=1)
-        nearest = list(np.argsort(d_user)[:top_k_users])
-        best_channel = list(np.argsort(-gains[m])[:top_k_users]) if gains.size else []
-        candidate_users = []
-        for idx in nearest + best_channel:
-            if int(idx) not in candidate_users:
-                candidate_users.append(int(idx))
-            if len(candidate_users) >= top_k_users:
-                break
+        if weighted_centroid is not None:
+            center_dir, center_dist = _unit_direction(q_xy, weighted_centroid)
+            center_text = f"weighted_center:d={center_dist:.1f}m,dir={_fmt_vec(center_dir, 3)}"
+        else:
+            center_text = "weighted_center:n/a"
 
-        user_parts = []
-        for k in candidate_users:
-            direction, dist = _unit_direction(q_xy, users[k])
-            user_parts.append(
-                f"u{k}:d={dist:.1f}m,dir={_fmt_vec(direction, 3)},w={float(weights[k]):.2f}"
+        if users.size > 0:
+            d_user = np.linalg.norm(users - q_xy[None, :], axis=1)
+            nearest_user = int(np.argmin(d_user))
+            user_dir, user_dist = _unit_direction(q_xy, users[nearest_user])
+            user_text = (
+                f"nearest_user=u{nearest_user}:d={user_dist:.1f}m,"
+                f"dir={_fmt_vec(user_dir, 3)},w={float(weights[nearest_user]):.2f}"
             )
+        else:
+            user_text = "nearest_user:n/a"
 
-        target_parts = []
         if targets.size > 0:
             d_target = np.linalg.norm(targets - q_xy[None, :], axis=1)
-            best_t = int(np.argmax(sensing[m])) if sensing.size else int(np.argmin(d_target))
             nearest_t = int(np.argmin(d_target))
-            for t in dict.fromkeys([best_t, nearest_t]):
-                direction, dist = _unit_direction(q_xy, targets[t])
-                sinr_db = 10.0 * np.log10(float(sensing[m, t]) + 1e-12) if sensing.size else 0.0
-                target_parts.append(
-                    f"t{t}:d={dist:.1f}m,dir={_fmt_vec(direction, 3)},sinr={sinr_db:.1f}dB"
-                )
+            target_dir, target_dist = _unit_direction(q_xy, targets[nearest_t])
+            target_text = f"nearest_target=t{nearest_t}:d={target_dist:.1f}m,dir={_fmt_vec(target_dir, 3)}"
+        else:
+            target_text = "nearest_target:n/a"
 
         lines.append(
             f"  UAV {m}: xy={_fmt_vec(q_xy, 1)}, h={float(q[m, 2]):.1f}m, load={loads[m]}, "
-            f"user candidates {{{'; '.join(user_parts)}}}, sensing candidates {{{'; '.join(target_parts)}}}"
+            f"{center_text}, {user_text}, {target_text}"
         )
 
     return "\n".join(lines)
@@ -224,11 +218,10 @@ def build_multimodal_prompt(
     parts.append(build_geometry_guidance_str(env_sample, config))
     parts.append(
         "[Bird's-Eye-View Image]\n"
-        "The attached BEV image uses the same geometry guidance: blue triangles are UAVs, "
+        "The attached BEV image uses the same compact geometry cues: blue triangles are UAVs, "
         "green users are scaled by demand weight, red X markers are sensing targets, "
-        "blue rings show the per-slot mobility radius, green guide lines point to candidate users, "
-        "and orange/red guide lines point to sensing candidates. Use the text and image together "
-        "to infer coverage holes, load imbalance, target proximity, and movement directions."
+        "blue rings show the per-slot mobility radius, purple lines point to the weighted user center, "
+        "green lines point to nearest users, and orange dashed lines point to nearest sensing targets."
     )
     parts.append("\nNow propose the warm-start decision prior delta in JSON format.")
 
