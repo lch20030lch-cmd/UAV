@@ -257,6 +257,8 @@ def main():
     parser.add_argument("--save_raw", action="store_true")
     parser.add_argument("--projection_head_type", type=str, choices=["shared", "split"], default=None,
                         help="可选 projection head 类型；分析 split checkpoint 时需要传 split")
+    parser.add_argument("--q_projection_mode", type=str, choices=["clip", "direction"], default=None,
+                        help="可选 q 投影模式；分析 direction checkpoint 时需要传 direction")
     args = parser.parse_args()
 
     with (PROJECT_ROOT / args.config).open("r", encoding="utf-8") as f:
@@ -275,6 +277,8 @@ def main():
     proj_head_config = build_proj_head_config(model_cfg, sim_cfg)
     if args.projection_head_type is not None:
         proj_head_config["head_type"] = args.projection_head_type
+    if args.q_projection_mode is not None:
+        proj_head_config["q_projection_mode"] = args.q_projection_mode
 
     model = Gemma3MultimodalISAC(
         model_name_or_path=model_name,
@@ -321,6 +325,7 @@ def main():
         "model": model_name,
         "checkpoint": args.checkpoint,
         "projection_head_type": proj_head_config.get("head_type", "shared"),
+        "q_projection_mode": proj_head_config.get("q_projection_mode", "clip"),
         "loaded_projection": loaded_projection,
         "loaded_control_embeddings": loaded_control_embeddings,
         "lora_checkpoint": lora_checkpoint,

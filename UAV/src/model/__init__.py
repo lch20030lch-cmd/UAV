@@ -28,4 +28,5 @@ def build_proj_head_config(model_cfg: dict, sim_cfg: dict) -> dict:
         "tau_assoc": model_cfg["projection_head"]["tau_assoc"],
         "sinkhorn_iters": model_cfg["projection_head"]["sinkhorn_iters"],
         "head_type": model_cfg["projection_head"].get("head_type", "shared"),
+        "q_projection_mode": model_cfg["projection_head"].get("q_projection_mode", "clip"),
     }

@@ -368,13 +368,17 @@ class ConstraintProjectionHead(nn.Module):
         tau_assoc: float = 0.5,
         sinkhorn_iters: int = 20,
         head_type: str = "shared",
+        q_projection_mode: str = "clip",
     ):
         super().__init__()
         self.M = M
         self.K = K
         if head_type not in {"shared", "split"}:
             raise ValueError(f"Unsupported projection head_type: {head_type}")
+        if q_projection_mode not in {"clip", "direction"}:
+            raise ValueError(f"Unsupported q_projection_mode: {q_projection_mode}")
         self.head_type = head_type
+        self.q_projection_mode = q_projection_mode
 
         # 读出维度 = M*3 (位移) + M*K (关联) + M*(K+1) (功率)
         self.q_dim = M * 3
@@ -418,6 +422,20 @@ class ConstraintProjectionHead(nn.Module):
 
         return delta_q, delta_a, delta_p
 
+    def _prepare_delta_q(self, delta_q_raw: torch.Tensor) -> torch.Tensor:
+        """
+        准备送入 Proj_Q 的 q 先验。
+
+        clip 模式保持旧逻辑：raw delta 直接交给 Proj_Q 做移动半径裁剪。
+        direction 模式面向 15m 边界饱和数据：raw delta 只表达方向，
+        先归一化到 v_max_dt 半径，再交给 Proj_Q 做区域/高度等物理裁剪。
+        """
+        if self.q_projection_mode == "clip":
+            return delta_q_raw
+        direction = F.normalize(delta_q_raw, p=2, dim=-1, eps=1e-6)
+        radius = self.proj_q.v_max_dt.to(device=delta_q_raw.device, dtype=delta_q_raw.dtype)
+        return direction * radius
+
     def forward(
         self,
         control_states: torch.Tensor,      # (B, num_control_tokens, hidden_dim)
@@ -457,7 +475,8 @@ class ConstraintProjectionHead(nn.Module):
             da = self.a_mlp(da_raw).reshape(control_states.shape[0], self.M, self.K)
             dp = self.p_mlp(dp_raw).reshape(control_states.shape[0], self.M, self.K + 1)
 
-        dq_proj = self.proj_q(dq, q_current)
+        dq_for_projection = self._prepare_delta_q(dq)
+        dq_proj = self.proj_q(dq_for_projection, q_current)
         da_proj = self.proj_a(da)
         dp_proj = self.proj_p(dp)
 

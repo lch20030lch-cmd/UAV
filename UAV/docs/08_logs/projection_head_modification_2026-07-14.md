@@ -197,3 +197,128 @@ python src/training/train_sft_mm.py \
 ```
 
 Stage B2 的目标不是提高 association，而是在 association 不回退的前提下拉起 `delta_q` 与 `delta_p` 的跨样本方差。
+
+## 2026-07-17 追加：q direction projection 模式
+
+### 新诊断结论
+
+后续 100 条 smoke 实验进一步发现：
+
+```text
+delta_q target 的 norm mean ≈ 14.995m
+near 15m ratio = 1.0
+```
+
+这说明当前数据中的 `delta_q` 不是普通自由连续位移回归，而更接近：
+
+```text
+方向向量 + 固定 15m 移动半径
+```
+
+在旧 `Proj_Q` 路径中：
+
+```text
+delta_q_raw -> Proj_Q clip(||delta_q|| <= 15m)
+```
+
+模型需要同时学习方向和幅度，而幅度又会被移动性约束裁剪。q-direction loss 能让 raw q 分支动起来，但 1000 step 后方向 cosine 仍只在 0.26-0.27 左右，说明只加方向损失还不够。
+
+### 本次新增代码
+
+文件：
+
+```text
+src/model/projection_head.py
+src/model/__init__.py
+src/training/train_sft_mm.py
+scripts/analyze_mm_delta_outputs.py
+scripts/smoke_mm_forward.py
+```
+
+新增参数：
+
+```bash
+--q_projection_mode {clip,direction}
+```
+
+默认值仍为：
+
+```text
+clip
+```
+
+保持旧 checkpoint 和旧实验兼容。
+
+新 `direction` 模式：
+
+```text
+delta_q_raw -> normalize(delta_q_raw) -> 15m * direction -> Proj_Q
+```
+
+其中 `Proj_Q` 仍保留区域、高度和物理边界裁剪。区别是 raw q 只负责表达方向，半径由 `v_max_dt` 显式给定。
+
+### 设计目的
+
+```text
+将 q 任务从“任意三维位移回归”改成“15m 边界上的方向学习”，
+更符合当前 oracle delta_q 全部贴移动半径上限的数据事实。
+```
+
+### 下一步建议实验
+
+沿用 compact geom v3 数据：
+
+```text
+/root/autodl-tmp/data/mm_smoke_100_geom_v3
+```
+
+从 v3 Stage A2 association checkpoint 继续：
+
+```bash
+python src/training/train_sft_mm.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke_100_geom_v3 \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --init_checkpoint /root/autodl-tmp/outputs/mm_smoke_100_geom_v3_stage_a2_split_assoc/mm_sft_smoke_final \
+  --max_steps 1000 \
+  --max_length 3072 \
+  --output_dir /root/autodl-tmp/outputs/mm_smoke_100_geom_v3_stage_b4_split_q_direction_proj_1000step \
+  --projection_head_type split \
+  --q_projection_mode direction \
+  --freeze_assoc_branch \
+  --projection_lr 0.005 \
+  --lambda_q 0 \
+  --lambda_q_dir 1.0 \
+  --lambda_a 0 \
+  --lambda_p 0 \
+  --lambda_assoc_ce 0 \
+  --lambda_assoc_raw_ce 0
+```
+
+诊断时也必须带同样的 q 投影模式：
+
+```bash
+python scripts/analyze_mm_delta_outputs.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke_100_geom_v3 \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --checkpoint /root/autodl-tmp/outputs/mm_smoke_100_geom_v3_stage_b4_split_q_direction_proj_1000step/mm_sft_smoke_final \
+  --projection_head_type split \
+  --q_projection_mode direction \
+  --name mm100_geom_v3_stage_b4_split_q_direction_proj_1000step \
+  --num_samples 100 \
+  --max_length 3072 \
+  --output /root/autodl-tmp/outputs/mm_smoke_100_geom_v3_stage_b4_split_q_direction_proj_1000step/delta_diag_mm100_geom_v3_stage_b4_split_q_direction_proj_1000step.json \
+  --save_raw
+```
+
+验收目标：
+
+```text
+1. association 保持 geom v3 Stage A2 水平附近：
+   unique≈3.9, fixed=0, match≈0.445
+
+2. q direction cosine 明显高于 0.27。
+
+3. delta_q_per_dim_std_mean 继续向 target 8.37 靠近，而不是只扩大 raw q 幅度。
+```

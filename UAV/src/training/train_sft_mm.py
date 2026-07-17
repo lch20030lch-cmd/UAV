@@ -124,6 +124,7 @@ def train_mm_sft_smoke(
     lora_lr_override: float = None,
     init_checkpoint: str = None,
     projection_head_type: str = None,
+    q_projection_mode: str = None,
     freeze_assoc_branch: bool = False,
     freeze_qp_branch: bool = False,
 ):
@@ -160,7 +161,10 @@ def train_mm_sft_smoke(
     proj_head_config = build_proj_head_config(model_cfg, sim_cfg)
     if projection_head_type is not None:
         proj_head_config["head_type"] = projection_head_type
+    if q_projection_mode is not None:
+        proj_head_config["q_projection_mode"] = q_projection_mode
     head_type = proj_head_config.get("head_type", "shared")
+    q_mode = proj_head_config.get("q_projection_mode", "clip")
     if (freeze_assoc_branch or freeze_qp_branch) and head_type != "split":
         raise ValueError("分支冻结参数只适用于 --projection_head_type split。")
     if freeze_assoc_branch and freeze_qp_branch:
@@ -276,6 +280,7 @@ def train_mm_sft_smoke(
     print(f"  projection lr:                {proj_lr}")
     print(f"  LoRA lr:                      {lora_lr if train_lora else 0.0}")
     print(f"  projection head type:         {head_type}")
+    print(f"  q projection mode:            {q_mode}")
     print(f"  frozen projection tensors:    {len(frozen_projection_branches)}")
     print(f"  lambda_q/a/p:                 {lambda_q_value} / {lambda_a_value} / {lambda_p_value}")
     print(f"  q direction weight:           {lambda_q_dir_value}")
@@ -368,6 +373,7 @@ def train_mm_sft_smoke(
                         "lora_rank": model_cfg["lora"]["rank"] if train_lora else 0,
                         "lora_alpha": model_cfg["lora"]["alpha"] if train_lora else 0,
                         "projection_head_type": head_type,
+                        "q_projection_mode": q_mode,
                         "freeze_assoc_branch": freeze_assoc_branch,
                         "freeze_qp_branch": freeze_qp_branch,
                         "frozen_projection_tensors": len(frozen_projection_branches),
@@ -398,6 +404,7 @@ def train_mm_sft_smoke(
             "lora_rank": model_cfg["lora"]["rank"] if train_lora else 0,
             "lora_alpha": model_cfg["lora"]["alpha"] if train_lora else 0,
             "projection_head_type": head_type,
+            "q_projection_mode": q_mode,
             "freeze_assoc_branch": freeze_assoc_branch,
             "freeze_qp_branch": freeze_qp_branch,
             "frozen_projection_tensors": len(frozen_projection_branches),
@@ -445,6 +452,8 @@ if __name__ == "__main__":
                         help="可选：从已有 mm smoke checkpoint 加载 projection head / control token / LoRA")
     parser.add_argument("--projection_head_type", type=str, choices=["shared", "split"], default=None,
                         help="可选 projection head 类型；默认使用配置文件，split 用于 q/a/p 分支解耦实验")
+    parser.add_argument("--q_projection_mode", type=str, choices=["clip", "direction"], default=None,
+                        help="可选 q 投影模式；direction 用于 15m 边界饱和的 q 方向实验")
     parser.add_argument("--freeze_assoc_branch", action="store_true",
                         help="split head 下冻结 association 分支，主要用于 Stage B2 训练 q/p")
     parser.add_argument("--freeze_qp_branch", action="store_true",
@@ -469,6 +478,7 @@ if __name__ == "__main__":
         lora_lr_override=args.lora_lr,
         init_checkpoint=args.init_checkpoint,
         projection_head_type=args.projection_head_type,
+        q_projection_mode=args.q_projection_mode,
         freeze_assoc_branch=args.freeze_assoc_branch,
         freeze_qp_branch=args.freeze_qp_branch,
     )
