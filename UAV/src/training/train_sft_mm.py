@@ -108,6 +108,20 @@ def _set_projection_branch_trainable(model, branch_prefixes, trainable: bool):
     return changed
 
 
+def _freeze_projection_except(model, trainable_prefixes):
+    """只保留指定 projection head 前缀可训练，其余全部冻结。"""
+    frozen = []
+    trainable = []
+    for name, param in model.projection_head.named_parameters():
+        keep_trainable = any(name.startswith(prefix) for prefix in trainable_prefixes)
+        param.requires_grad = keep_trainable
+        if keep_trainable:
+            trainable.append(name)
+        else:
+            frozen.append(name)
+    return frozen, trainable
+
+
 def train_mm_sft_smoke(
     config_path: str,
     data_dir: str = None,
@@ -131,6 +145,7 @@ def train_mm_sft_smoke(
     q_geometry_mode: str = None,
     freeze_assoc_branch: bool = False,
     freeze_qp_branch: bool = False,
+    freeze_all_except_q_cue: bool = False,
 ):
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -172,10 +187,13 @@ def train_mm_sft_smoke(
     head_type = proj_head_config.get("head_type", "shared")
     q_mode = proj_head_config.get("q_projection_mode", "clip")
     q_geom_mode = proj_head_config.get("q_geometry_mode", "none")
-    if (freeze_assoc_branch or freeze_qp_branch) and head_type != "split":
+    if (freeze_assoc_branch or freeze_qp_branch or freeze_all_except_q_cue) and head_type != "split":
         raise ValueError("分支冻结参数只适用于 --projection_head_type split。")
     if freeze_assoc_branch and freeze_qp_branch:
         raise ValueError("--freeze_assoc_branch 与 --freeze_qp_branch 不能同时使用。")
+
+    if freeze_all_except_q_cue and (freeze_assoc_branch or freeze_qp_branch):
+        raise ValueError("--freeze_all_except_q_cue cannot be combined with other projection freeze options.")
 
     model = Gemma3MultimodalISAC(
         model_name_or_path=model_name,
@@ -204,7 +222,13 @@ def train_mm_sft_smoke(
     model.projection_head.train()
 
     frozen_projection_branches = []
-    if freeze_assoc_branch:
+    trainable_projection_branches = []
+    if freeze_all_except_q_cue:
+        frozen_projection_branches, trainable_projection_branches = _freeze_projection_except(
+            model,
+            trainable_prefixes=("readout_q_cue",),
+        )
+    elif freeze_assoc_branch:
         frozen_projection_branches = _set_projection_branch_trainable(
             model,
             branch_prefixes=("readout_a", "a_mlp"),
@@ -296,6 +320,7 @@ def train_mm_sft_smoke(
     print(f"  q projection mode:            {q_mode}")
     print(f"  q geometry mode:              {q_geom_mode}")
     print(f"  frozen projection tensors:    {len(frozen_projection_branches)}")
+    print(f"  q-cue-only trainable tensors: {len(trainable_projection_branches)}")
     print(f"  lambda_q/a/p:                 {lambda_q_value} / {lambda_a_value} / {lambda_p_value}")
     print(f"  q direction weight:           {lambda_q_dir_value}")
     print(f"  q cue CE weight:              {lambda_q_cue_ce_value}")
@@ -398,7 +423,9 @@ def train_mm_sft_smoke(
                         "q_geometry_mode": q_geom_mode,
                         "freeze_assoc_branch": freeze_assoc_branch,
                         "freeze_qp_branch": freeze_qp_branch,
+                        "freeze_all_except_q_cue": freeze_all_except_q_cue,
                         "frozen_projection_tensors": len(frozen_projection_branches),
+                        "q_cue_only_trainable_tensors": len(trainable_projection_branches),
                         "lambda_q": lambda_q_value,
                         "lambda_a": lambda_a_value,
                         "lambda_p": lambda_p_value,
@@ -431,7 +458,9 @@ def train_mm_sft_smoke(
             "q_geometry_mode": q_geom_mode,
             "freeze_assoc_branch": freeze_assoc_branch,
             "freeze_qp_branch": freeze_qp_branch,
+            "freeze_all_except_q_cue": freeze_all_except_q_cue,
             "frozen_projection_tensors": len(frozen_projection_branches),
+            "q_cue_only_trainable_tensors": len(trainable_projection_branches),
             "lambda_q": lambda_q_value,
             "lambda_a": lambda_a_value,
             "lambda_p": lambda_p_value,
@@ -487,6 +516,8 @@ if __name__ == "__main__":
                         help="split head 下冻结 association 分支，主要用于 Stage B2 训练 q/p")
     parser.add_argument("--freeze_qp_branch", action="store_true",
                         help="split head 下冻结 q/p 分支，主要用于 Stage A2 训练 association")
+    parser.add_argument("--freeze_all_except_q_cue", action="store_true",
+                        help="只训练 q 几何候选方向头 readout_q_cue，用于 B6")
     args = parser.parse_args()
 
     train_mm_sft_smoke(
@@ -512,4 +543,5 @@ if __name__ == "__main__":
         q_geometry_mode=args.q_geometry_mode,
         freeze_assoc_branch=args.freeze_assoc_branch,
         freeze_qp_branch=args.freeze_qp_branch,
+        freeze_all_except_q_cue=args.freeze_all_except_q_cue,
     )

@@ -152,3 +152,79 @@ argmax_match_rate_mean
 如果 `q_cue_accuracy` 和 `q_cue_chosen_geometry_cosine_mean` 明显提升，但最终 `delta_q` 仍弱，说明 cue 选择学到了，但 q 输出组合/高度处理还要继续改。
 
 如果 cue 本身也学不动，问题更偏向 control token readout 或 backbone 是否需要 LoRA 参与。
+
+## 2026-07-17 追加：B6 只训练 q cue head
+
+B5 结果说明 `cue_xy` 能把 `delta_q` 幅度拉起来：
+
+```text
+delta_q_per_dim_std_mean: 7.0771
+```
+
+但 cue 选择明显偏向 `weighted_center`：
+
+```text
+q_cue_accuracy: 0.31
+q_cue_pred_hist: {'weighted_center': 360, 'nearest_user': 40, 'nearest_target': 0}
+q_cue_target_hist: {'weighted_center': 123, 'nearest_user': 99, 'nearest_target': 178}
+```
+
+因此新增训练开关：
+
+```text
+--freeze_all_except_q_cue
+```
+
+作用：
+
+```text
+只训练 readout_q_cue
+冻结 readout_q / q_mlp / readout_a / a_mlp / readout_p / p_mlp
+冻结 base Gemma 和 control token 之外的其他 projection head 参数
+```
+
+B6 建议从 B5 checkpoint 初始化，只修 cue 选择器：
+
+```bash
+python src/training/train_sft_mm.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_smoke_100_geom_v3 \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --init_checkpoint /root/autodl-tmp/outputs/mm_smoke_100_geom_v3_stage_b5_q_cue_xy_1000step/mm_sft_smoke_final \
+  --max_steps 1000 \
+  --max_length 3072 \
+  --output_dir /root/autodl-tmp/outputs/mm_smoke_100_geom_v3_stage_b6_q_cue_only_1000step \
+  --projection_head_type split \
+  --q_geometry_mode cue_xy \
+  --freeze_all_except_q_cue \
+  --projection_lr 0.003 \
+  --lambda_q 0 \
+  --lambda_q_dir 0 \
+  --lambda_q_cue_ce 5.0 \
+  --lambda_a 0 \
+  --lambda_p 0 \
+  --lambda_assoc_ce 0 \
+  --lambda_assoc_raw_ce 0
+```
+
+训练启动时应看到：
+
+```text
+q-cue-only trainable tensors: > 0
+```
+
+诊断时继续传：
+
+```text
+--q_geometry_mode cue_xy
+```
+
+优先观察：
+
+```text
+q_cue_accuracy
+q_cue_pred_hist
+q_cue_chosen_geometry_cosine_mean
+delta_q_per_dim_std_mean
+delta_a_argmax_unique_per_user_mean
+```
