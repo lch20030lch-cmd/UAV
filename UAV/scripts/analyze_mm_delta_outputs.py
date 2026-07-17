@@ -74,6 +74,34 @@ def _summarize_association(prefix: str, delta_a: np.ndarray) -> Dict:
     }
 
 
+def _summarize_q_cues(
+    q_cue_logits: np.ndarray,
+    q_geometry_cues: np.ndarray,
+    delta_q_target: np.ndarray,
+) -> Dict:
+    target_xy = delta_q_target[..., :2]
+    target_dir = target_xy / np.maximum(np.linalg.norm(target_xy, axis=-1, keepdims=True), 1e-8)
+    cue_dir = q_geometry_cues / np.maximum(np.linalg.norm(q_geometry_cues, axis=-1, keepdims=True), 1e-8)
+    cue_cos = (cue_dir * target_dir[:, :, None, :]).sum(axis=-1)
+    target_idx = np.argmax(cue_cos, axis=-1)
+    pred_idx = np.argmax(q_cue_logits, axis=-1)
+    pred_probs = np.exp(q_cue_logits - q_cue_logits.max(axis=-1, keepdims=True))
+    pred_probs = pred_probs / np.maximum(pred_probs.sum(axis=-1, keepdims=True), 1e-12)
+    names = ["weighted_center", "nearest_user", "nearest_target"]
+    target_hist = {names[i]: int((target_idx == i).sum()) for i in range(3)}
+    pred_hist = {names[i]: int((pred_idx == i).sum()) for i in range(3)}
+    chosen_cos = np.take_along_axis(cue_cos, pred_idx[..., None], axis=-1).squeeze(-1)
+    best_cos = np.max(cue_cos, axis=-1)
+    return {
+        "q_cue_accuracy": float((pred_idx == target_idx).mean()),
+        "q_cue_pred_hist": pred_hist,
+        "q_cue_target_hist": target_hist,
+        "q_cue_pred_prob_mean": pred_probs.reshape(-1, 3).mean(axis=0).tolist(),
+        "q_cue_chosen_geometry_cosine_mean": float(chosen_cos.mean()),
+        "q_cue_best_geometry_cosine_mean": float(best_cos.mean()),
+    }
+
+
 def _summarize_deltas(
     delta_q: np.ndarray,
     delta_a: np.ndarray,
@@ -81,6 +109,8 @@ def _summarize_deltas(
     delta_q_raw: np.ndarray = None,
     delta_a_raw: np.ndarray = None,
     delta_q_target: np.ndarray = None,
+    q_cue_logits: np.ndarray = None,
+    q_geometry_cues: np.ndarray = None,
     control_states: np.ndarray = None,
     delta_raw: np.ndarray = None,
 ) -> Dict:
@@ -101,6 +131,8 @@ def _summarize_deltas(
         summary["delta_q_raw_dir_cosine_mean"] = float(cos.mean())
         summary["delta_q_raw_dir_cosine_std"] = float(cos.std())
         summary["delta_q_raw_dir_mse_mean"] = float(mse.mean())
+    if q_cue_logits is not None and q_geometry_cues is not None and delta_q_target is not None:
+        summary.update(_summarize_q_cues(q_cue_logits, q_geometry_cues, delta_q_target))
     if delta_a_raw is not None:
         summary.update(_summarize_tensor("delta_a_raw", delta_a_raw))
         summary.update(_summarize_association("delta_a_raw", delta_a_raw))
@@ -148,7 +180,13 @@ def _load_projection_head(model: Gemma3MultimodalISAC, checkpoint: str):
     if not ckpt_path.exists():
         raise FileNotFoundError(f"projection_head checkpoint not found: {ckpt_path}")
     state = torch.load(ckpt_path, map_location="cpu")
-    model.projection_head.load_state_dict(state)
+    load_result = model.projection_head.load_state_dict(state, strict=False)
+    if load_result.missing_keys or load_result.unexpected_keys:
+        print(
+            "Projection head loaded with non-strict key match: "
+            f"missing={list(load_result.missing_keys)}, "
+            f"unexpected={list(load_result.unexpected_keys)}"
+        )
     return str(ckpt_path)
 
 
@@ -188,6 +226,8 @@ def _collect_deltas(
     delta_q_raws: List[np.ndarray] = []
     delta_a_raws: List[np.ndarray] = []
     delta_q_targets: List[np.ndarray] = []
+    q_cue_logits_list: List[np.ndarray] = []
+    q_geometry_cues_list: List[np.ndarray] = []
     control_states_list: List[np.ndarray] = []
     delta_raws: List[np.ndarray] = []
 
@@ -204,6 +244,7 @@ def _collect_deltas(
                 "delta_q_target",
                 "delta_a_target",
                 "delta_p_target",
+                "q_geometry_mask",
             }
         }
         with torch.no_grad():
@@ -217,6 +258,10 @@ def _collect_deltas(
             delta_a_raws.append(_as_np(outputs["delta_a_raw"].squeeze(0)))
         if "delta_q_target" in batch:
             delta_q_targets.append(_as_np(batch["delta_q_target"].squeeze(0)))
+        if "q_cue_logits" in outputs:
+            q_cue_logits_list.append(_as_np(outputs["q_cue_logits"].squeeze(0)))
+        if "q_geometry_cues" in batch:
+            q_geometry_cues_list.append(_as_np(batch["q_geometry_cues"].squeeze(0)))
         if "control_states" in outputs:
             control_states_list.append(_as_np(outputs["control_states"].squeeze(0)))
         if "delta_raw" in outputs:
@@ -233,6 +278,10 @@ def _collect_deltas(
         result["delta_q_raw"] = np.stack(delta_q_raws, axis=0)
     if delta_q_targets:
         result["delta_q_target"] = np.stack(delta_q_targets, axis=0)
+    if q_cue_logits_list:
+        result["q_cue_logits"] = np.stack(q_cue_logits_list, axis=0)
+    if q_geometry_cues_list:
+        result["q_geometry_cues"] = np.stack(q_geometry_cues_list, axis=0)
     if control_states_list:
         result["control_states"] = np.stack(control_states_list, axis=0)
     if delta_raws:
@@ -259,6 +308,8 @@ def main():
                         help="可选 projection head 类型；分析 split checkpoint 时需要传 split")
     parser.add_argument("--q_projection_mode", type=str, choices=["clip", "direction"], default=None,
                         help="可选 q 投影模式；分析 direction checkpoint 时需要传 direction")
+    parser.add_argument("--q_geometry_mode", type=str, choices=["none", "cue_xy"], default=None,
+                        help="可选：分析 cue_xy checkpoint 时需要传 cue_xy")
     args = parser.parse_args()
 
     with (PROJECT_ROOT / args.config).open("r", encoding="utf-8") as f:
@@ -279,6 +330,8 @@ def main():
         proj_head_config["head_type"] = args.projection_head_type
     if args.q_projection_mode is not None:
         proj_head_config["q_projection_mode"] = args.q_projection_mode
+    if args.q_geometry_mode is not None:
+        proj_head_config["q_geometry_mode"] = args.q_geometry_mode
 
     model = Gemma3MultimodalISAC(
         model_name_or_path=model_name,
@@ -314,6 +367,8 @@ def main():
         deltas.get("delta_q_raw"),
         deltas.get("delta_a_raw"),
         deltas.get("delta_q_target"),
+        deltas.get("q_cue_logits"),
+        deltas.get("q_geometry_cues"),
         deltas.get("control_states"),
         deltas.get("delta_raw"),
     )
@@ -326,6 +381,7 @@ def main():
         "checkpoint": args.checkpoint,
         "projection_head_type": proj_head_config.get("head_type", "shared"),
         "q_projection_mode": proj_head_config.get("q_projection_mode", "clip"),
+        "q_geometry_mode": proj_head_config.get("q_geometry_mode", "none"),
         "loaded_projection": loaded_projection,
         "loaded_control_embeddings": loaded_control_embeddings,
         "lora_checkpoint": lora_checkpoint,
@@ -360,6 +416,11 @@ def main():
         "delta_q_raw_per_dim_std_mean",
         "delta_q_raw_dir_cosine_mean",
         "delta_q_raw_dir_mse_mean",
+        "q_cue_accuracy",
+        "q_cue_target_hist",
+        "q_cue_pred_hist",
+        "q_cue_chosen_geometry_cosine_mean",
+        "q_cue_best_geometry_cosine_mean",
         "delta_a_argmax_unique_per_user_mean",
         "delta_a_argmax_fixed_user_count",
         "delta_a_entropy_mean",

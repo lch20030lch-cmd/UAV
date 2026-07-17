@@ -45,7 +45,13 @@ def _load_projection_head(model: Gemma3MultimodalISAC, checkpoint: str):
     if not ckpt_path.exists():
         raise FileNotFoundError(f"projection_head checkpoint not found: {ckpt_path}")
     state = torch.load(ckpt_path, map_location="cpu")
-    model.projection_head.load_state_dict(state)
+    load_result = model.projection_head.load_state_dict(state, strict=False)
+    if load_result.missing_keys or load_result.unexpected_keys:
+        print(
+            "Projection head loaded with non-strict key match: "
+            f"missing={list(load_result.missing_keys)}, "
+            f"unexpected={list(load_result.unexpected_keys)}"
+        )
     return str(ckpt_path)
 
 
@@ -83,6 +89,8 @@ def main():
                         help="可选 projection head 类型；加载 split checkpoint 时需要传 split")
     parser.add_argument("--q_projection_mode", type=str, choices=["clip", "direction"], default=None,
                         help="可选 q 投影模式；加载 direction checkpoint 时需要传 direction")
+    parser.add_argument("--q_geometry_mode", type=str, choices=["none", "cue_xy"], default=None,
+                        help="可选：加载 cue_xy checkpoint 时需要传 cue_xy")
     args = parser.parse_args()
 
     with (PROJECT_ROOT / args.config).open("r", encoding="utf-8") as f:
@@ -103,6 +111,8 @@ def main():
         proj_head_config["head_type"] = args.projection_head_type
     if args.q_projection_mode is not None:
         proj_head_config["q_projection_mode"] = args.q_projection_mode
+    if args.q_geometry_mode is not None:
+        proj_head_config["q_geometry_mode"] = args.q_geometry_mode
 
     model = Gemma3MultimodalISAC(
         model_name_or_path=model_name,
@@ -141,6 +151,7 @@ def main():
             "delta_q_target",
             "delta_a_target",
             "delta_p_target",
+            "q_geometry_mask",
         }
     }
 
@@ -154,6 +165,7 @@ def main():
     print(f"  loaded_lora_checkpoint: {model.loaded_lora_checkpoint}")
     print(f"  projection_head_type: {proj_head_config.get('head_type', 'shared')}")
     print(f"  q_projection_mode: {proj_head_config.get('q_projection_mode', 'clip')}")
+    print(f"  q_geometry_mode: {proj_head_config.get('q_geometry_mode', 'none')}")
     print(f"  max_length: {max_length}")
     print(f"  input_ids: {tuple(batch['input_ids'].shape)}")
     print(f"  attention_mask: {tuple(batch['attention_mask'].shape)}")
@@ -164,6 +176,8 @@ def main():
     print(f"  delta_q: {tuple(outputs['delta_q'].shape)}")
     print(f"  delta_a: {tuple(outputs['delta_a'].shape)}")
     print(f"  delta_p: {tuple(outputs['delta_p'].shape)}")
+    if "q_cue_logits" in outputs:
+        print(f"  q_cue_logits: {tuple(outputs['q_cue_logits'].shape)}")
 
     for name in ["delta_q", "delta_a", "delta_p"]:
         tensor = outputs[name]

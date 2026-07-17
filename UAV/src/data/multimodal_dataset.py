@@ -15,6 +15,8 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from src.data.geometry_cues import parse_q_geometry_cues
+
 
 def get_image_token(processor) -> str:
     # 不同 transformers 版本暴露的图像 token 名称不完全一致，这里集中做兼容。
@@ -155,6 +157,9 @@ class MultimodalSFTDataset(Dataset):
         if not (len(input_ids) == len(attention_mask) == len(token_type_ids) == len(labels) == len(control_mask)):
             raise RuntimeError("Multimodal token fields have inconsistent lengths after padding/truncation.")
 
+        num_uavs = len(item["q_current"])
+        q_geometry_cues, q_geometry_mask = parse_q_geometry_cues(item["prompt"], num_uavs)
+
         result = {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
@@ -167,6 +172,8 @@ class MultimodalSFTDataset(Dataset):
             "delta_q_target": torch.tensor(item["delta_q"], dtype=torch.float32),
             "delta_a_target": torch.tensor(item["delta_a"], dtype=torch.float32),
             "delta_p_target": torch.tensor(item["delta_p"], dtype=torch.float32),
+            "q_geometry_cues": torch.tensor(q_geometry_cues, dtype=torch.float32),
+            "q_geometry_mask": torch.tensor(q_geometry_mask, dtype=torch.float32),
         }
 
         for key, value in encoded.items():

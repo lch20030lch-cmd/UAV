@@ -369,6 +369,7 @@ class ConstraintProjectionHead(nn.Module):
         sinkhorn_iters: int = 20,
         head_type: str = "shared",
         q_projection_mode: str = "clip",
+        q_geometry_mode: str = "none",
     ):
         super().__init__()
         self.M = M
@@ -377,8 +378,11 @@ class ConstraintProjectionHead(nn.Module):
             raise ValueError(f"Unsupported projection head_type: {head_type}")
         if q_projection_mode not in {"clip", "direction"}:
             raise ValueError(f"Unsupported q_projection_mode: {q_projection_mode}")
+        if q_geometry_mode not in {"none", "cue_xy"}:
+            raise ValueError(f"Unsupported q_geometry_mode: {q_geometry_mode}")
         self.head_type = head_type
         self.q_projection_mode = q_projection_mode
+        self.q_geometry_mode = q_geometry_mode
 
         # 读出维度 = M*3 (位移) + M*K (关联) + M*(K+1) (功率)
         self.q_dim = M * 3
@@ -398,6 +402,10 @@ class ConstraintProjectionHead(nn.Module):
             self.q_mlp = ResidualMLP(self.q_dim, mlp_hidden or [256, 256])
             self.a_mlp = ResidualMLP(self.a_dim, mlp_hidden or [256, 256])
             self.p_mlp = ResidualMLP(self.p_dim, mlp_hidden or [256, 256])
+
+        # 可选 q 几何候选方向选择头。它只在传入 q_geometry_cues 且
+        # q_geometry_mode=cue_xy 时参与输出，默认不改变旧路径。
+        self.readout_q_cue = ControlReadout(hidden_dim, num_control_tokens, M * 3, num_queries=M)
 
         # 投影模块
         self.proj_q = DeploymentProjection(area_w, area_h, h_min, h_max, v_max_dt)
@@ -436,10 +444,35 @@ class ConstraintProjectionHead(nn.Module):
         radius = self.proj_q.v_max_dt.to(device=delta_q_raw.device, dtype=delta_q_raw.dtype)
         return direction * radius
 
+    def _compose_q_from_geometry_cues(
+        self,
+        delta_q_raw: torch.Tensor,
+        q_geometry_cues: Optional[torch.Tensor],
+        q_cue_logits: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        用 prompt/BEV 的三类候选 xy 方向组合 q 位移。
+
+        q_geometry_cues: (B, M, 3, 2)，顺序为 weighted center / nearest user /
+        nearest target。xy 方向由 cue 权重加权，z 方向暂时保留 raw q 的 dh，
+        因为当前 v3 几何提示主要表达水平移动方向。
+        """
+        if self.q_geometry_mode != "cue_xy" or q_geometry_cues is None or q_cue_logits is None:
+            return self._prepare_delta_q(delta_q_raw)
+
+        cues = q_geometry_cues.to(device=delta_q_raw.device, dtype=delta_q_raw.dtype)
+        weights = F.softmax(q_cue_logits.to(dtype=delta_q_raw.dtype), dim=-1)
+        cue_xy = torch.sum(weights.unsqueeze(-1) * cues, dim=2)
+        cue_xy = F.normalize(cue_xy, p=2, dim=-1, eps=1e-6)
+        radius = self.proj_q.v_max_dt.to(device=delta_q_raw.device, dtype=delta_q_raw.dtype)
+        q_xy = cue_xy * radius
+        return torch.cat([q_xy, delta_q_raw[..., 2:3]], dim=-1)
+
     def forward(
         self,
         control_states: torch.Tensor,      # (B, num_control_tokens, hidden_dim)
         q_current: Optional[torch.Tensor] = None,  # (B, M, 3)
+        q_geometry_cues: Optional[torch.Tensor] = None,  # (B, M, 3, 2)
     ) -> dict:
         """
         前向传播
@@ -475,12 +508,18 @@ class ConstraintProjectionHead(nn.Module):
             da = self.a_mlp(da_raw).reshape(control_states.shape[0], self.M, self.K)
             dp = self.p_mlp(dp_raw).reshape(control_states.shape[0], self.M, self.K + 1)
 
-        dq_for_projection = self._prepare_delta_q(dq)
+        q_cue_logits = None
+        q_cue_weights = None
+        if self.q_geometry_mode == "cue_xy" and q_geometry_cues is not None:
+            q_cue_logits = self.readout_q_cue(control_states).reshape(control_states.shape[0], self.M, 3)
+            q_cue_weights = F.softmax(q_cue_logits, dim=-1)
+
+        dq_for_projection = self._compose_q_from_geometry_cues(dq, q_geometry_cues, q_cue_logits)
         dq_proj = self.proj_q(dq_for_projection, q_current)
         da_proj = self.proj_a(da)
         dp_proj = self.proj_p(dp)
 
-        return {
+        result = {
             "delta_q": dq_proj,
             "delta_a": da_proj,
             "delta_p": dp_proj,
@@ -489,3 +528,7 @@ class ConstraintProjectionHead(nn.Module):
             "delta_a_raw": da,
             "delta_p_raw": dp,
         }
+        if q_cue_logits is not None:
+            result["q_cue_logits"] = q_cue_logits
+            result["q_cue_weights"] = q_cue_weights
+        return result

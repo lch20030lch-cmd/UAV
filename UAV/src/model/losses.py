@@ -41,6 +41,7 @@ class UAVISACLosses:
         lambda_assoc_ce: float = 0.0,
         lambda_assoc_raw_ce: float = 0.0,
         lambda_q_dir: float = 0.0,
+        lambda_q_cue_ce: float = 0.0,
         dpo_beta: float = 0.1,
         sft_anchor_mu: float = 0.05,
     ):
@@ -52,6 +53,7 @@ class UAVISACLosses:
         self.lambda_assoc_ce = lambda_assoc_ce
         self.lambda_assoc_raw_ce = lambda_assoc_raw_ce
         self.lambda_q_dir = lambda_q_dir
+        self.lambda_q_cue_ce = lambda_q_cue_ce
         self.dpo_beta = dpo_beta
         self.sft_anchor_mu = sft_anchor_mu
 
@@ -107,6 +109,35 @@ class UAVISACLosses:
         target_dir = F.normalize(delta_q_target, p=2, dim=-1, eps=1e-6)
         return F.mse_loss(pred_dir, target_dir)
 
+    def compute_q_cue_ce_loss(
+        self,
+        q_cue_logits: torch.Tensor,
+        q_geometry_cues: torch.Tensor,
+        delta_q_target: torch.Tensor,
+        q_geometry_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        几何 cue 分类损失。
+
+        对每架 UAV，先选出与 oracle delta_q 水平移动方向 cosine 最大的 cue，
+        再监督 q_cue_logits 预测该 cue。这样 q 分支先学会“沿 prompt/BEV 中
+        哪条候选线移动”，而不是直接自由回归 dx/dy。
+        """
+        logits = q_cue_logits.to(dtype=torch.float32)
+        cues = q_geometry_cues.to(device=logits.device, dtype=torch.float32)
+        target_xy = delta_q_target[..., :2].to(device=logits.device, dtype=torch.float32)
+        target_dir = F.normalize(target_xy, p=2, dim=-1, eps=1e-6)
+        cue_dir = F.normalize(cues, p=2, dim=-1, eps=1e-6)
+        cosine = torch.sum(cue_dir * target_dir.unsqueeze(2), dim=-1)
+        if q_geometry_mask is not None:
+            mask = q_geometry_mask.to(device=logits.device, dtype=torch.bool)
+            cosine = cosine.masked_fill(~mask, -1e4)
+        target_idx = torch.argmax(cosine, dim=-1)
+        return F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            target_idx.reshape(-1),
+        )
+
     def compute_control_loss(
         self,
         delta_hat: Dict[str, torch.Tensor],
@@ -161,6 +192,20 @@ class UAVISACLosses:
         else:
             loss_q_dir = dq_hat.new_tensor(0.0)
 
+        if (
+            "q_cue_logits" in delta_hat
+            and "q_geometry_cues" in delta_target
+            and self.lambda_q_cue_ce != 0
+        ):
+            loss_q_cue_ce = self.compute_q_cue_ce_loss(
+                delta_hat["q_cue_logits"],
+                delta_target["q_geometry_cues"],
+                dq_tgt,
+                delta_target.get("q_geometry_mask"),
+            )
+        else:
+            loss_q_cue_ce = dq_hat.new_tensor(0.0)
+
         # 功率 loss (MSE)
         loss_p = F.mse_loss(dp_hat, dp_tgt) if self.lambda_p != 0 else dp_hat.new_tensor(0.0)
 
@@ -171,6 +216,7 @@ class UAVISACLosses:
             + self.lambda_assoc_ce * loss_a_ce
             + self.lambda_assoc_raw_ce * loss_a_raw_ce
             + self.lambda_q_dir * loss_q_dir
+            + self.lambda_q_cue_ce * loss_q_cue_ce
         )
 
         if return_components:
@@ -180,6 +226,7 @@ class UAVISACLosses:
                 "loss_a_ce": loss_a_ce,
                 "loss_a_raw_ce": loss_a_raw_ce,
                 "loss_q_dir": loss_q_dir,
+                "loss_q_cue_ce": loss_q_cue_ce,
                 "loss_p": loss_p,
             }
         return total
@@ -319,10 +366,12 @@ class UAVISACLosses:
             "loss_a_ce": ctl_parts["loss_a_ce"].item(),
             "loss_a_raw_ce": ctl_parts["loss_a_raw_ce"].item(),
             "loss_q_dir": ctl_parts["loss_q_dir"].item(),
+            "loss_q_cue_ce": ctl_parts["loss_q_cue_ce"].item(),
             "loss_p": ctl_parts["loss_p"].item(),
             "lambda_assoc_ce": self.lambda_assoc_ce,
             "lambda_assoc_raw_ce": self.lambda_assoc_raw_ce,
             "lambda_q_dir": self.lambda_q_dir,
+            "lambda_q_cue_ce": self.lambda_q_cue_ce,
         }
         return total, metrics
 

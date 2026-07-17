@@ -87,8 +87,10 @@ def _load_mm_smoke_checkpoint(model, init_checkpoint: str) -> dict:
     proj_path = ckpt_dir / "projection_head.pt"
     if proj_path.exists():
         state = torch.load(proj_path, map_location="cpu")
-        model.projection_head.load_state_dict(state)
+        load_result = model.projection_head.load_state_dict(state, strict=False)
         loaded["projection_head"] = str(proj_path)
+        loaded["projection_missing_keys"] = list(load_result.missing_keys)
+        loaded["projection_unexpected_keys"] = list(load_result.unexpected_keys)
 
     loaded_ctrl = model.load_control_token_embeddings(ckpt_dir)
     if loaded_ctrl:
@@ -120,11 +122,13 @@ def train_mm_sft_smoke(
     lambda_p: float = None,
     lambda_assoc_raw_ce: float = None,
     lambda_q_dir: float = None,
+    lambda_q_cue_ce: float = None,
     projection_lr: float = None,
     lora_lr_override: float = None,
     init_checkpoint: str = None,
     projection_head_type: str = None,
     q_projection_mode: str = None,
+    q_geometry_mode: str = None,
     freeze_assoc_branch: bool = False,
     freeze_qp_branch: bool = False,
 ):
@@ -163,8 +167,11 @@ def train_mm_sft_smoke(
         proj_head_config["head_type"] = projection_head_type
     if q_projection_mode is not None:
         proj_head_config["q_projection_mode"] = q_projection_mode
+    if q_geometry_mode is not None:
+        proj_head_config["q_geometry_mode"] = q_geometry_mode
     head_type = proj_head_config.get("head_type", "shared")
     q_mode = proj_head_config.get("q_projection_mode", "clip")
+    q_geom_mode = proj_head_config.get("q_geometry_mode", "none")
     if (freeze_assoc_branch or freeze_qp_branch) and head_type != "split":
         raise ValueError("分支冻结参数只适用于 --projection_head_type split。")
     if freeze_assoc_branch and freeze_qp_branch:
@@ -206,7 +213,7 @@ def train_mm_sft_smoke(
     elif freeze_qp_branch:
         frozen_projection_branches = _set_projection_branch_trainable(
             model,
-            branch_prefixes=("readout_q", "q_mlp", "readout_p", "p_mlp"),
+            branch_prefixes=("readout_q", "q_mlp", "readout_q_cue", "readout_p", "p_mlp"),
             trainable=False,
         )
 
@@ -243,6 +250,11 @@ def train_mm_sft_smoke(
         if lambda_q_dir is not None
         else float(train_cfg.get("phase1", {}).get("lambda_q_dir", 0.0))
     )
+    lambda_q_cue_ce_value = (
+        float(lambda_q_cue_ce)
+        if lambda_q_cue_ce is not None
+        else float(train_cfg.get("phase1", {}).get("lambda_q_cue_ce", 0.0))
+    )
     loss_fn = UAVISACLosses(
         lambda_ctl=model_cfg["loss"]["lambda_ctl"],
         lambda_q=lambda_q_value,
@@ -252,6 +264,7 @@ def train_mm_sft_smoke(
         lambda_assoc_ce=assoc_ce_weight,
         lambda_assoc_raw_ce=assoc_raw_ce_weight,
         lambda_q_dir=lambda_q_dir_value,
+        lambda_q_cue_ce=lambda_q_cue_ce_value,
     )
     # 默认只训练投影头；传入 --train_lora 时，PEFT 会额外打开 LoRA 参数。
     proj_params = [p for p in model.projection_head.parameters() if p.requires_grad]
@@ -281,9 +294,11 @@ def train_mm_sft_smoke(
     print(f"  LoRA lr:                      {lora_lr if train_lora else 0.0}")
     print(f"  projection head type:         {head_type}")
     print(f"  q projection mode:            {q_mode}")
+    print(f"  q geometry mode:              {q_geom_mode}")
     print(f"  frozen projection tensors:    {len(frozen_projection_branches)}")
     print(f"  lambda_q/a/p:                 {lambda_q_value} / {lambda_a_value} / {lambda_p_value}")
     print(f"  q direction weight:           {lambda_q_dir_value}")
+    print(f"  q cue CE weight:              {lambda_q_cue_ce_value}")
     print(f"  association CE weight:        {assoc_ce_weight}")
     print(f"  association raw CE weight:    {assoc_raw_ce_weight}")
 
@@ -308,6 +323,7 @@ def train_mm_sft_smoke(
                     "delta_q_target",
                     "delta_a_target",
                     "delta_p_target",
+                    "q_geometry_mask",
                 }
             }
 
@@ -327,6 +343,10 @@ def train_mm_sft_smoke(
                 "delta_a": batch["delta_a_target"],
                 "delta_p": batch["delta_p_target"],
             }
+            if "q_geometry_cues" in batch:
+                delta_target["q_geometry_cues"] = batch["q_geometry_cues"]
+            if "q_geometry_mask" in batch:
+                delta_target["q_geometry_mask"] = batch["q_geometry_mask"]
             total_loss, metrics = loss_fn.compute_phase1_total(
                 delta_hat=delta_hat,
                 delta_target=delta_target,
@@ -350,6 +370,7 @@ def train_mm_sft_smoke(
                 f"loss_a_ce={metrics['loss_a_ce']:.6f} "
                 f"loss_a_raw_ce={metrics['loss_a_raw_ce']:.6f} "
                 f"loss_q_dir={metrics['loss_q_dir']:.6f} "
+                f"loss_q_cue_ce={metrics['loss_q_cue_ce']:.6f} "
                 f"grad_norm_proj={grad_norm:.6f} "
                 f"grad_norm_lora={grad_norm_lora:.6f}"
             )
@@ -374,6 +395,7 @@ def train_mm_sft_smoke(
                         "lora_alpha": model_cfg["lora"]["alpha"] if train_lora else 0,
                         "projection_head_type": head_type,
                         "q_projection_mode": q_mode,
+                        "q_geometry_mode": q_geom_mode,
                         "freeze_assoc_branch": freeze_assoc_branch,
                         "freeze_qp_branch": freeze_qp_branch,
                         "frozen_projection_tensors": len(frozen_projection_branches),
@@ -381,6 +403,7 @@ def train_mm_sft_smoke(
                         "lambda_a": lambda_a_value,
                         "lambda_p": lambda_p_value,
                         "lambda_q_dir": lambda_q_dir_value,
+                        "lambda_q_cue_ce": lambda_q_cue_ce_value,
                         "lambda_assoc_ce": assoc_ce_weight,
                         "lambda_assoc_raw_ce": assoc_raw_ce_weight,
                         "loaded_init": loaded_init,
@@ -405,6 +428,7 @@ def train_mm_sft_smoke(
             "lora_alpha": model_cfg["lora"]["alpha"] if train_lora else 0,
             "projection_head_type": head_type,
             "q_projection_mode": q_mode,
+            "q_geometry_mode": q_geom_mode,
             "freeze_assoc_branch": freeze_assoc_branch,
             "freeze_qp_branch": freeze_qp_branch,
             "frozen_projection_tensors": len(frozen_projection_branches),
@@ -412,6 +436,7 @@ def train_mm_sft_smoke(
             "lambda_a": lambda_a_value,
             "lambda_p": lambda_p_value,
             "lambda_q_dir": lambda_q_dir_value,
+            "lambda_q_cue_ce": lambda_q_cue_ce_value,
             "lambda_assoc_ce": assoc_ce_weight,
             "lambda_assoc_raw_ce": assoc_raw_ce_weight,
             "loaded_init": loaded_init,
@@ -444,6 +469,8 @@ if __name__ == "__main__":
                         help="可选 delta_p 损失权重覆盖值")
     parser.add_argument("--lambda_q_dir", type=float, default=None,
                         help="可选 delta_q raw 方向辅助损失权重，适用于 q target 贴移动边界的 smoke")
+    parser.add_argument("--lambda_q_cue_ce", type=float, default=None,
+                        help="可选：q 几何候选方向分类损失权重，用于 cue_xy 几何蒸馏")
     parser.add_argument("--projection_lr", type=float, default=None,
                         help="可选 projection head 学习率覆盖值")
     parser.add_argument("--lora_lr", type=float, default=None,
@@ -454,6 +481,8 @@ if __name__ == "__main__":
                         help="可选 projection head 类型；默认使用配置文件，split 用于 q/a/p 分支解耦实验")
     parser.add_argument("--q_projection_mode", type=str, choices=["clip", "direction"], default=None,
                         help="可选 q 投影模式；direction 用于 15m 边界饱和的 q 方向实验")
+    parser.add_argument("--q_geometry_mode", type=str, choices=["none", "cue_xy"], default=None,
+                        help="可选：cue_xy 使用 prompt/BEV 几何候选方向组合 q 水平移动")
     parser.add_argument("--freeze_assoc_branch", action="store_true",
                         help="split head 下冻结 association 分支，主要用于 Stage B2 训练 q/p")
     parser.add_argument("--freeze_qp_branch", action="store_true",
@@ -474,11 +503,13 @@ if __name__ == "__main__":
         lambda_p=args.lambda_p,
         lambda_assoc_raw_ce=args.lambda_assoc_raw_ce,
         lambda_q_dir=args.lambda_q_dir,
+        lambda_q_cue_ce=args.lambda_q_cue_ce,
         projection_lr=args.projection_lr,
         lora_lr_override=args.lora_lr,
         init_checkpoint=args.init_checkpoint,
         projection_head_type=args.projection_head_type,
         q_projection_mode=args.q_projection_mode,
+        q_geometry_mode=args.q_geometry_mode,
         freeze_assoc_branch=args.freeze_assoc_branch,
         freeze_qp_branch=args.freeze_qp_branch,
     )

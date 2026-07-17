@@ -217,6 +217,7 @@ class Gemma3MultimodalISAC(nn.Module):
         attention_mask: torch.Tensor,
         control_mask: torch.Tensor,
         q_current: Optional[torch.Tensor] = None,
+        q_geometry_cues: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         **kwargs,
@@ -253,7 +254,9 @@ class Gemma3MultimodalISAC(nn.Module):
         self.projection_head = self.projection_head.to(control_states.device)
         if q_current is not None:
             q_current = q_current.to(control_states.device)
-        prior_hat = self.projection_head(control_states.float(), q_current)
+        if q_geometry_cues is not None:
+            q_geometry_cues = q_geometry_cues.to(control_states.device)
+        prior_hat = self.projection_head(control_states.float(), q_current, q_geometry_cues)
 
         return {
             "logits": getattr(outputs, "logits", None),
