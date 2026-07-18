@@ -234,6 +234,8 @@ def train_stage2(
         lambda_q=model_cfg["loss"]["lambda_q"],
         lambda_a=model_cfg["loss"]["lambda_a"],
         lambda_p=model_cfg["loss"]["lambda_p"],
+        lambda_p_raw_kl=model_cfg["loss"].get("lambda_p_raw_kl", 0.0),
+        power_temperature=float(model_cfg["projection_head"]["tau_power"]),
         lambda_sep=model_cfg["loss"]["lambda_sep"],
         dpo_beta=train_cfg["beta"],
         sft_anchor_mu=train_cfg.get("mu", 0.05),
@@ -333,6 +335,8 @@ def train_stage2(
                     "delta_a": outputs_chosen["delta_a"],
                     "delta_p": outputs_chosen["delta_p"],
                 }
+                if "delta_p_raw" in outputs_chosen:
+                    delta_hat["delta_p_raw"] = outputs_chosen["delta_p_raw"]
 
                 # === Total Stage II loss ===
                 # L = L_DPO + μ*L_SFT + λ_ctl*L_ctl + λ_sep*L_sep

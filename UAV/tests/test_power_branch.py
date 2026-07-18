@@ -72,6 +72,19 @@ class PowerLossTest(unittest.TestCase):
         loss.backward()
         self.assertGreater(float(prediction.grad.abs().sum()), 0.0)
 
+    def test_raw_kl_keeps_gradient_when_softmax_is_wrong_and_saturated(self):
+        raw_logits = torch.tensor(
+            [[[20.0, -20.0, -20.0], [20.0, -20.0, -20.0]]],
+            requires_grad=True,
+        )
+
+        loss = self.losses.compute_power_raw_kl_loss(raw_logits, self.target)
+
+        self.assertGreater(float(loss), 1.0)
+        loss.backward()
+        self.assertTrue(torch.isfinite(raw_logits.grad).all())
+        self.assertGreater(float(raw_logits.grad.abs().sum()), 0.1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -258,6 +258,8 @@ def train_stage1(config_path: str, data_dir: Optional[str] = None, resume_from: 
         lambda_q=model_cfg["loss"]["lambda_q"],
         lambda_a=model_cfg["loss"]["lambda_a"],
         lambda_p=model_cfg["loss"]["lambda_p"],
+        lambda_p_raw_kl=model_cfg["loss"].get("lambda_p_raw_kl", 0.0),
+        power_temperature=float(model_cfg["projection_head"]["tau_power"]),
         lambda_sep=model_cfg["loss"]["lambda_sep"],
     )
 
@@ -353,6 +355,8 @@ def train_stage1(config_path: str, data_dir: Optional[str] = None, resume_from: 
                     "delta_a": outputs["delta_a"],
                     "delta_p": outputs["delta_p"],
                 }
+                if "delta_p_raw" in outputs:
+                    delta_hat["delta_p_raw"] = outputs["delta_p_raw"]
 
                 total_loss, metrics = loss_fn.compute_phase1_total(
                     delta_hat=delta_hat,
@@ -474,6 +478,8 @@ def train_stage1(config_path: str, data_dir: Optional[str] = None, resume_from: 
                     "delta_a": outputs["delta_a"],
                     "delta_p": outputs["delta_p"],
                 }
+                if "delta_p_raw" in outputs:
+                    delta_hat["delta_p_raw"] = outputs["delta_p_raw"]
 
                 # 计算损失
                 q_hat = None

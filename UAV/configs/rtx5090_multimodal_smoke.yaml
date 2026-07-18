@@ -82,6 +82,7 @@ model:
     lambda_q: 1.0
     lambda_a: 0.5
     lambda_p: 0.3
+    lambda_p_raw_kl: 0.0
     lambda_sep: 0.1
 
 simulation:

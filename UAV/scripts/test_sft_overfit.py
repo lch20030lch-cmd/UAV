@@ -275,6 +275,8 @@ def run_overfit_test(config_path: str, data_path: str, n_samples: int,
         lambda_q=model_cfg["loss"]["lambda_q"],
         lambda_a=model_cfg["loss"]["lambda_a"],
         lambda_p=model_cfg["loss"]["lambda_p"],
+        lambda_p_raw_kl=model_cfg["loss"].get("lambda_p_raw_kl", 0.0),
+        power_temperature=float(model_cfg["projection_head"]["tau_power"]),
         lambda_sep=model_cfg["loss"]["lambda_sep"],
     )
 
@@ -338,6 +340,8 @@ def run_overfit_test(config_path: str, data_path: str, n_samples: int,
             "delta_a": outputs["delta_a"],
             "delta_p": outputs["delta_p"],
         }
+        if "delta_p_raw" in outputs:
+            delta_hat["delta_p_raw"] = outputs["delta_p_raw"]
 
         q_hat = None
         if batch["q_current"].numel() > 0:

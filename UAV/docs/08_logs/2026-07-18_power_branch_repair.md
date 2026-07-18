@@ -1,6 +1,6 @@
 ---
 type: log
-status: p_only_training_complete_validation_pending
+status: p_only_mse_failed_raw_kl_fix_pending
 stage: multimodal_power_branch_repair
 last_updated: 2026-07-18
 ---
@@ -334,3 +334,73 @@ geom-v3 Stage A2 split association
 
 训练完成本身不等于 P0 通过。下一步必须分别诊断 train500 与独立 val100，
 并与本日志中的 Stage A2 val100 初始化基线逐项比较。
+
+## 2026-07-18 第一次 P-only train500 诊断：失败
+
+第一次 P-only checkpoint 在 train500 上的关键结果：
+
+```text
+delta_p_per_dim_std_mean: 1.3321270842e-07
+delta_p_raw_per_dim_std_mean: 0.2548862994
+delta_p_target_per_dim_std_mean: 0.0716962442
+delta_p_mse: 0.0663626939
+delta_p_active_comm_mse: 0.0583080761
+delta_p_inactive_comm_mse: 0.0499998517
+delta_p_sensing_mse: 0.3520784378
+delta_p_inactive_power_leakage_mean: 0.0499999262
+delta_p_entropy_mean: 1.9797970356e-05
+warnings:
+  - delta_p_low_cross_sample_variance
+  - delta_p_inactive_power_leakage
+```
+
+判定：
+
+```text
+FAIL: 投影后功率方差约为 1e-7，已经跨样本塌缩；
+FAIL: 熵约为 2e-5，softmax 已经饱和为错误的近 one-hot 分配；
+FAIL: active、inactive、sensing 三组误差均未改善；
+FAIL: inactive leakage 仍约为 0.05。
+```
+
+`delta_p_raw` 仍有方差而投影后的 `delta_p` 几乎恒定，说明本轮主要问题不是
+control states 完全无信息，而是只用投影后 MSE 时，错误饱和的 softmax 梯度接近
+零。此 checkpoint 不进入独立 val100 验收，也不能作为后续训练的初始化。
+
+## P0.1：raw power soft-target KL 修复
+
+在 `PowerProjection` 之前新增 raw logits 辅助损失：
+
+```text
+target_prob = normalize(clamp(delta_p_target, min=0))
+log_pred = log_softmax(delta_p_raw / tau_power)
+loss_p_raw_kl = KL(target_prob || log_pred)
+```
+
+总功率监督更新为：
+
+```text
+lambda_p * grouped_projected_mse
+  + lambda_p_raw_kl * raw_soft_target_kl
+```
+
+这样即使 softmax 已经错误饱和，raw KL 仍能直接对 logits 提供非零纠正梯度。
+默认配置把 `lambda_p_raw_kl` 设为 `0.0`，因此旧实验和其他训练入口不会被静默
+改变；P0.1 预检会显式设置该权重。
+
+训练日志同时新增：
+
+```text
+loss_p_raw_kl
+delta_p_entropy
+delta_p_inactive_leakage
+```
+
+新增回归测试检查错误饱和 logits 上的 raw KL 仍为有限值且反向梯度非零。
+
+新的执行顺序：
+
+1. 服务器运行 6 项功率分支单元测试；
+2. 从干净的 Stage A2 checkpoint 重新开始 50-step P-only 预检；
+3. 预检确认熵未快速降到 0、raw KL 能下降后，再从 Stage A2 干净初始化运行完整 500 step；
+4. 完整训练通过 train500 与独立 val100 验收后，才进入 association 的 P1 阶段。

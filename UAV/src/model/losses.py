@@ -42,6 +42,8 @@ class UAVISACLosses:
         lambda_assoc_raw_ce: float = 0.0,
         lambda_q_dir: float = 0.0,
         lambda_q_cue_ce: float = 0.0,
+        lambda_p_raw_kl: float = 0.0,
+        power_temperature: float = 0.5,
         dpo_beta: float = 0.1,
         sft_anchor_mu: float = 0.05,
     ):
@@ -54,6 +56,10 @@ class UAVISACLosses:
         self.lambda_assoc_raw_ce = lambda_assoc_raw_ce
         self.lambda_q_dir = lambda_q_dir
         self.lambda_q_cue_ce = lambda_q_cue_ce
+        self.lambda_p_raw_kl = lambda_p_raw_kl
+        if power_temperature <= 0:
+            raise ValueError(f"power_temperature must be positive, got {power_temperature}")
+        self.power_temperature = power_temperature
         self.dpo_beta = dpo_beta
         self.sft_anchor_mu = sft_anchor_mu
 
@@ -200,6 +206,36 @@ class UAVISACLosses:
             "loss_p_sensing": loss_sensing,
         }
 
+    def compute_power_raw_kl_loss(
+        self,
+        delta_p_raw: torch.Tensor,
+        delta_p_target: torch.Tensor,
+    ) -> torch.Tensor:
+        """在 PowerProjection 前用 soft-target KL 提供不饱和的功率梯度。
+
+        projected MSE 在 softmax 错误饱和为 one-hot 后梯度可能接近 0。
+        KL 对 raw logits 的梯度为 ``softmax(logits/tau) - target``，即使当前
+        分布已经错误饱和也能继续纠正。oracle 每架 UAV 的功率和约为 1，
+        这里仍显式归一化以兼容小的数值/舍入误差。
+        """
+        if delta_p_raw.shape != delta_p_target.shape:
+            raise ValueError(
+                "delta_p_raw/target shapes differ: "
+                f"{tuple(delta_p_raw.shape)} != {tuple(delta_p_target.shape)}"
+            )
+        target = delta_p_target.clamp_min(0.0)
+        target = target / target.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        log_prediction = F.log_softmax(
+            delta_p_raw / self.power_temperature,
+            dim=-1,
+        )
+        target_log = torch.where(
+            target > 0,
+            torch.log(target.clamp_min(1e-12)),
+            torch.zeros_like(target),
+        )
+        return torch.sum(target * (target_log - log_prediction), dim=-1).mean()
+
     def compute_control_loss(
         self,
         delta_hat: Dict[str, torch.Tensor],
@@ -279,6 +315,12 @@ class UAVISACLosses:
                 "loss_p_sensing": dp_hat.new_tensor(0.0),
             }
 
+        if "delta_p_raw" in delta_hat and self.lambda_p_raw_kl != 0:
+            dp_raw = delta_hat["delta_p_raw"].to(dtype=common_dtype)
+            loss_p_raw_kl = self.compute_power_raw_kl_loss(dp_raw, dp_tgt)
+        else:
+            loss_p_raw_kl = dp_hat.new_tensor(0.0)
+
         total = (
             self.lambda_q * loss_q
             + self.lambda_a * loss_a
@@ -287,6 +329,7 @@ class UAVISACLosses:
             + self.lambda_assoc_raw_ce * loss_a_raw_ce
             + self.lambda_q_dir * loss_q_dir
             + self.lambda_q_cue_ce * loss_q_cue_ce
+            + self.lambda_p_raw_kl * loss_p_raw_kl
         )
 
         if return_components:
@@ -298,6 +341,7 @@ class UAVISACLosses:
                 "loss_q_dir": loss_q_dir,
                 "loss_q_cue_ce": loss_q_cue_ce,
                 "loss_p": loss_p,
+                "loss_p_raw_kl": loss_p_raw_kl,
                 **power_parts,
             }
         return total
@@ -439,6 +483,7 @@ class UAVISACLosses:
             "loss_q_dir": ctl_parts["loss_q_dir"].item(),
             "loss_q_cue_ce": ctl_parts["loss_q_cue_ce"].item(),
             "loss_p": ctl_parts["loss_p"].item(),
+            "loss_p_raw_kl": ctl_parts["loss_p_raw_kl"].item(),
             "loss_p_active": ctl_parts["loss_p_active"].item(),
             "loss_p_inactive": ctl_parts["loss_p_inactive"].item(),
             "loss_p_sensing": ctl_parts["loss_p_sensing"].item(),
@@ -446,6 +491,7 @@ class UAVISACLosses:
             "lambda_assoc_raw_ce": self.lambda_assoc_raw_ce,
             "lambda_q_dir": self.lambda_q_dir,
             "lambda_q_cue_ce": self.lambda_q_cue_ce,
+            "lambda_p_raw_kl": self.lambda_p_raw_kl,
         }
         return total, metrics
 

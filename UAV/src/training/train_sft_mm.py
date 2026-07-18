@@ -137,6 +137,7 @@ def train_mm_sft_smoke(
     lambda_assoc_raw_ce: float = None,
     lambda_q_dir: float = None,
     lambda_q_cue_ce: float = None,
+    lambda_p_raw_kl: float = None,
     projection_lr: float = None,
     lora_lr_override: float = None,
     init_checkpoint: str = None,
@@ -291,6 +292,16 @@ def train_mm_sft_smoke(
         if lambda_q_cue_ce is not None
         else float(train_cfg.get("phase1", {}).get("lambda_q_cue_ce", 0.0))
     )
+    lambda_p_raw_kl_value = (
+        float(lambda_p_raw_kl)
+        if lambda_p_raw_kl is not None
+        else float(
+            train_cfg.get("phase1", {}).get(
+                "lambda_p_raw_kl",
+                model_cfg["loss"].get("lambda_p_raw_kl", 0.0),
+            )
+        )
+    )
     loss_fn = UAVISACLosses(
         lambda_ctl=model_cfg["loss"]["lambda_ctl"],
         lambda_q=lambda_q_value,
@@ -301,6 +312,8 @@ def train_mm_sft_smoke(
         lambda_assoc_raw_ce=assoc_raw_ce_weight,
         lambda_q_dir=lambda_q_dir_value,
         lambda_q_cue_ce=lambda_q_cue_ce_value,
+        lambda_p_raw_kl=lambda_p_raw_kl_value,
+        power_temperature=float(model_cfg["projection_head"]["tau_power"]),
     )
     # 默认只训练投影头；传入 --train_lora 时，PEFT 会额外打开 LoRA 参数。
     proj_params = [p for p in model.projection_head.parameters() if p.requires_grad]
@@ -337,6 +350,7 @@ def train_mm_sft_smoke(
     print(f"  lambda_q/a/p:                 {lambda_q_value} / {lambda_a_value} / {lambda_p_value}")
     print(f"  q direction weight:           {lambda_q_dir_value}")
     print(f"  q cue CE weight:              {lambda_q_cue_ce_value}")
+    print(f"  power raw KL weight:          {lambda_p_raw_kl_value}")
     print(f"  association CE weight:        {assoc_ce_weight}")
     print(f"  association raw CE weight:    {assoc_raw_ce_weight}")
 
@@ -376,6 +390,8 @@ def train_mm_sft_smoke(
                 delta_hat["delta_a_raw"] = outputs["delta_a_raw"]
             if "delta_q_raw" in outputs:
                 delta_hat["delta_q_raw"] = outputs["delta_q_raw"]
+            if "delta_p_raw" in outputs:
+                delta_hat["delta_p_raw"] = outputs["delta_p_raw"]
             if "q_cue_logits" in outputs:
                 delta_hat["q_cue_logits"] = outputs["q_cue_logits"]
             delta_target = {
@@ -392,6 +408,18 @@ def train_mm_sft_smoke(
                 delta_target=delta_target,
                 phase1_lambda_ctl=train_cfg.get("phase1", {}).get("lambda_ctl", 1.0),
             )
+
+            with torch.no_grad():
+                p_prob = outputs["delta_p"].float().clamp_min(1e-12)
+                p_prob = p_prob / p_prob.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                metrics["delta_p_entropy"] = float(
+                    (-(p_prob * torch.log(p_prob)).sum(dim=-1)).mean().item()
+                )
+                inactive_mask = batch["delta_a_target"] <= 0.5
+                inactive_power = outputs["delta_p"][..., :-1].float()[inactive_mask]
+                metrics["delta_p_inactive_leakage"] = float(
+                    inactive_power.mean().item() if inactive_power.numel() else 0.0
+                )
 
             optimizer.zero_grad(set_to_none=True)
             total_loss.backward()
@@ -412,9 +440,12 @@ def train_mm_sft_smoke(
                 f"loss_q_dir={metrics['loss_q_dir']:.6f} "
                 f"loss_q_cue_ce={metrics['loss_q_cue_ce']:.6f} "
                 f"loss_p={metrics['loss_p']:.6f} "
+                f"loss_p_raw_kl={metrics['loss_p_raw_kl']:.6f} "
                 f"loss_p_active={metrics['loss_p_active']:.6f} "
                 f"loss_p_inactive={metrics['loss_p_inactive']:.6f} "
                 f"loss_p_sensing={metrics['loss_p_sensing']:.6f} "
+                f"delta_p_entropy={metrics['delta_p_entropy']:.6f} "
+                f"delta_p_inactive_leakage={metrics['delta_p_inactive_leakage']:.6f} "
                 f"grad_norm_proj={grad_norm:.6f} "
                 f"grad_norm_lora={grad_norm_lora:.6f}"
             )
@@ -455,6 +486,7 @@ def train_mm_sft_smoke(
                         "lambda_p": lambda_p_value,
                         "lambda_q_dir": lambda_q_dir_value,
                         "lambda_q_cue_ce": lambda_q_cue_ce_value,
+                        "lambda_p_raw_kl": lambda_p_raw_kl_value,
                         "lambda_assoc_ce": assoc_ce_weight,
                         "lambda_assoc_raw_ce": assoc_raw_ce_weight,
                         "loaded_init": loaded_init,
@@ -495,6 +527,7 @@ def train_mm_sft_smoke(
             "lambda_p": lambda_p_value,
             "lambda_q_dir": lambda_q_dir_value,
             "lambda_q_cue_ce": lambda_q_cue_ce_value,
+            "lambda_p_raw_kl": lambda_p_raw_kl_value,
             "lambda_assoc_ce": assoc_ce_weight,
             "lambda_assoc_raw_ce": assoc_raw_ce_weight,
             "loaded_init": loaded_init,
@@ -529,6 +562,8 @@ if __name__ == "__main__":
                         help="可选 delta_q raw 方向辅助损失权重，适用于 q target 贴移动边界的 smoke")
     parser.add_argument("--lambda_q_cue_ce", type=float, default=None,
                         help="可选：q 几何候选方向分类损失权重，用于 cue_xy 几何蒸馏")
+    parser.add_argument("--lambda_p_raw_kl", type=float, default=None,
+                        help="可选：PowerProjection 前 raw logits 的 soft-target KL 权重")
     parser.add_argument("--projection_lr", type=float, default=None,
                         help="可选 projection head 学习率覆盖值")
     parser.add_argument("--lora_lr", type=float, default=None,
@@ -566,6 +601,7 @@ if __name__ == "__main__":
         lambda_assoc_raw_ce=args.lambda_assoc_raw_ce,
         lambda_q_dir=args.lambda_q_dir,
         lambda_q_cue_ce=args.lambda_q_cue_ce,
+        lambda_p_raw_kl=args.lambda_p_raw_kl,
         projection_lr=args.projection_lr,
         lora_lr_override=args.lora_lr,
         init_checkpoint=args.init_checkpoint,
