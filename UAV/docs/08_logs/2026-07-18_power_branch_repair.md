@@ -1,6 +1,6 @@
 ---
 type: log
-status: p_only_mse_failed_raw_kl_fix_pending
+status: p_only_raw_kl_preflight_pass_full_training_pending
 stage: multimodal_power_branch_repair
 last_updated: 2026-07-18
 ---
@@ -404,3 +404,53 @@ delta_p_inactive_leakage
 2. 从干净的 Stage A2 checkpoint 重新开始 50-step P-only 预检；
 3. 预检确认熵未快速降到 0、raw KL 能下降后，再从 Stage A2 干净初始化运行完整 500 step；
 4. 完整训练通过 train500 与独立 val100 验收后，才进入 association 的 P1 阶段。
+
+## 2026-07-18 P0.1 raw-KL 50-step 预检结果
+
+从干净 Stage A2 checkpoint 初始化，只训练 `readout_p / p_mlp`，使用：
+
+```text
+max_steps=50
+projection_lr=0.0003
+lambda_p=0.1
+lambda_p_raw_kl=1.0
+```
+
+在 train500 的前 100 条样本上诊断：
+
+```text
+delta_p_per_dim_std_mean: 0.0180089530
+delta_p_raw_per_dim_std_mean: 0.1297873259
+delta_p_target_per_dim_std_mean: 0.0678294450
+delta_p_mse: 0.0102780098
+delta_p_active_comm_mse: 0.0137879374
+delta_p_inactive_comm_mse: 0.0008396233
+delta_p_sensing_mse: 0.1343041658
+delta_p_inactive_power_leakage_mean: 0.0197597090
+delta_p_entropy_mean: 1.6685179450
+delta_p_total_per_uav_pred_mean: 1.0
+delta_p_total_per_uav_mae: 0.0000330287
+warnings: ['delta_p_inactive_power_leakage']
+```
+
+与第一次失败的 P-only 训练相比：
+
+```text
+projected variance: 1.33e-7 -> 0.01801
+entropy:            1.98e-5 -> 1.66852
+inactive MSE:       0.05000 -> 0.00084
+sensing MSE:        0.35208 -> 0.13430
+inactive leakage:   0.05000 -> 0.01976
+```
+
+判定：
+
+```text
+PASS: raw KL 阻止了错误 one-hot 饱和和跨样本常数塌缩；
+PASS: active、inactive、sensing 三组监督均产生了有效改善；
+PASS: association 仍保持 unique=3.9、fixed_user_count=0，P-only 隔离有效；
+PENDING: inactive leakage 仍高于最终 0.01 门槛，需在完整 500-step 后复验。
+```
+
+因此允许从同一个干净 Stage A2 初始化运行完整 500-step P-only 实验。为保持实验
+可复现性，不从 50-step 预检 checkpoint 续训，也不继承第一次失败的 checkpoint。
