@@ -275,3 +275,60 @@ if "q_cue_logits" in outputs:
 ```text
 /root/autodl-tmp/outputs/mm_smoke_100_geom_v3_stage_b6_q_cue_only_fix_1000step
 ```
+
+## 2026-07-18 追加：修复后 B6 结果与 cached-state probe
+
+修复后 B6 已完成 1000 step，q cue loss 和 projection gradient 均非零，说明训练链路已打通。
+
+关键诊断：
+
+```text
+q_cue_accuracy: 0.445
+q_cue_target_hist: {'weighted_center': 123, 'nearest_user': 99, 'nearest_target': 178}
+q_cue_pred_hist: {'weighted_center': 0, 'nearest_user': 0, 'nearest_target': 400}
+q_cue_chosen_geometry_cosine_mean: 0.6064
+q_cue_best_geometry_cosine_mean: 0.8722
+pred_delta_q_vs_target_q_xy_cosine_mean: 0.6737
+pred_delta_q_raw_vs_target_q_xy_cosine_mean: 0.0391
+```
+
+额外对 dynamic / fixed / shuffled soft weights 的比较结果近似相同，因此当前 B6 只学到了全局固定 cue 混合，没有证明 control states 支持样本级 cue 选择。
+
+当前结果应定位为：
+
+```text
+fixed-mixture geometry baseline
+```
+
+而不是动态 MLLM cue selector。
+
+新增轻量诊断脚本：
+
+```text
+scripts/probe_q_cue_control_states.py
+```
+
+它直接读取 delta diagnostic NPZ 中缓存的 `control_states`，复用线上 `ControlReadout` 结构，在 10 条环境样本上从头训练 q-cue probe；不重新加载 Gemma，不重新编码图像。
+
+服务器命令：
+
+```bash
+python scripts/probe_q_cue_control_states.py \
+  --prediction_npz /root/autodl-tmp/outputs/mm_smoke_100_geom_v3_stage_b6_q_cue_only_fix_1000step/delta_diag_mm100_geom_v3_stage_b6_q_cue_only_fix_1000step.npz \
+  --train_samples 10 \
+  --steps 500 \
+  --learning_rate 0.001 \
+  --weight_decay 0 \
+  --seed 42 \
+  --output /root/autodl-tmp/outputs/mm_smoke_100_geom_v3_stage_b6_q_cue_only_fix_1000step/q_cue_control_state_probe_10.json
+```
+
+判读：
+
+```text
+TRAIN accuracy >= 0.90:
+  frozen control states 可读，下一步优先改为 continuous mixture-direction loss。
+
+TRAIN accuracy < 0.90:
+  当前 readout 无法从 frozen control states 读出 cue 选择，下一步优先测试 LoRA/backbone adaptation。
+```
