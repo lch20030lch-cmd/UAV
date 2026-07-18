@@ -392,3 +392,28 @@ VALIDATION dynamic_mixture_cosine > fixed_mixture_cosine
 ```
 
 若仍失败，说明 100 个环境不足以支持动态 cue selector，下一步应扩大数据并保留 fixed mixture 作为强基线，而不是继续增加模型容量。
+
+## 2026-07-18 追加：500/100 独立环境验证
+
+训练集已按 `seed=42` 扩展到 500 个环境：
+
+```text
+SFT: 500 -> /root/autodl-tmp/data/mm_geom_v3_train500_seed42/sft_dataset.jsonl
+DPO: 500 -> /root/autodl-tmp/data/mm_geom_v3_train500_seed42/dpo_dataset.jsonl
+Time: 5956.7s
+```
+
+下一步不在这 500 条内部留出验证集，而是另外生成 `seed=2026` 的 100 条环境，分别提取 train/validation control-state NPZ。probe 新增：
+
+```text
+--validation_npz <independent-validation.npz>
+--train_samples 0  # 使用 prediction_npz 中的全部训练环境
+```
+
+这样训练集与验证集在环境生成层面完全独立。主验收指标保持不变：
+
+```text
+validation dynamic_mixture_cosine > validation fixed_mixture_cosine
+```
+
+若扩大到 500 个训练环境后仍不能在独立 seed 验证集超过 fixed mixture，应把 fixed mixture 保留为最终几何分支，并把 dynamic selector 作为负结果或消融实验，而不是继续扩大 selector 容量。

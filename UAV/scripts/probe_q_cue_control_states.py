@@ -3,7 +3,8 @@
 
 该脚本读取 ``analyze_mm_delta_outputs.py --save_raw`` 生成的 NPZ，
 不加载 Gemma，也不重新编码图像。它复用线上 q-cue 头的 ControlReadout
-结构，在少量环境样本上做过拟合，并在未参与训练的样本上评估：
+结构，在训练环境上拟合，并在未参与训练的样本上评估；既支持同一 NPZ
+内部切分，也支持用 ``--validation_npz`` 指定独立 seed 的验证集：
 
 1. frozen control states 能否被当前 q-cue 头读出；
 2. dynamic cue mixture 是否优于 fixed / shuffled mixture；
@@ -239,13 +240,66 @@ def _print_split(result: Dict):
     print(f"  shuffled mixture cosine:  {result['shuffled_mixture_cosine']:.4f}")
 
 
+def _format_indices(indices: List[int], preview: int = 12) -> str:
+    if len(indices) <= preview:
+        return str(indices)
+    return f"{indices[:preview]} ... ({len(indices)} total)"
+
+
+def _load_probe_npz(path: Path, device: torch.device) -> Dict[str, torch.Tensor]:
+    if not path.exists():
+        raise FileNotFoundError(f"probe NPZ not found: {path}")
+    data = np.load(path)
+    required = ("control_states", "q_geometry_cues", "delta_q_target")
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise KeyError(f"prediction NPZ {path} is missing required arrays: {missing}")
+
+    states = torch.from_numpy(np.asarray(data["control_states"], dtype=np.float32)).to(device)
+    cues = torch.from_numpy(np.asarray(data["q_geometry_cues"], dtype=np.float32)).to(device)
+    delta_q_target = torch.from_numpy(
+        np.asarray(data["delta_q_target"], dtype=np.float32)
+    ).to(device)
+    cue_mask = None
+    if "q_geometry_mask" in data:
+        cue_mask = torch.from_numpy(
+            np.asarray(data["q_geometry_mask"], dtype=np.bool_)
+        ).to(device)
+
+    if states.ndim != 3:
+        raise ValueError(f"control_states must have shape (N, C, H), got {tuple(states.shape)}")
+    if cues.ndim != 4 or cues.shape[2:] != (len(CUE_NAMES), 2):
+        raise ValueError(f"q_geometry_cues must have shape (N, M, 3, 2), got {tuple(cues.shape)}")
+    if delta_q_target.shape[:2] != cues.shape[:2] or delta_q_target.shape[-1] != 3:
+        raise ValueError(
+            "delta_q_target must have shape (N, M, 3) aligned with q_geometry_cues, "
+            f"got {tuple(delta_q_target.shape)}"
+        )
+    if states.shape[0] != cues.shape[0]:
+        raise ValueError(
+            f"control_states and q_geometry_cues sample counts differ: "
+            f"{states.shape[0]} != {cues.shape[0]}"
+        )
+
+    targets, valid = _build_targets(cues, delta_q_target, cue_mask)
+    return {
+        "states": states,
+        "cues": cues,
+        "delta_q_target": delta_q_target,
+        "targets": targets,
+        "valid": valid,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Probe whether cached multimodal control states contain q-cue selection information."
     )
     parser.add_argument("--prediction_npz", type=str, required=True)
+    parser.add_argument("--validation_npz", type=str, default=None,
+                        help="可选独立 seed 验证 NPZ；提供后不会从训练 NPZ 内部切验证集")
     parser.add_argument("--train_samples", type=int, default=10,
-                        help="用于小样本过拟合的环境样本数，按环境切分以避免泄漏")
+                        help="训练环境数；提供 --validation_npz 时传 0 表示使用全部训练 NPZ")
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.0)
@@ -270,37 +324,49 @@ def main():
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     npz_path = Path(args.prediction_npz)
-    if not npz_path.exists():
-        raise FileNotFoundError(f"prediction NPZ not found: {npz_path}")
-    data = np.load(npz_path)
-    required = ("control_states", "q_geometry_cues", "delta_q_target")
-    missing = [key for key in required if key not in data]
-    if missing:
-        raise KeyError(f"prediction NPZ is missing required arrays: {missing}")
+    train_data = _load_probe_npz(npz_path, device)
+    states = train_data["states"]
+    cues = train_data["cues"]
+    delta_q_target = train_data["delta_q_target"]
+    targets = train_data["targets"]
+    valid = train_data["valid"]
 
-    states = torch.from_numpy(np.asarray(data["control_states"], dtype=np.float32)).to(device)
-    cues = torch.from_numpy(np.asarray(data["q_geometry_cues"], dtype=np.float32)).to(device)
-    delta_q_target = torch.from_numpy(np.asarray(data["delta_q_target"], dtype=np.float32)).to(device)
-    cue_mask = None
-    if "q_geometry_mask" in data:
-        cue_mask = torch.from_numpy(np.asarray(data["q_geometry_mask"], dtype=np.bool_)).to(device)
-
-    if states.ndim != 3:
-        raise ValueError(f"control_states must have shape (N, C, H), got {tuple(states.shape)}")
-    if cues.ndim != 4 or cues.shape[2:] != (len(CUE_NAMES), 2):
-        raise ValueError(f"q_geometry_cues must have shape (N, M, 3, 2), got {tuple(cues.shape)}")
-    if delta_q_target.shape[:2] != cues.shape[:2] or delta_q_target.shape[-1] != 3:
-        raise ValueError(
-            "delta_q_target must have shape (N, M, 3) aligned with q_geometry_cues, "
-            f"got {tuple(delta_q_target.shape)}"
+    validation_npz_path = Path(args.validation_npz) if args.validation_npz else None
+    if validation_npz_path is not None:
+        validation_data = _load_probe_npz(validation_npz_path, device)
+        if args.train_samples == 0:
+            train_indices = list(range(states.shape[0]))
+        else:
+            train_indices, _ = _select_probe_indices(
+                targets, valid, args.train_samples, args.seed
+            )
+        val_indices = list(range(validation_data["states"].shape[0]))
+    else:
+        if args.train_samples == 0:
+            raise ValueError("--train_samples 0 requires --validation_npz")
+        train_indices, val_indices = _select_probe_indices(
+            targets, valid, args.train_samples, args.seed
         )
-
-    targets, valid = _build_targets(cues, delta_q_target, cue_mask)
-    train_indices, val_indices = _select_probe_indices(
-        targets, valid, args.train_samples, args.seed
-    )
+        validation_data = {
+            "states": states,
+            "cues": cues,
+            "delta_q_target": delta_q_target,
+            "targets": targets,
+            "valid": valid,
+        }
     train_index = torch.tensor(train_indices, device=device, dtype=torch.long)
     val_index = torch.tensor(val_indices, device=device, dtype=torch.long)
+
+    if validation_data["states"].shape[1:] != states.shape[1:]:
+        raise ValueError(
+            "Training and validation control state shapes differ: "
+            f"{tuple(states.shape[1:])} != {tuple(validation_data['states'].shape[1:])}"
+        )
+    if validation_data["cues"].shape[1:] != cues.shape[1:]:
+        raise ValueError(
+            "Training and validation q geometry cue shapes differ: "
+            f"{tuple(cues.shape[1:])} != {tuple(validation_data['cues'].shape[1:])}"
+        )
 
     num_control_tokens = states.shape[1]
     hidden_dim = states.shape[2]
@@ -336,11 +402,13 @@ def main():
     print("=" * 72)
     print("Q-cue cached-control-state probe")
     print("=" * 72)
-    print(f"  NPZ:                    {npz_path}")
+    print(f"  training NPZ:           {npz_path}")
+    print(f"  validation NPZ:         {validation_npz_path or 'internal split'}")
     print(f"  device:                 {device}")
-    print(f"  control states:         {tuple(states.shape)}")
+    print(f"  training states:        {tuple(states.shape)}")
+    print(f"  validation states:      {tuple(validation_data['states'].shape)}")
     print(f"  q geometry cues:        {tuple(cues.shape)}")
-    print(f"  train sample indices:   {train_indices}")
+    print(f"  train sample indices:   {_format_indices(train_indices)}")
     print(f"  train target hist:      {_hist(train_targets, train_valid)}")
     print(f"  validation samples:     {len(val_indices)}")
     print(f"  readout type:           {readout_type}")
@@ -400,11 +468,11 @@ def main():
     val_result = _evaluate_split(
         "VALIDATION / UNSEEN",
         readout,
-        states[val_index],
-        cues[val_index],
-        delta_q_target[val_index],
-        targets[val_index],
-        valid[val_index],
+        validation_data["states"][val_index],
+        validation_data["cues"][val_index],
+        validation_data["delta_q_target"][val_index],
+        validation_data["targets"][val_index],
+        validation_data["valid"][val_index],
         fixed_weights,
         args.seed + 2,
     )
@@ -449,6 +517,7 @@ def main():
 
     result = {
         "prediction_npz": str(npz_path),
+        "validation_npz": str(validation_npz_path) if validation_npz_path else None,
         "device": str(device),
         "seed": args.seed,
         "steps": args.steps,
