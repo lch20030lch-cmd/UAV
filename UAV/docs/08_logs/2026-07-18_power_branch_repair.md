@@ -1,6 +1,6 @@
 ---
 type: log
-status: p_init_baseline_recorded_training_pending
+status: p_only_training_complete_validation_pending
 stage: multimodal_power_branch_repair
 last_updated: 2026-07-18
 ---
@@ -312,3 +312,25 @@ lambda_q/a/p:                 0.0 / 0.0 / 1.0
 ```
 
 这样 Stage A2 的 q、association 和实验性 q-cue 参数均不会被 P-only 更新。
+
+## 2026-07-18 P-only train500 完成
+
+服务器完成 500-step P-only 训练：
+
+```text
+OK: multimodal SFT smoke complete
+final_checkpoint:
+/root/autodl-tmp/outputs/mm_geom_v3_stage_p0_power_only_train500_500step/mm_sft_smoke_final
+```
+
+该 checkpoint 的继承关系为：
+
+```text
+geom-v3 Stage A2 split association
+  -> freeze_all_except_p
+  -> train500 / 500 steps / projection_lr=0.001
+  -> P-only checkpoint
+```
+
+训练完成本身不等于 P0 通过。下一步必须分别诊断 train500 与独立 val100，
+并与本日志中的 Stage A2 val100 初始化基线逐项比较。
