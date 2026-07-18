@@ -285,3 +285,30 @@ delta_a_argmax_fixed_user_count = 0
 warnings 不包含 delta_p_low_cross_sample_variance
 warnings 不包含 delta_p_inactive_power_leakage
 ```
+
+## P-only 参数隔离
+
+为避免 `--freeze_assoc_branch + lambda_q=0` 仍把无梯度 q 参数放进优化器，
+训练脚本新增：
+
+```text
+--freeze_all_except_p
+```
+
+它只保留以下参数可训练：
+
+```text
+readout_p
+p_mlp
+```
+
+训练启动时必须看到：
+
+```text
+isolated projection branch:  power
+isolated trainable tensors:   > 0
+trainable LoRA tensors:       0
+lambda_q/a/p:                 0.0 / 0.0 / 1.0
+```
+
+这样 Stage A2 的 q、association 和实验性 q-cue 参数均不会被 P-only 更新。
