@@ -1,6 +1,6 @@
 ---
 type: log
-status: code_and_target_gates_pass_p_training_pending
+status: p_init_baseline_recorded_training_pending
 stage: multimodal_power_branch_repair
 last_updated: 2026-07-18
 ---
@@ -234,3 +234,54 @@ PASS: P0 代码 gate 与 target-data gate 均通过。
 
 下一阶段先测旧 Stage A2 checkpoint 在新投影公式下的 val100 初始化基线，
 然后进行 P-only 训练，并用同一独立验证集检查是否超过初始化基线。
+
+## 2026-07-18 Stage A2 独立验证初始化基线
+
+使用旧 geom-v3 Stage A2 split-association checkpoint，在修复后的默认
+PowerProjection 下对独立 val100 推理：
+
+```text
+delta_p_per_dim_std_mean: 0.0219130013
+delta_p_raw_per_dim_std_mean: 0.1918728501
+delta_p_target_per_dim_std_mean: 0.0673355162
+delta_p_mse: 0.0299952198
+delta_p_active_comm_mse: 0.0198893212
+delta_p_inactive_comm_mse: 0.0131981177
+delta_p_sensing_mse: 0.3324812353
+delta_p_inactive_power_leakage_mean: 0.0491444282
+delta_p_total_per_uav_pred_mean: 1.0
+delta_p_total_per_uav_target_mean: 0.9999984503
+delta_p_total_per_uav_mae: 0.0000355333
+warnings: ['delta_p_inactive_power_leakage']
+```
+
+冻结的 association 初始化状态：
+
+```text
+delta_a_argmax_unique_per_user_mean: 3.45
+delta_a_argmax_fixed_user_count: 0
+```
+
+判定：
+
+```text
+PASS: 移除无条件 floor 后，未训练 p 分支已不再是近零方差常数输出；
+PASS: simplex 严格保持总功率约 1；
+FAIL: inactive leakage 0.04914 > 0.01；
+FAIL: sensing MSE 0.33248 很高；
+P-only 训练有必要，且已有独立验证基线可比较。
+```
+
+P-only 训练后的独立 val100 验收标准：
+
+```text
+delta_p_active_comm_mse < 0.0198893212
+delta_p_inactive_comm_mse < 0.0131981177
+delta_p_sensing_mse < 0.3324812353
+delta_p_inactive_power_leakage_mean < 0.01
+delta_p_per_dim_std_mean > 1e-4
+delta_a_argmax_unique_per_user_mean ≈ 3.45
+delta_a_argmax_fixed_user_count = 0
+warnings 不包含 delta_p_low_cross_sample_variance
+warnings 不包含 delta_p_inactive_power_leakage
+```
