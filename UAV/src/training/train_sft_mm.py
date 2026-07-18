@@ -363,6 +363,8 @@ def train_mm_sft_smoke(
                 delta_hat["delta_a_raw"] = outputs["delta_a_raw"]
             if "delta_q_raw" in outputs:
                 delta_hat["delta_q_raw"] = outputs["delta_q_raw"]
+            if "q_cue_logits" in outputs:
+                delta_hat["q_cue_logits"] = outputs["q_cue_logits"]
             delta_target = {
                 "delta_q": batch["delta_q_target"],
                 "delta_a": batch["delta_a_target"],

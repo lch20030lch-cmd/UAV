@@ -228,3 +228,50 @@ q_cue_chosen_geometry_cosine_mean
 delta_q_per_dim_std_mean
 delta_a_argmax_unique_per_user_mean
 ```
+
+## 2026-07-18 修复：B6 loss_q_cue_ce 未进入训练
+
+第一次 B6 跑完后日志显示：
+
+```text
+loss_ctl=0.000000
+loss_total=0.000000
+loss_q_cue_ce=0.000000
+grad_norm_proj=0.000000
+```
+
+metadata 已确认：
+
+```text
+q_geometry_mode = cue_xy
+freeze_all_except_q_cue = true
+lambda_q_cue_ce = 5.0
+q_cue_only_trainable_tensors > 0
+```
+
+因此不是命令参数未生效，而是训练脚本构造 `delta_hat` 时漏传了：
+
+```text
+outputs["q_cue_logits"]
+```
+
+导致 `UAVISACLosses.compute_control_loss()` 中的 q cue CE 分支没有触发，`loss_q_cue_ce` 被置为 0。
+
+修复文件：
+
+```text
+src/training/train_sft_mm.py
+```
+
+修复内容：
+
+```text
+if "q_cue_logits" in outputs:
+    delta_hat["q_cue_logits"] = outputs["q_cue_logits"]
+```
+
+第一次 B6 checkpoint 不应作为有效 q cue 训练结果使用。修复后建议重新跑一个新目录：
+
+```text
+/root/autodl-tmp/outputs/mm_smoke_100_geom_v3_stage_b6_q_cue_only_fix_1000step
+```
