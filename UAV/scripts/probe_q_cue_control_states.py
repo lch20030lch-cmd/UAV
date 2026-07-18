@@ -12,6 +12,7 @@
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -21,12 +22,48 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from src.model.projection_head import ControlReadout
 
 
 CUE_NAMES = ("weighted_center", "nearest_user", "nearest_target")
+
+
+class CompactCueReadout(nn.Module):
+    """保留 per-UAV attention query，但用小瓶颈替代 2560→1280 大读出。"""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_queries: int,
+        bottleneck_dim: int = 128,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        if bottleneck_dim <= 0:
+            raise ValueError(f"bottleneck_dim must be positive, got {bottleneck_dim}")
+        self.hidden_dim = hidden_dim
+        self.num_queries = num_queries
+        self.attn_queries = nn.Parameter(torch.empty(1, num_queries, hidden_dim))
+        nn.init.normal_(self.attn_queries, std=0.02)
+        self.readout = nn.Sequential(
+            nn.Linear(hidden_dim, bottleneck_dim),
+            nn.GELU(),
+            nn.LayerNorm(bottleneck_dim),
+            nn.Dropout(dropout),
+            nn.Linear(bottleneck_dim, len(CUE_NAMES)),
+        )
+
+    def forward(self, control_states: torch.Tensor) -> torch.Tensor:
+        batch_size = control_states.shape[0]
+        queries = self.attn_queries.expand(batch_size, -1, -1)
+        scores = torch.bmm(queries, control_states.transpose(1, 2)) / math.sqrt(self.hidden_dim)
+        weights = F.softmax(scores, dim=-1)
+        pooled = torch.bmm(weights, control_states)
+        logits = self.readout(pooled.reshape(-1, self.hidden_dim))
+        return logits.reshape(batch_size, self.num_queries * len(CUE_NAMES))
 
 
 def _unit(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -70,6 +107,34 @@ def _accuracy(logits: torch.Tensor, targets: torch.Tensor, valid: torch.Tensor) 
 def _majority_accuracy(targets: torch.Tensor, valid: torch.Tensor) -> float:
     counts = torch.bincount(targets[valid], minlength=len(CUE_NAMES))
     return float(counts.max().float().div(counts.sum().clamp_min(1)).item())
+
+
+def _compute_probe_loss(
+    logits: torch.Tensor,
+    cues: torch.Tensor,
+    delta_q_target: torch.Tensor,
+    targets: torch.Tensor,
+    valid: torch.Tensor,
+    loss_mode: str,
+    ce_weight: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """计算 hard CE、连续 mixture-direction loss 及实际优化目标。"""
+    loss_ce = F.cross_entropy(logits[valid], targets[valid])
+    cue_weights = F.softmax(logits, dim=-1)
+    pred_dir = _unit((cue_weights.unsqueeze(-1) * cues).sum(dim=2))
+    target_dir = _unit(delta_q_target[..., :2])
+    cosine = (pred_dir * target_dir).sum(dim=-1)
+    loss_direction = (1.0 - cosine[valid]).mean()
+
+    if loss_mode == "ce":
+        total = loss_ce
+    elif loss_mode == "direction":
+        total = loss_direction
+    elif loss_mode == "hybrid":
+        total = loss_direction + ce_weight * loss_ce
+    else:
+        raise ValueError(f"Unsupported loss mode: {loss_mode}")
+    return total, loss_ce, loss_direction
 
 
 def _select_probe_indices(
@@ -184,6 +249,15 @@ def main():
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--loss_mode", type=str, choices=["ce", "direction", "hybrid"],
+                        default="ce",
+                        help="ce 保持旧探针；direction 直接优化 cue 混合方向；hybrid 组合两者")
+    parser.add_argument("--ce_weight", type=float, default=0.1,
+                        help="hybrid 模式下 hard CE 的辅助权重")
+    parser.add_argument("--probe_hidden_dim", type=int, default=0,
+                        help="0 使用原始 2560→1280 ControlReadout；正数使用紧凑瓶颈，建议 64/128")
+    parser.add_argument("--dropout", type=float, default=0.1,
+                        help="紧凑 probe 的 dropout；原始 ControlReadout 不使用")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_steps", type=int, default=50)
     parser.add_argument("--device", type=str, default=None,
@@ -231,12 +305,22 @@ def main():
     num_control_tokens = states.shape[1]
     hidden_dim = states.shape[2]
     num_uavs = cues.shape[1]
-    readout = ControlReadout(
-        hidden_dim=hidden_dim,
-        num_control_tokens=num_control_tokens,
-        out_dim=num_uavs * len(CUE_NAMES),
-        num_queries=num_uavs,
-    ).to(device)
+    if args.probe_hidden_dim > 0:
+        readout = CompactCueReadout(
+            hidden_dim=hidden_dim,
+            num_queries=num_uavs,
+            bottleneck_dim=args.probe_hidden_dim,
+            dropout=args.dropout,
+        ).to(device)
+        readout_type = f"compact_{args.probe_hidden_dim}"
+    else:
+        readout = ControlReadout(
+            hidden_dim=hidden_dim,
+            num_control_tokens=num_control_tokens,
+            out_dim=num_uavs * len(CUE_NAMES),
+            num_queries=num_uavs,
+        ).to(device)
+        readout_type = "original_control_readout"
     optimizer = torch.optim.AdamW(
         readout.parameters(),
         lr=args.learning_rate,
@@ -244,6 +328,8 @@ def main():
     )
 
     train_states = states[train_index]
+    train_cues = cues[train_index]
+    train_delta_q_target = delta_q_target[train_index]
     train_targets = targets[train_index]
     train_valid = valid[train_index]
 
@@ -257,6 +343,8 @@ def main():
     print(f"  train sample indices:   {train_indices}")
     print(f"  train target hist:      {_hist(train_targets, train_valid)}")
     print(f"  validation samples:     {len(val_indices)}")
+    print(f"  readout type:           {readout_type}")
+    print(f"  loss mode:              {args.loss_mode}")
     print(f"  trainable parameters:   {sum(p.numel() for p in readout.parameters()):,}")
 
     final_loss = None
@@ -264,7 +352,15 @@ def main():
         logits = readout(train_states).reshape(
             train_states.shape[0], num_uavs, len(CUE_NAMES)
         )
-        final_loss = F.cross_entropy(logits[train_valid], train_targets[train_valid])
+        final_loss, loss_ce, loss_direction = _compute_probe_loss(
+            logits,
+            train_cues,
+            train_delta_q_target,
+            train_targets,
+            train_valid,
+            args.loss_mode,
+            args.ce_weight,
+        )
         optimizer.zero_grad(set_to_none=True)
         final_loss.backward()
         optimizer.step()
@@ -272,11 +368,17 @@ def main():
         if step == 1 or step % args.log_steps == 0 or step == args.steps:
             accuracy = _accuracy(logits.detach(), train_targets, train_valid)
             pred_hist = _hist(logits.detach().argmax(dim=-1), train_valid)
+            train_mix_cosine = 1.0 - float(loss_direction.detach().item())
             print(
                 f"step={step} loss={final_loss.item():.6f} "
-                f"train_accuracy={accuracy:.4f} pred_hist={pred_hist}"
+                f"loss_ce={loss_ce.item():.6f} "
+                f"loss_direction={loss_direction.item():.6f} "
+                f"train_accuracy={accuracy:.4f} "
+                f"train_mix_cosine={train_mix_cosine:.4f} "
+                f"pred_hist={pred_hist}"
             )
 
+    readout.eval()
     with torch.no_grad():
         train_logits = readout(train_states).reshape(
             train_states.shape[0], num_uavs, len(CUE_NAMES)
@@ -288,8 +390,8 @@ def main():
         "TRAIN / OVERFIT",
         readout,
         train_states,
-        cues[train_index],
-        delta_q_target[train_index],
+        train_cues,
+        train_delta_q_target,
         train_targets,
         train_valid,
         fixed_weights,
@@ -310,18 +412,38 @@ def main():
     _print_split(train_result)
     _print_split(val_result)
 
-    overfit_pass = bool(train_result["accuracy"] >= 0.90)
-    if overfit_pass:
+    train_mixture_gain = (
+        train_result["dynamic_mixture_cosine"] - train_result["fixed_mixture_cosine"]
+    )
+    validation_accuracy_gain = val_result["accuracy"] - val_result["majority_accuracy"]
+    validation_mixture_gain = (
+        val_result["dynamic_mixture_cosine"] - val_result["fixed_mixture_cosine"]
+    )
+    if args.loss_mode == "ce":
+        train_fit_pass = bool(train_result["accuracy"] >= 0.90)
+        generalization_pass = bool(
+            validation_accuracy_gain > 0.0 and validation_mixture_gain > 0.01
+        )
+    else:
+        train_fit_pass = bool(train_mixture_gain > 0.05)
+        generalization_pass = bool(validation_mixture_gain > 0.01)
+
+    if generalization_pass:
         conclusion = (
-            "PASS: the current q-cue readout can overfit cached control states. "
-            "The next experiment should prioritize a continuous mixture-direction loss "
-            "and an environment-level held-out split."
+            "GENERALIZATION PASS: dynamic cue weights outperform the fixed mixture on "
+            "unseen environments. The probe design is a candidate for integration into "
+            "the main multimodal training path."
+        )
+    elif train_fit_pass:
+        conclusion = (
+            "MEMORIZATION ONLY: the probe improves or fits the training split but does not "
+            "beat the fixed mixture on unseen environments. Do not integrate this selector; "
+            "reduce capacity, regularize, or increase data first."
         )
     else:
         conclusion = (
-            "FAIL: the current q-cue readout cannot overfit even the small probe set. "
-            "The next experiment should test whether LoRA/backbone adaptation is required "
-            "before changing the cue loss."
+            "UNDERFIT: the probe does not improve enough even on the training split. "
+            "Check optimization and representation quality before main-model integration."
         )
     print(f"\nConclusion: {conclusion}")
 
@@ -332,11 +454,19 @@ def main():
         "steps": args.steps,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
+        "loss_mode": args.loss_mode,
+        "ce_weight": args.ce_weight,
+        "readout_type": readout_type,
+        "probe_hidden_dim": args.probe_hidden_dim,
+        "dropout": args.dropout,
         "train_sample_indices": train_indices,
         "validation_sample_indices": val_indices,
         "final_train_loss": float(final_loss.item()),
-        "overfit_threshold": 0.90,
-        "overfit_pass": overfit_pass,
+        "train_fit_pass": train_fit_pass,
+        "generalization_pass": generalization_pass,
+        "train_mixture_gain": train_mixture_gain,
+        "validation_accuracy_gain": validation_accuracy_gain,
+        "validation_mixture_gain": validation_mixture_gain,
         "train": train_result,
         "validation": val_result,
         "conclusion": conclusion,

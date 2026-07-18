@@ -332,3 +332,63 @@ TRAIN accuracy >= 0.90:
 TRAIN accuracy < 0.90:
   当前 readout 无法从 frozen control states 读出 cue 选择，下一步优先测试 LoRA/backbone adaptation。
 ```
+
+## 2026-07-18 追加：80/20 probe 显示动态 selector 不泛化
+
+原始 329 万参数 `ControlReadout` 在 80 个环境训练、20 个环境验证时得到：
+
+```text
+TRAIN:
+  accuracy: 0.6625 > majority 0.4281
+  dynamic mixture cosine: 0.7480
+  fixed mixture cosine: 0.6800
+
+VALIDATION:
+  accuracy: 0.3750 < majority 0.5125
+  dynamic mixture cosine: 0.6274
+  fixed mixture cosine: 0.7505
+  shuffled mixture cosine: 0.6393
+```
+
+结论：
+
+```text
+当前大 q-cue head 在训练集上学到样本差异，但这些差异不能泛化；
+验证集 dynamic 低于 fixed，甚至略低于 shuffled。
+当前阶段不应启用 LoRA，也不应把动态 selector 接入主方法。
+```
+
+probe 脚本新增：
+
+```text
+--probe_hidden_dim 64/128
+--dropout
+--loss_mode {ce,direction,hybrid}
+--ce_weight
+```
+
+并将结论改为同时检查训练拟合和验证泛化，不再把小样本记忆直接判为 PASS。
+
+下一轮先测试约 17 万参数的 compact-64 head + continuous mixture-direction loss：
+
+```bash
+python scripts/probe_q_cue_control_states.py \
+  --prediction_npz /root/autodl-tmp/outputs/mm_smoke_100_geom_v3_stage_b6_q_cue_only_fix_1000step/delta_diag_mm100_geom_v3_stage_b6_q_cue_only_fix_1000step.npz \
+  --train_samples 80 \
+  --steps 500 \
+  --learning_rate 0.0003 \
+  --weight_decay 0.01 \
+  --loss_mode direction \
+  --probe_hidden_dim 64 \
+  --dropout 0.2 \
+  --seed 42 \
+  --output /root/autodl-tmp/outputs/mm_smoke_100_geom_v3_stage_b6_q_cue_only_fix_1000step/q_cue_probe_compact64_direction_80_20.json
+```
+
+唯一主验收条件：
+
+```text
+VALIDATION dynamic_mixture_cosine > fixed_mixture_cosine
+```
+
+若仍失败，说明 100 个环境不足以支持动态 cue selector，下一步应扩大数据并保留 fixed mixture 作为强基线，而不是继续增加模型容量。
