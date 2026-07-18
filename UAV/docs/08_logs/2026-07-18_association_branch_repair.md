@@ -1,6 +1,6 @@
 ---
 type: log
-status: a_only_train500_pending
+status: a_only_train500_complete_validation_pending
 stage: multimodal_association_branch_repair
 last_updated: 2026-07-18
 ---
@@ -87,3 +87,17 @@ lambda_p_raw_kl: 0
 训练后必须重新检查 train500 和独立 val100 的 accuracy、固定多数基线、oracle
 probability 与 train/val gap。只有独立验证准确率显著提升后，才讨论 soft/hard
 association-aware power projection。
+
+## 2026-07-18 A-only train500 完成
+
+服务器已完成 1000-step A-only 训练：
+
+```text
+OK: multimodal SFT smoke complete
+final checkpoint:
+/root/autodl-tmp/outputs/mm_geom_v3_stage_a3_assoc_only_train500_1000step/mm_sft_smoke_final
+```
+
+该 checkpoint 从 P0.1 完整功率 checkpoint 初始化，通过 `--freeze_qp_branch` 只更新
+association 分支。当前状态为 `training_complete_validation_pending`；必须同时检查完整
+train500 和独立 val100 后才能判定是否通过。
