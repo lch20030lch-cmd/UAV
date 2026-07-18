@@ -83,6 +83,65 @@ def _summarize_association(prefix: str, delta_a: np.ndarray) -> Dict:
     }
 
 
+def _summarize_power_targets(delta_p: np.ndarray, delta_a: np.ndarray) -> Dict:
+    """检查 oracle 功率是否与二值 association 一致。"""
+    pred_shape = delta_a.shape[:-1] + (delta_a.shape[-1] + 1,)
+    if delta_p.shape != pred_shape:
+        raise ValueError(
+            f"delta_p must have shape {pred_shape} for delta_a {delta_a.shape}, got {delta_p.shape}"
+        )
+    comm = delta_p[..., :-1]
+    active = delta_a > 0.5
+    inactive = ~active
+
+    def masked_mean(values: np.ndarray, mask: np.ndarray) -> float:
+        selected = values[mask]
+        return float(selected.mean()) if selected.size else 0.0
+
+    inactive_values = comm[inactive]
+    total = delta_p.sum(axis=-1)
+    return {
+        "target_delta_p_active_comm_mean": masked_mean(comm, active),
+        "target_delta_p_inactive_comm_mean": masked_mean(comm, inactive),
+        "target_delta_p_inactive_nonzero_ratio": float(
+            (np.abs(inactive_values) > 1e-8).mean()
+        ) if inactive_values.size else 0.0,
+        "target_delta_p_sensing_mean": float(delta_p[..., -1].mean()),
+        "target_delta_p_total_per_uav_mean": float(total.mean()),
+        "target_delta_p_total_per_uav_std": float(total.std()),
+    }
+
+
+def _summarize_power_prediction(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    association: np.ndarray,
+) -> Dict:
+    num_samples = min(prediction.shape[0], target.shape[0], association.shape[0])
+    prediction = prediction[:num_samples]
+    target = target[:num_samples]
+    association = association[:num_samples]
+    comm_sq = (prediction[..., :-1] - target[..., :-1]) ** 2
+    active = association > 0.5
+    inactive = ~active
+
+    def masked_mean(values: np.ndarray, mask: np.ndarray) -> float:
+        selected = values[mask]
+        return float(selected.mean()) if selected.size else 0.0
+
+    return {
+        "pred_delta_p_mse": float(((prediction - target) ** 2).mean()),
+        "pred_delta_p_active_comm_mse": masked_mean(comm_sq, active),
+        "pred_delta_p_inactive_comm_mse": masked_mean(comm_sq, inactive),
+        "pred_delta_p_sensing_mse": float(
+            ((prediction[..., -1] - target[..., -1]) ** 2).mean()
+        ),
+        "pred_delta_p_inactive_power_leakage_mean": masked_mean(
+            prediction[..., :-1], inactive
+        ),
+    }
+
+
 def _load_targets(records: List[Dict]) -> Dict[str, np.ndarray]:
     return {
         "delta_q": np.asarray([r["delta_q"] for r in records], dtype=np.float32),
@@ -143,6 +202,7 @@ def main():
     for name, values in targets.items():
         summary.update(_summarize_tensor(f"target_{name}", values))
     summary.update(_summarize_association("target_delta_a", targets["delta_a"]))
+    summary.update(_summarize_power_targets(targets["delta_p"], targets["delta_a"]))
 
     predictions = _load_predictions(args.prediction_npz)
     if predictions is not None:
@@ -150,6 +210,11 @@ def main():
             summary.update(_summarize_tensor(f"pred_{name}", values))
         summary.update(_summarize_association("pred_delta_a", predictions["delta_a"]))
         summary.update(_compare_argmax(targets["delta_a"], predictions["delta_a"]))
+        summary.update(
+            _summarize_power_prediction(
+                predictions["delta_p"], targets["delta_p"], targets["delta_a"]
+            )
+        )
         summary["prediction_npz"] = args.prediction_npz
 
     if args.output:
@@ -165,6 +230,12 @@ def main():
         "target_delta_q_per_dim_std_mean",
         "target_delta_a_per_dim_std_mean",
         "target_delta_p_per_dim_std_mean",
+        "target_delta_p_active_comm_mean",
+        "target_delta_p_inactive_comm_mean",
+        "target_delta_p_inactive_nonzero_ratio",
+        "target_delta_p_sensing_mean",
+        "target_delta_p_total_per_uav_mean",
+        "target_delta_p_total_per_uav_std",
         "target_delta_a_argmax_unique_per_user_mean",
         "target_delta_a_argmax_fixed_user_count",
         "target_delta_a_argmax_dominant_ratio_mean",
@@ -180,6 +251,11 @@ def main():
             "argmax_match_rate_mean",
             "argmax_match_rate_per_user_min",
             "argmax_match_rate_per_user_max",
+            "pred_delta_p_mse",
+            "pred_delta_p_active_comm_mse",
+            "pred_delta_p_inactive_comm_mse",
+            "pred_delta_p_sensing_mse",
+            "pred_delta_p_inactive_power_leakage_mean",
         ):
             print(f"  {key}: {summary[key]}")
 

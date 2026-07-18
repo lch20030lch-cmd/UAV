@@ -138,6 +138,68 @@ class UAVISACLosses:
             target_idx.reshape(-1),
         )
 
+    @staticmethod
+    def _masked_mse(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """按逻辑组求均值，避免大量未关联零条目淹没有效功率监督。"""
+        squared_error = (prediction - target).pow(2)
+        mask = mask.to(device=prediction.device, dtype=torch.bool)
+        if not mask.any():
+            return squared_error.new_tensor(0.0)
+        return squared_error[mask].mean()
+
+    def compute_power_loss(
+        self,
+        delta_p_hat: torch.Tensor,
+        delta_p_target: torch.Tensor,
+        delta_a_target: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """关联感知的功率回归损失。
+
+        oracle ``delta_p`` 的通信部分只在 ``delta_a_target=1`` 的位置非零。
+        若直接对全部 ``M*K`` 条目做一个 MSE，大量未关联零条目会主导梯度，
+        使最容易的解退化为近常数小功率。这里分别归一化三类监督：
+
+        1. 已关联用户通信功率；
+        2. 未关联用户零功率/泄漏；
+        3. 感知功率。
+
+        三组等权平均，使损失不随未关联条目数量线性放大。
+        """
+        if delta_p_hat.shape != delta_p_target.shape:
+            raise ValueError(
+                "delta_p prediction/target shapes differ: "
+                f"{tuple(delta_p_hat.shape)} != {tuple(delta_p_target.shape)}"
+            )
+        num_comm_users = delta_p_hat.shape[-1] - 1
+        if delta_a_target.shape != delta_p_hat.shape[:-1] + (num_comm_users,):
+            raise ValueError(
+                "delta_a_target must align with communication power entries: "
+                f"expected {delta_p_hat.shape[:-1] + (num_comm_users,)}, "
+                f"got {tuple(delta_a_target.shape)}"
+            )
+
+        pred_comm = delta_p_hat[..., :num_comm_users]
+        target_comm = delta_p_target[..., :num_comm_users]
+        active_mask = delta_a_target > 0.5
+        inactive_mask = ~active_mask
+
+        loss_active = self._masked_mse(pred_comm, target_comm, active_mask)
+        loss_inactive = self._masked_mse(pred_comm, target_comm, inactive_mask)
+        loss_sensing = F.mse_loss(
+            delta_p_hat[..., num_comm_users:],
+            delta_p_target[..., num_comm_users:],
+        )
+        loss = (loss_active + loss_inactive + loss_sensing) / 3.0
+        return loss, {
+            "loss_p_active": loss_active,
+            "loss_p_inactive": loss_inactive,
+            "loss_p_sensing": loss_sensing,
+        }
+
     def compute_control_loss(
         self,
         delta_hat: Dict[str, torch.Tensor],
@@ -206,8 +268,16 @@ class UAVISACLosses:
         else:
             loss_q_cue_ce = dq_hat.new_tensor(0.0)
 
-        # 功率 loss (MSE)
-        loss_p = F.mse_loss(dp_hat, dp_tgt) if self.lambda_p != 0 else dp_hat.new_tensor(0.0)
+        # 功率 loss：按关联有效通信、未关联泄漏、感知功率三组分别归一化。
+        if self.lambda_p != 0:
+            loss_p, power_parts = self.compute_power_loss(dp_hat, dp_tgt, da_tgt)
+        else:
+            loss_p = dp_hat.new_tensor(0.0)
+            power_parts = {
+                "loss_p_active": dp_hat.new_tensor(0.0),
+                "loss_p_inactive": dp_hat.new_tensor(0.0),
+                "loss_p_sensing": dp_hat.new_tensor(0.0),
+            }
 
         total = (
             self.lambda_q * loss_q
@@ -228,6 +298,7 @@ class UAVISACLosses:
                 "loss_q_dir": loss_q_dir,
                 "loss_q_cue_ce": loss_q_cue_ce,
                 "loss_p": loss_p,
+                **power_parts,
             }
         return total
 
@@ -368,6 +439,9 @@ class UAVISACLosses:
             "loss_q_dir": ctl_parts["loss_q_dir"].item(),
             "loss_q_cue_ce": ctl_parts["loss_q_cue_ce"].item(),
             "loss_p": ctl_parts["loss_p"].item(),
+            "loss_p_active": ctl_parts["loss_p_active"].item(),
+            "loss_p_inactive": ctl_parts["loss_p_inactive"].item(),
+            "loss_p_sensing": ctl_parts["loss_p_sensing"].item(),
             "lambda_assoc_ce": self.lambda_assoc_ce,
             "lambda_assoc_raw_ce": self.lambda_assoc_raw_ce,
             "lambda_q_dir": self.lambda_q_dir,

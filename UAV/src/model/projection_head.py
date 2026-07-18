@@ -210,19 +210,26 @@ class PowerProjection(nn.Module):
 
     p̂_m = P_max * softmax(p̃_m' / τ_p)
 
-    保证:
-      Σ(通信 + 感知) ≤ P_max
+    默认严格实现论文中的 simplex 投影:
+      Σ(通信 + 感知) = P_max
       每个条目 ≥ 0
-      每个通信条目 ≥ p_min (论文公式 21: A_{m,k}||w_{m,k}||² ≥ A_{m,k}P_min)
+
+    可选 ``p_min_ratio > 0`` 时，通信功率下界必须由 association 软门控，
+    避免给未关联用户强制分配功率。默认关闭该可选下界，由下游 SCA-FP
+    对关联条件下的最小用户功率做最终可行化。
     """
 
-    def __init__(self, p_max: float = 1.0, tau: float = 0.5, p_min_ratio: float = 0.01):
+    def __init__(self, p_max: float = 1.0, tau: float = 0.5, p_min_ratio: float = 0.0):
         super().__init__()
         self.register_buffer("p_max", torch.tensor(p_max))
         self.p_min = p_min_ratio * p_max  # absolute floor
         self.tau = tau
 
-    def forward(self, p_tilde: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        p_tilde: torch.Tensor,
+        association: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             p_tilde: (B, M, K+1) — 原始功率得分
@@ -241,26 +248,39 @@ class PowerProjection(nn.Module):
         # 缩放到功率预算
         p_hat = self.p_max * p_soft
 
-        # 通信条目下界钳位 (论文 P_min 约束), 感知条目不受此限
-        p_comm = p_hat[..., :K_comm]  # (B, M, K_comm)
-        p_sense = p_hat[..., K_comm:]  # (B, M, 1)
+        if self.p_min <= 0:
+            return p_hat
 
-        # 钳位后重分配: 被钳掉的多余功率均分给其他通信条目
-        floor = self.p_min
-        below_floor = p_comm < floor
-        deficit = (floor - p_comm) * below_floor.float()  # 每个条目缺口
-        total_deficit = deficit.sum(dim=-1, keepdim=True)  # (B, M, 1)
+        if association is None:
+            raise ValueError(
+                "PowerProjection with p_min_ratio > 0 requires association weights."
+            )
+        if association.shape != p_tilde.shape[:-1] + (K_comm,):
+            raise ValueError(
+                "association must align with communication power entries: "
+                f"expected {p_tilde.shape[:-1] + (K_comm,)}, got {tuple(association.shape)}"
+            )
 
-        p_comm = torch.where(below_floor, torch.tensor(floor, device=p_comm.device, dtype=p_comm.dtype), p_comm)
+        # 关联感知的通信下界。association=0 时下界也是 0，避免与 oracle 中
+        # 未关联用户的零功率标签冲突；感知功率不受该下界约束。
+        assoc = association.to(device=p_tilde.device, dtype=p_tilde.dtype).clamp(0.0, 1.0)
+        base_comm = self.p_min * assoc
+        base_total = base_comm.sum(dim=-1, keepdim=True)
 
-        # 从高于 floor 的条目中扣除 deficit
-        above_floor = p_comm > floor
-        excess = (p_comm - floor) * above_floor.float()
-        total_excess = excess.sum(dim=-1, keepdim=True) + 1e-8
-        scale = torch.clamp(1.0 - total_deficit / total_excess, min=0.0)
-        p_comm = torch.where(above_floor, floor + excess * scale, p_comm)
-
-        return torch.cat([p_comm, p_sense], dim=-1)
+        # 极端情况下 association 软负载可能使下界总和超过预算；先整体缩放，
+        # 再把剩余预算按原 softmax 权重分配，严格保持总功率不超过 P_max。
+        base_scale = torch.clamp(
+            self.p_max.to(dtype=p_tilde.dtype) / base_total.clamp_min(1e-8),
+            max=1.0,
+        )
+        base_comm = base_comm * base_scale
+        base_total = base_comm.sum(dim=-1, keepdim=True)
+        remaining = (self.p_max.to(dtype=p_tilde.dtype) - base_total).clamp_min(0.0)
+        extra = remaining * p_soft
+        return torch.cat(
+            [base_comm + extra[..., :K_comm], extra[..., K_comm:]],
+            dim=-1,
+        )
 
 
 class AssociationProjection(nn.Module):
@@ -517,7 +537,7 @@ class ConstraintProjectionHead(nn.Module):
         dq_for_projection = self._compose_q_from_geometry_cues(dq, q_geometry_cues, q_cue_logits)
         dq_proj = self.proj_q(dq_for_projection, q_current)
         da_proj = self.proj_a(da)
-        dp_proj = self.proj_p(dp)
+        dp_proj = self.proj_p(dp, association=da_proj)
 
         result = {
             "delta_q": dq_proj,

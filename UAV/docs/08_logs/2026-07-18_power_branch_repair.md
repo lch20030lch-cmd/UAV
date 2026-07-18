@@ -1,0 +1,170 @@
+---
+type: log
+status: code_complete_runtime_pending
+stage: multimodal_power_branch_repair
+last_updated: 2026-07-18
+---
+
+# 2026-07-18 功率分支 P0 修复
+
+## 优先级结论
+
+完整 SFT/DPO 之前按以下顺序处理阻塞项：
+
+1. P0：修复功率投影、功率损失和诊断指标；
+2. P1：在 train500/val100 上验证 association；
+3. P2：关闭 dynamic cue，用 direct q-direction + LoRA 验证 q；
+4. P3：三个分支均通过后才允许联合 SFT/DPO。
+
+本日志只记录 P0。
+
+## 已确认的问题
+
+旧 `PowerProjection` 默认对全部 `M*K` 个通信条目施加
+`0.01 * P_max` 下界，即使该 UAV 没有关联对应用户。
+
+oracle 数据的 `delta_p` 来自 SCA-FP beamformer 功率，未关联位置通常为 0。
+因此旧实现存在直接冲突：
+
+```text
+oracle inactive communication power = 0
+old projection inactive communication power >= 0.01 * P_max
+```
+
+旧功率损失又对全部 `M*(K+1)` 条目直接做一次 MSE。对于 `M=4, K=20`，
+大量未关联零条目会压过已关联通信功率和感知功率监督，容易得到近常数小功率解。
+历史 Stage B2 已出现：
+
+```text
+delta_p_per_dim_std_mean: 6.2088170160734535e-09
+warnings: ['delta_p_low_cross_sample_variance']
+```
+
+## 代码修改
+
+### 1. PowerProjection 与论文公式对齐
+
+默认路径现在只执行：
+
+```text
+p_hat = P_max * softmax(p_raw / tau_p)
+```
+
+默认 `p_min_ratio` 从 `0.01` 改为 `0.0`，不再给未关联用户强制分配功率。
+
+若未来显式启用 `p_min_ratio > 0`，必须传入 association 权重；下界变为：
+
+```text
+p_floor[m,k] = p_min * association[m,k]
+```
+
+并对剩余预算重新归一化，保证总功率不超过 `P_max`。
+
+### 2. 关联感知的分组功率损失
+
+新损失分别计算：
+
+```text
+loss_p_active    # 已关联用户通信功率
+loss_p_inactive  # 未关联用户功率泄漏
+loss_p_sensing   # 感知功率
+loss_p = (active + inactive + sensing) / 3
+```
+
+三组分别求均值后等权组合，避免未关联零条目的数量支配梯度。
+
+### 3. 日志与诊断
+
+训练日志新增：
+
+```text
+loss_p
+loss_p_active
+loss_p_inactive
+loss_p_sensing
+```
+
+`analyze_mm_delta_outputs.py` 新增保存和输出：
+
+```text
+delta_p_raw
+delta_a_target
+delta_p_target
+delta_p_active_comm_mse
+delta_p_inactive_comm_mse
+delta_p_sensing_mse
+delta_p_inactive_power_leakage_mean
+delta_p_total_per_uav_mae
+```
+
+新增 warning：
+
+```text
+delta_p_inactive_power_leakage
+```
+
+### 4. 回归测试
+
+新增：
+
+```text
+tests/test_power_branch.py
+```
+
+覆盖默认 simplex、可选 association-aware floor、预算守恒、分组损失和反向梯度。
+
+本机已通过 `py_compile` 和 `git diff --check`。本机 Python 环境没有安装
+PyTorch，运行时单元测试必须在服务器 `uavmllm` 环境执行。
+
+## 服务器验证顺序
+
+### A. 单元测试
+
+```bash
+python -m unittest tests.test_power_branch -v
+```
+
+### B. 先检查 train500/val100 oracle 功率标签
+
+```bash
+python scripts/analyze_mm_target_distribution.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_geom_v3_train500_seed42 \
+  --output /root/autodl-tmp/outputs/mm_geom_v3_probe/train500_target_distribution.json
+
+python scripts/analyze_mm_target_distribution.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_geom_v3_val100_seed2026 \
+  --output /root/autodl-tmp/outputs/mm_geom_v3_probe/val100_target_distribution.json
+```
+
+必须重点确认：
+
+```text
+target_delta_p_per_dim_std_mean > 0
+target_delta_p_inactive_comm_mean ≈ 0
+target_delta_p_inactive_nonzero_ratio ≈ 0
+```
+
+只有标签本身满足这些条件，才进入 P-only 训练。
+
+## P0 验收门槛
+
+代码级门槛：
+
+```text
+server unittest PASS
+PowerProjection sum(delta_p, dim=-1) == P_max
+```
+
+训练级门槛将在标签检查后执行：
+
+```text
+不再出现 delta_p_low_cross_sample_variance
+validation delta_p_active_comm_mse 相比初始化下降
+validation delta_p_sensing_mse 相比初始化下降
+delta_p_inactive_power_leakage_mean < 0.01
+```
+
+在服务器返回目标分布与单元测试结果之前，P0 状态保持
+`code_complete_runtime_pending`，不进入完整联合训练。

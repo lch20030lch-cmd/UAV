@@ -102,13 +102,59 @@ def _summarize_q_cues(
     }
 
 
+def _summarize_power_alignment(
+    delta_p: np.ndarray,
+    delta_p_target: np.ndarray,
+    delta_a_target: np.ndarray,
+) -> Dict:
+    """分开统计有效通信、未关联泄漏与感知功率误差。"""
+    if delta_p.shape != delta_p_target.shape:
+        raise ValueError(
+            f"delta_p prediction/target shapes differ: {delta_p.shape} != {delta_p_target.shape}"
+        )
+    if delta_a_target.shape != delta_p.shape[:-1] + (delta_p.shape[-1] - 1,):
+        raise ValueError(
+            "delta_a_target must align with communication power entries: "
+            f"got {delta_a_target.shape} for delta_p {delta_p.shape}"
+        )
+
+    pred_comm = delta_p[..., :-1]
+    target_comm = delta_p_target[..., :-1]
+    active = delta_a_target > 0.5
+    inactive = ~active
+    comm_sq_error = (pred_comm - target_comm) ** 2
+    sense_sq_error = (delta_p[..., -1:] - delta_p_target[..., -1:]) ** 2
+
+    def masked_mean(values: np.ndarray, mask: np.ndarray) -> float:
+        selected = values[mask]
+        return float(selected.mean()) if selected.size else 0.0
+
+    pred_total = delta_p.sum(axis=-1)
+    target_total = delta_p_target.sum(axis=-1)
+    return {
+        "delta_p_mse": float(((delta_p - delta_p_target) ** 2).mean()),
+        "delta_p_active_comm_mse": masked_mean(comm_sq_error, active),
+        "delta_p_inactive_comm_mse": masked_mean(comm_sq_error, inactive),
+        "delta_p_sensing_mse": float(sense_sq_error.mean()),
+        "delta_p_active_comm_pred_mean": masked_mean(pred_comm, active),
+        "delta_p_active_comm_target_mean": masked_mean(target_comm, active),
+        "delta_p_inactive_power_leakage_mean": masked_mean(pred_comm, inactive),
+        "delta_p_total_per_uav_pred_mean": float(pred_total.mean()),
+        "delta_p_total_per_uav_target_mean": float(target_total.mean()),
+        "delta_p_total_per_uav_mae": float(np.abs(pred_total - target_total).mean()),
+    }
+
+
 def _summarize_deltas(
     delta_q: np.ndarray,
     delta_a: np.ndarray,
     delta_p: np.ndarray,
     delta_q_raw: np.ndarray = None,
     delta_a_raw: np.ndarray = None,
+    delta_p_raw: np.ndarray = None,
     delta_q_target: np.ndarray = None,
+    delta_a_target: np.ndarray = None,
+    delta_p_target: np.ndarray = None,
     q_cue_logits: np.ndarray = None,
     q_geometry_cues: np.ndarray = None,
     control_states: np.ndarray = None,
@@ -136,6 +182,12 @@ def _summarize_deltas(
     if delta_a_raw is not None:
         summary.update(_summarize_tensor("delta_a_raw", delta_a_raw))
         summary.update(_summarize_association("delta_a_raw", delta_a_raw))
+    if delta_p_raw is not None:
+        summary.update(_summarize_tensor("delta_p_raw", delta_p_raw))
+    if delta_p_target is not None:
+        summary.update(_summarize_tensor("delta_p_target", delta_p_target))
+    if delta_p_target is not None and delta_a_target is not None:
+        summary.update(_summarize_power_alignment(delta_p, delta_p_target, delta_a_target))
     if control_states is not None:
         summary.update(_summarize_tensor("control_states", control_states))
     if delta_raw is not None:
@@ -155,6 +207,8 @@ def _summarize_deltas(
         warnings.append("delta_a_low_cross_sample_variance")
     if summary["delta_p_per_dim_std_mean"] < 1e-4:
         warnings.append("delta_p_low_cross_sample_variance")
+    if summary.get("delta_p_inactive_power_leakage_mean", 0.0) > 1e-2:
+        warnings.append("delta_p_inactive_power_leakage")
     if summary["delta_a_argmax_unique_per_user_mean"] <= 1.2:
         warnings.append("delta_a_argmax_nearly_constant")
     summary["warnings"] = warnings
@@ -225,7 +279,10 @@ def _collect_deltas(
     delta_ps: List[np.ndarray] = []
     delta_q_raws: List[np.ndarray] = []
     delta_a_raws: List[np.ndarray] = []
+    delta_p_raws: List[np.ndarray] = []
     delta_q_targets: List[np.ndarray] = []
+    delta_a_targets: List[np.ndarray] = []
+    delta_p_targets: List[np.ndarray] = []
     q_cue_logits_list: List[np.ndarray] = []
     q_geometry_cues_list: List[np.ndarray] = []
     control_states_list: List[np.ndarray] = []
@@ -256,8 +313,14 @@ def _collect_deltas(
             delta_q_raws.append(_as_np(outputs["delta_q_raw"].squeeze(0)))
         if "delta_a_raw" in outputs:
             delta_a_raws.append(_as_np(outputs["delta_a_raw"].squeeze(0)))
+        if "delta_p_raw" in outputs:
+            delta_p_raws.append(_as_np(outputs["delta_p_raw"].squeeze(0)))
         if "delta_q_target" in batch:
             delta_q_targets.append(_as_np(batch["delta_q_target"].squeeze(0)))
+        if "delta_a_target" in batch:
+            delta_a_targets.append(_as_np(batch["delta_a_target"].squeeze(0)))
+        if "delta_p_target" in batch:
+            delta_p_targets.append(_as_np(batch["delta_p_target"].squeeze(0)))
         if "q_cue_logits" in outputs:
             q_cue_logits_list.append(_as_np(outputs["q_cue_logits"].squeeze(0)))
         if "q_geometry_cues" in batch:
@@ -276,8 +339,14 @@ def _collect_deltas(
         result["delta_a_raw"] = np.stack(delta_a_raws, axis=0)
     if delta_q_raws:
         result["delta_q_raw"] = np.stack(delta_q_raws, axis=0)
+    if delta_p_raws:
+        result["delta_p_raw"] = np.stack(delta_p_raws, axis=0)
     if delta_q_targets:
         result["delta_q_target"] = np.stack(delta_q_targets, axis=0)
+    if delta_a_targets:
+        result["delta_a_target"] = np.stack(delta_a_targets, axis=0)
+    if delta_p_targets:
+        result["delta_p_target"] = np.stack(delta_p_targets, axis=0)
     if q_cue_logits_list:
         result["q_cue_logits"] = np.stack(q_cue_logits_list, axis=0)
     if q_geometry_cues_list:
@@ -361,16 +430,19 @@ def main():
     num_samples = min(args.num_samples, len(dataset))
     deltas = _collect_deltas(model, dataset, num_samples)
     summary = _summarize_deltas(
-        deltas["delta_q"],
-        deltas["delta_a"],
-        deltas["delta_p"],
-        deltas.get("delta_q_raw"),
-        deltas.get("delta_a_raw"),
-        deltas.get("delta_q_target"),
-        deltas.get("q_cue_logits"),
-        deltas.get("q_geometry_cues"),
-        deltas.get("control_states"),
-        deltas.get("delta_raw"),
+        delta_q=deltas["delta_q"],
+        delta_a=deltas["delta_a"],
+        delta_p=deltas["delta_p"],
+        delta_q_raw=deltas.get("delta_q_raw"),
+        delta_a_raw=deltas.get("delta_a_raw"),
+        delta_p_raw=deltas.get("delta_p_raw"),
+        delta_q_target=deltas.get("delta_q_target"),
+        delta_a_target=deltas.get("delta_a_target"),
+        delta_p_target=deltas.get("delta_p_target"),
+        q_cue_logits=deltas.get("q_cue_logits"),
+        q_geometry_cues=deltas.get("q_geometry_cues"),
+        control_states=deltas.get("control_states"),
+        delta_raw=deltas.get("delta_raw"),
     )
 
     result = {
@@ -413,6 +485,16 @@ def main():
         "delta_q_per_dim_std_mean",
         "delta_a_per_dim_std_mean",
         "delta_p_per_dim_std_mean",
+        "delta_p_raw_per_dim_std_mean",
+        "delta_p_target_per_dim_std_mean",
+        "delta_p_mse",
+        "delta_p_active_comm_mse",
+        "delta_p_inactive_comm_mse",
+        "delta_p_sensing_mse",
+        "delta_p_inactive_power_leakage_mean",
+        "delta_p_total_per_uav_pred_mean",
+        "delta_p_total_per_uav_target_mean",
+        "delta_p_total_per_uav_mae",
         "delta_q_raw_per_dim_std_mean",
         "delta_q_raw_dir_cosine_mean",
         "delta_q_raw_dir_mse_mean",

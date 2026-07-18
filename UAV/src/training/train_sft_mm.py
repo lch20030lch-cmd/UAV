@@ -398,6 +398,10 @@ def train_mm_sft_smoke(
                 f"loss_a_raw_ce={metrics['loss_a_raw_ce']:.6f} "
                 f"loss_q_dir={metrics['loss_q_dir']:.6f} "
                 f"loss_q_cue_ce={metrics['loss_q_cue_ce']:.6f} "
+                f"loss_p={metrics['loss_p']:.6f} "
+                f"loss_p_active={metrics['loss_p_active']:.6f} "
+                f"loss_p_inactive={metrics['loss_p_inactive']:.6f} "
+                f"loss_p_sensing={metrics['loss_p_sensing']:.6f} "
                 f"grad_norm_proj={grad_norm:.6f} "
                 f"grad_norm_lora={grad_norm_lora:.6f}"
             )
