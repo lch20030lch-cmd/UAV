@@ -1,6 +1,6 @@
 ---
 type: log
-status: p_only_raw_kl_full_training_complete_validation_pending
+status: p_only_generalizes_but_underfit_association_gate_pending
 stage: multimodal_power_branch_repair
 last_updated: 2026-07-18
 ---
@@ -468,3 +468,70 @@ final_checkpoint:
 当前状态为 `training_complete_validation_pending`。下一步依次检查训练末段日志、
 完整 train500 诊断和独立 val100 诊断；在独立验证结果通过前，不能将该 checkpoint
 并入联合 SFT，也不能进入 DPO。
+
+## 2026-07-18 P0.1 完整 train500 / 独立 val100 诊断
+
+完整 train500：
+
+```text
+delta_p_per_dim_std_mean: 0.0051668622
+delta_p_target_per_dim_std_mean: 0.0716962442
+delta_p_mse: 0.0081159258
+delta_p_active_comm_mse: 0.0125617245
+delta_p_inactive_comm_mse: 0.0009256767
+delta_p_sensing_mse: 0.0937406793
+delta_p_inactive_power_leakage_mean: 0.0274850018
+delta_p_entropy_mean: 2.2866133624
+```
+
+独立 val100：
+
+```text
+delta_p_per_dim_std_mean: 0.0051548160
+delta_p_target_per_dim_std_mean: 0.0673355162
+delta_p_mse: 0.0078541981
+delta_p_active_comm_mse: 0.0114227328
+delta_p_inactive_comm_mse: 0.0009410096
+delta_p_sensing_mse: 0.0937093645
+delta_p_inactive_power_leakage_mean: 0.0277360305
+delta_p_entropy_mean: 2.2955480158
+warnings: ['delta_p_inactive_power_leakage']
+```
+
+相对 Stage A2 独立 val100 初始化基线：
+
+```text
+overall MSE:    0.0299952 -> 0.0078542  (-73.8%)
+active MSE:     0.0198893 -> 0.0114227  (-42.6%)
+inactive MSE:   0.0131981 -> 0.0009410  (-92.9%)
+sensing MSE:    0.3324812 -> 0.0937094  (-71.8%)
+inactive leak:  0.0491444 -> 0.0277360  (-43.6%)
+```
+
+判定：
+
+```text
+PASS: raw-KL 功率修复在独立环境上稳定泛化，train/val 没有可见过拟合间隙；
+PASS: catastrophic one-hot collapse 已消失，总误差和三组误差显著下降；
+FAIL: inactive leakage 0.02774 仍高于 0.01 最终门槛；
+FAIL: val 输出方差仅为目标方差约 7.7%，样本级功率变化仍明显不足。
+```
+
+结果更接近跨环境平均功率模板，而不是充分的逐环境功率预测。继续盲目增加 P-only
+步数不能直接证明会解决该问题。下一步先完成 association 正确性 gate：只有
+association 不仅多样、而且在独立验证上确实命中 oracle，才允许尝试 association-aware
+功率掩码或联合 A/P 训练。
+
+为此，`analyze_mm_delta_outputs.py` 新增：
+
+```text
+delta_a_argmax_accuracy
+delta_a_fixed_user_majority_accuracy
+delta_a_accuracy_gain_over_fixed_user_majority
+delta_a_oracle_probability_mean
+delta_a_oracle_probability_std
+warning: delta_a_not_above_fixed_user_majority
+```
+
+旧指标 `unique_per_user` 只能证明预测会变化，不能证明选对 UAV；上述新指标用于补齐
+这一诊断缺口。

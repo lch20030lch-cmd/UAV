@@ -74,6 +74,50 @@ def _summarize_association(prefix: str, delta_a: np.ndarray) -> Dict:
     }
 
 
+def _summarize_association_alignment(
+    delta_a: np.ndarray,
+    delta_a_target: np.ndarray,
+) -> Dict:
+    """对比预测关联与 oracle，并给出固定用户多数选择基线。"""
+    if delta_a.shape != delta_a_target.shape:
+        raise ValueError(
+            "delta_a prediction/target shapes differ: "
+            f"{delta_a.shape} != {delta_a_target.shape}"
+        )
+    if delta_a.ndim != 3:
+        raise ValueError(f"delta_a must have shape (N, M, K), got {delta_a.shape}")
+
+    pred_idx = np.argmax(delta_a, axis=1)
+    target_idx = np.argmax(delta_a_target, axis=1)
+    accuracy = float((pred_idx == target_idx).mean())
+
+    num_samples, num_uavs, num_users = delta_a.shape
+    majority_correct = 0
+    for user_idx in range(num_users):
+        counts = np.bincount(target_idx[:, user_idx], minlength=num_uavs)
+        majority_correct += int(counts.max())
+    fixed_user_majority_accuracy = float(
+        majority_correct / max(num_samples * num_users, 1)
+    )
+
+    probs = np.clip(delta_a.astype(np.float64), 0.0, None)
+    probs = probs / np.maximum(probs.sum(axis=1, keepdims=True), 1e-12)
+    oracle_probs = np.take_along_axis(
+        probs,
+        target_idx[:, None, :],
+        axis=1,
+    ).squeeze(1)
+    return {
+        "delta_a_argmax_accuracy": accuracy,
+        "delta_a_fixed_user_majority_accuracy": fixed_user_majority_accuracy,
+        "delta_a_accuracy_gain_over_fixed_user_majority": (
+            accuracy - fixed_user_majority_accuracy
+        ),
+        "delta_a_oracle_probability_mean": float(oracle_probs.mean()),
+        "delta_a_oracle_probability_std": float(oracle_probs.std()),
+    }
+
+
 def _summarize_q_cues(
     q_cue_logits: np.ndarray,
     q_geometry_cues: np.ndarray,
@@ -167,6 +211,8 @@ def _summarize_deltas(
 
     # 关联矩阵的 argmax 如果长期不变，说明模型还没有学到“按场景换 UAV”的能力。
     summary.update(_summarize_association("delta_a", delta_a))
+    if delta_a_target is not None:
+        summary.update(_summarize_association_alignment(delta_a, delta_a_target))
     if delta_q_raw is not None:
         summary.update(_summarize_tensor("delta_q_raw", delta_q_raw))
     if delta_q_raw is not None and delta_q_target is not None:
@@ -211,6 +257,11 @@ def _summarize_deltas(
         warnings.append("delta_p_inactive_power_leakage")
     if summary["delta_a_argmax_unique_per_user_mean"] <= 1.2:
         warnings.append("delta_a_argmax_nearly_constant")
+    if (
+        "delta_a_accuracy_gain_over_fixed_user_majority" in summary
+        and summary["delta_a_accuracy_gain_over_fixed_user_majority"] <= 0.0
+    ):
+        warnings.append("delta_a_not_above_fixed_user_majority")
     summary["warnings"] = warnings
     return summary
 
@@ -505,6 +556,10 @@ def main():
         "q_cue_best_geometry_cosine_mean",
         "delta_a_argmax_unique_per_user_mean",
         "delta_a_argmax_fixed_user_count",
+        "delta_a_argmax_accuracy",
+        "delta_a_fixed_user_majority_accuracy",
+        "delta_a_accuracy_gain_over_fixed_user_majority",
+        "delta_a_oracle_probability_mean",
         "delta_a_entropy_mean",
         "delta_a_raw_per_dim_std_mean",
         "delta_a_raw_argmax_unique_per_user_mean",
