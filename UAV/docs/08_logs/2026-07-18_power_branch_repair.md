@@ -1,6 +1,6 @@
 ---
 type: log
-status: target_validation_pass_unittest_pending
+status: code_and_target_gates_pass_p_training_pending
 stage: multimodal_power_branch_repair
 last_updated: 2026-07-18
 ---
@@ -207,3 +207,30 @@ PASS: train500 与独立 val100 的 active/sensing/total 分布高度一致。
 因此历史 p 常数坍缩不能归因于 oracle 标签单一或 train/validation
 分布偏移。修复 PowerProjection 的无条件下界及重新平衡功率损失是必要的。
 当前只剩服务器单元测试 gate；通过后进入 P-only 初始化基线与训练。
+
+## 2026-07-18 服务器单元测试结果
+
+服务器 `uavmllm` 环境执行：
+
+```text
+test_exact_power_target_has_zero_grouped_loss ... ok
+test_inactive_entries_do_not_dominate_active_and_sensing_groups ... ok
+test_default_projection_is_simplex_without_unconditional_floor ... ok
+test_optional_floor_is_association_aware_and_budget_safe ... ok
+test_optional_floor_requires_association ... ok
+
+Ran 5 tests in 0.181s
+OK
+```
+
+判定：
+
+```text
+PASS: 默认 simplex 无条件下界已移除；
+PASS: 可选下界受 association 控制且保持预算；
+PASS: 分组功率损失数值与梯度正确；
+PASS: P0 代码 gate 与 target-data gate 均通过。
+```
+
+下一阶段先测旧 Stage A2 checkpoint 在新投影公式下的 val100 初始化基线，
+然后进行 P-only 训练，并用同一独立验证集检查是否超过初始化基线。
