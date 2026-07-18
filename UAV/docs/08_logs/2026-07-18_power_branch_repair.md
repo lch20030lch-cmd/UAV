@@ -1,6 +1,6 @@
 ---
 type: log
-status: code_complete_runtime_pending
+status: target_validation_pass_unittest_pending
 stage: multimodal_power_branch_repair
 last_updated: 2026-07-18
 ---
@@ -166,5 +166,44 @@ validation delta_p_sensing_mse 相比初始化下降
 delta_p_inactive_power_leakage_mean < 0.01
 ```
 
-在服务器返回目标分布与单元测试结果之前，P0 状态保持
-`code_complete_runtime_pending`，不进入完整联合训练。
+初始代码提交后，P0 状态为 `code_complete_runtime_pending`；目标分布和
+单元测试均通过前不进入完整联合训练。
+
+## 2026-07-18 服务器标签验证结果
+
+train500：
+
+```text
+target_delta_p_per_dim_std_mean: 0.0716962442
+target_delta_p_active_comm_mean: 0.0996794403
+target_delta_p_inactive_comm_mean: 0.0
+target_delta_p_inactive_nonzero_ratio: 0.0
+target_delta_p_sensing_mean: 0.5016000271
+target_delta_p_total_per_uav_mean: 0.9999971986
+target_delta_p_total_per_uav_std: 0.0000649001
+```
+
+val100（独立 `seed=2026`）：
+
+```text
+target_delta_p_per_dim_std_mean: 0.0673355162
+target_delta_p_active_comm_mean: 0.1000996977
+target_delta_p_inactive_comm_mean: 0.0
+target_delta_p_inactive_nonzero_ratio: 0.0
+target_delta_p_sensing_mean: 0.4995000064
+target_delta_p_total_per_uav_mean: 0.9999984503
+target_delta_p_total_per_uav_std: 0.0000640142
+```
+
+判定：
+
+```text
+PASS: 功率标签具有非零跨环境变化；
+PASS: 未关联通信功率严格为 0；
+PASS: 每架 UAV 的 oracle 总功率约为 P_max=1；
+PASS: train500 与独立 val100 的 active/sensing/total 分布高度一致。
+```
+
+因此历史 p 常数坍缩不能归因于 oracle 标签单一或 train/validation
+分布偏移。修复 PowerProjection 的无条件下界及重新平衡功率损失是必要的。
+当前只剩服务器单元测试 gate；通过后进入 P-only 初始化基线与训练。
