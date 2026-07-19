@@ -1,6 +1,6 @@
 ---
 type: log
-status: fixed_residual_preflight_complete_joint_warmstart_selected
+status: q2_gradient_bottleneck_found_q3_replacement_implemented
 stage: multimodal_direct_q_direction
 last_updated: 2026-07-19
 ---

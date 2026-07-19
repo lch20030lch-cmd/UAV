@@ -56,6 +56,13 @@ def _grad_norm(parameters) -> float:
     return total ** 0.5
 
 
+def _parameter_norm(parameters) -> float:
+    total = 0.0
+    for param in parameters:
+        total += param.detach().float().norm().item() ** 2
+    return total ** 0.5
+
+
 def _save_mm_smoke(model, save_dir: Path, metadata: dict, save_lora: bool = False):
     save_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.projection_head.state_dict(), save_dir / "projection_head.pt")
@@ -67,8 +74,8 @@ def _save_mm_smoke(model, save_dir: Path, metadata: dict, save_lora: bool = Fals
         json.dump(metadata, f, indent=2)
 
 
-def _resolve_lora_checkpoint(init_checkpoint: str, train_lora: bool):
-    if not init_checkpoint or not train_lora:
+def _resolve_lora_checkpoint(init_checkpoint: str, enable_lora: bool):
+    if not init_checkpoint or not enable_lora:
         return None
     candidate = Path(init_checkpoint) / "lora"
     if (candidate / "adapter_config.json").exists():
@@ -133,6 +140,7 @@ def train_mm_sft_smoke(
     max_length: int = None,
     output_dir: str = None,
     train_lora: bool = False,
+    load_lora: bool = False,
     lambda_assoc_ce: float = None,
     lambda_q: float = None,
     lambda_a: float = None,
@@ -148,7 +156,6 @@ def train_mm_sft_smoke(
     projection_head_type: str = None,
     q_projection_mode: str = None,
     q_geometry_mode: str = None,
-    power_assoc_gate_strength: float = None,
     freeze_assoc_branch: bool = False,
     freeze_qp_branch: bool = False,
     freeze_all_except_q: bool = False,
@@ -173,7 +180,12 @@ def train_mm_sft_smoke(
     out_root = Path(output_dir or cfg.get("output_dir", "/root/autodl-tmp/outputs/mm_smoke"))
     ckpt_root = Path(cfg.get("checkpoint_dir", "/root/autodl-tmp/checkpoints/mm_smoke"))
     ckpt_root.mkdir(parents=True, exist_ok=True)
-    init_lora_checkpoint = _resolve_lora_checkpoint(init_checkpoint, train_lora)
+    lora_enabled = bool(train_lora or load_lora)
+    init_lora_checkpoint = _resolve_lora_checkpoint(init_checkpoint, lora_enabled)
+    if load_lora and init_lora_checkpoint is None:
+        raise FileNotFoundError(
+            "--load_lora requires --init_checkpoint containing lora/adapter_config.json"
+        )
 
     print("=" * 60)
     print("BEV-image multimodal SFT smoke")
@@ -182,7 +194,13 @@ def train_mm_sft_smoke(
     print(f"  model:      {model_name}")
     print(f"  max_length: {max_seq_length}")
     print(f"  steps:      {steps_limit}")
-    print(f"  trainable:  {'projection_head + LoRA' if train_lora else 'projection_head only'}")
+    if train_lora:
+        trainable_label = "projection_head + LoRA"
+    elif load_lora:
+        trainable_label = "projection_head (loaded LoRA frozen)"
+    else:
+        trainable_label = "projection_head only"
+    print(f"  trainable:  {trainable_label}")
     print()
 
     proj_head_config = build_proj_head_config(model_cfg, sim_cfg)
@@ -192,12 +210,9 @@ def train_mm_sft_smoke(
         proj_head_config["q_projection_mode"] = q_projection_mode
     if q_geometry_mode is not None:
         proj_head_config["q_geometry_mode"] = q_geometry_mode
-    if power_assoc_gate_strength is not None:
-        proj_head_config["power_assoc_gate_strength"] = float(power_assoc_gate_strength)
     head_type = proj_head_config.get("head_type", "shared")
     q_mode = proj_head_config.get("q_projection_mode", "clip")
     q_geom_mode = proj_head_config.get("q_geometry_mode", "none")
-    p_assoc_gate_strength = float(proj_head_config.get("power_assoc_gate_strength", 0.0))
     freeze_modes = (
         freeze_assoc_branch,
         freeze_qp_branch,
@@ -217,7 +232,7 @@ def train_mm_sft_smoke(
         proj_head_config=proj_head_config,
         attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
         freeze_vision_tower=model_cfg.get("freeze_vision_tower", True),
-        enable_lora=train_lora,
+        enable_lora=lora_enabled,
         lora_rank=model_cfg["lora"]["rank"],
         lora_alpha=model_cfg["lora"]["alpha"],
         lora_dropout=model_cfg["lora"].get("dropout", 0.0),
@@ -248,7 +263,7 @@ def train_mm_sft_smoke(
     elif freeze_all_except_q:
         frozen_projection_branches, trainable_projection_branches = _freeze_projection_except(
             model,
-            trainable_prefixes=("readout_q", "q_mlp", "q_residual_gate_logit"),
+            trainable_prefixes=("readout_q", "q_mlp", "q_residual_adapter"),
         )
         isolated_projection_branch = "q"
     elif freeze_all_except_q_cue:
@@ -337,7 +352,7 @@ def train_mm_sft_smoke(
         lambda_p_raw_kl=lambda_p_raw_kl_value,
         power_temperature=float(model_cfg["projection_head"]["tau_power"]),
     )
-    # 默认只训练投影头；传入 --train_lora 时，PEFT 会额外打开 LoRA 参数。
+    # 默认只训练投影头；--load_lora 只加载并冻结 adapter，--train_lora 才更新它。
     proj_params = [p for p in model.projection_head.parameters() if p.requires_grad]
     lora_params = [
         p for n, p in model.base_model.named_parameters()
@@ -366,7 +381,6 @@ def train_mm_sft_smoke(
     print(f"  projection head type:         {head_type}")
     print(f"  q projection mode:            {q_mode}")
     print(f"  q geometry mode:              {q_geom_mode}")
-    print(f"  power association gate:       {p_assoc_gate_strength}")
     print(f"  frozen projection tensors:    {len(frozen_projection_branches)}")
     print(f"  isolated projection branch:  {isolated_projection_branch or 'none'}")
     print(f"  isolated trainable tensors:   {len(trainable_projection_branches)}")
@@ -444,19 +458,25 @@ def train_mm_sft_smoke(
                 metrics["delta_p_inactive_leakage"] = float(
                     inactive_power.mean().item() if inactive_power.numel() else 0.0
                 )
-                metrics["q_residual_gate"] = float(
-                    outputs["q_residual_gate"].float().item()
-                    if "q_residual_gate" in outputs
-                    else 0.0
-                )
 
             optimizer.zero_grad(set_to_none=True)
             total_loss.backward()
             grad_norm = _grad_norm(model.projection_head.parameters())
             grad_norm_lora = _grad_norm(lora_params) if train_lora else 0.0
+            q_residual_adapter = getattr(model.projection_head, "q_residual_adapter", None)
+            grad_norm_q_residual = (
+                _grad_norm(q_residual_adapter.parameters())
+                if q_residual_adapter is not None
+                else 0.0
+            )
             clip_params = list(model.projection_head.parameters()) + lora_params
             torch.nn.utils.clip_grad_norm_(clip_params, cfg["hardware"].get("max_grad_norm", 1.0))
             optimizer.step()
+            q_residual_adapter_norm = (
+                _parameter_norm(q_residual_adapter.parameters())
+                if q_residual_adapter is not None
+                else 0.0
+            )
 
             global_step += 1
             pbar.update(1)
@@ -476,9 +496,10 @@ def train_mm_sft_smoke(
                 f"loss_p_sensing={metrics['loss_p_sensing']:.6f} "
                 f"delta_p_entropy={metrics['delta_p_entropy']:.6f} "
                 f"delta_p_inactive_leakage={metrics['delta_p_inactive_leakage']:.6f} "
-                f"q_residual_gate={metrics['q_residual_gate']:.6f} "
                 f"grad_norm_proj={grad_norm:.6f} "
-                f"grad_norm_lora={grad_norm_lora:.6f}"
+                f"grad_norm_lora={grad_norm_lora:.6f} "
+                f"grad_norm_q_residual={grad_norm_q_residual:.6f} "
+                f"q_residual_adapter_norm={q_residual_adapter_norm:.6f}"
             )
 
             if torch.isnan(total_loss):
@@ -487,24 +508,25 @@ def train_mm_sft_smoke(
             if global_step % train_cfg.get("save_steps", 10) == 0:
                 _save_mm_smoke(
                     model,
-                    ckpt_root / f"mm_sft_{'lora_' if train_lora else ''}smoke_step_{global_step}",
+                    ckpt_root / f"mm_sft_{'lora_' if lora_enabled else ''}smoke_step_{global_step}",
                     {
                         "global_step": global_step,
                         "loss_ctl": metrics["loss_ctl"],
                         "loss_total": metrics["loss_total"],
                         "grad_norm_proj": grad_norm,
                         "grad_norm_lora": grad_norm_lora,
-                        "trainable": "projection_head_lora" if train_lora else "projection_head_only",
+                        "trainable": trainable_label,
+                        "train_lora": train_lora,
+                        "load_lora": load_lora,
                         "projection_lr": proj_lr,
                         "lora_lr": lora_lr if train_lora else 0.0,
-                        "lora_rank": model_cfg["lora"]["rank"] if train_lora else 0,
-                        "lora_alpha": model_cfg["lora"]["alpha"] if train_lora else 0,
+                        "lora_rank": model_cfg["lora"]["rank"] if lora_enabled else 0,
+                        "lora_alpha": model_cfg["lora"]["alpha"] if lora_enabled else 0,
                         "projection_head_type": head_type,
                         "q_projection_mode": q_mode,
                         "q_geometry_mode": q_geom_mode,
                         "q_fixed_cue_weights": proj_head_config.get("q_fixed_cue_weights"),
-                        "q_residual_max_scale": proj_head_config.get("q_residual_max_scale", 1.0),
-                        "power_assoc_gate_strength": p_assoc_gate_strength,
+                        "q_residual_max_scale": proj_head_config.get("q_residual_max_scale", 0.5),
                         "freeze_assoc_branch": freeze_assoc_branch,
                         "freeze_qp_branch": freeze_qp_branch,
                         "freeze_all_except_q": freeze_all_except_q,
@@ -527,12 +549,12 @@ def train_mm_sft_smoke(
                         "lambda_assoc_raw_ce": assoc_raw_ce_weight,
                         "loaded_init": loaded_init,
                     },
-                    save_lora=train_lora,
+                    save_lora=lora_enabled,
                 )
 
     pbar.close()
 
-    final_dir = out_root / ("mm_sft_lora_smoke_final" if train_lora else "mm_sft_smoke_final")
+    final_dir = out_root / ("mm_sft_lora_smoke_final" if lora_enabled else "mm_sft_smoke_final")
     _save_mm_smoke(
         model,
         final_dir,
@@ -540,17 +562,18 @@ def train_mm_sft_smoke(
             "global_step": global_step,
             "max_steps": steps_limit,
             "max_seq_length": max_seq_length,
-            "trainable": "projection_head_lora" if train_lora else "projection_head_only",
+            "trainable": trainable_label,
+            "train_lora": train_lora,
+            "load_lora": load_lora,
             "projection_lr": proj_lr,
             "lora_lr": lora_lr if train_lora else 0.0,
-            "lora_rank": model_cfg["lora"]["rank"] if train_lora else 0,
-            "lora_alpha": model_cfg["lora"]["alpha"] if train_lora else 0,
+            "lora_rank": model_cfg["lora"]["rank"] if lora_enabled else 0,
+            "lora_alpha": model_cfg["lora"]["alpha"] if lora_enabled else 0,
             "projection_head_type": head_type,
             "q_projection_mode": q_mode,
             "q_geometry_mode": q_geom_mode,
             "q_fixed_cue_weights": proj_head_config.get("q_fixed_cue_weights"),
-            "q_residual_max_scale": proj_head_config.get("q_residual_max_scale", 1.0),
-            "power_assoc_gate_strength": p_assoc_gate_strength,
+            "q_residual_max_scale": proj_head_config.get("q_residual_max_scale", 0.5),
             "freeze_assoc_branch": freeze_assoc_branch,
             "freeze_qp_branch": freeze_qp_branch,
             "freeze_all_except_q": freeze_all_except_q,
@@ -573,7 +596,7 @@ def train_mm_sft_smoke(
             "lambda_assoc_raw_ce": assoc_raw_ce_weight,
             "loaded_init": loaded_init,
         },
-        save_lora=train_lora,
+        save_lora=lora_enabled,
     )
     print()
     print("OK: multimodal SFT smoke complete")
@@ -589,6 +612,11 @@ if __name__ == "__main__":
     parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--train_lora", action="store_true")
+    parser.add_argument(
+        "--load_lora",
+        action="store_true",
+        help="从 init checkpoint 加载 LoRA 但保持冻结，用于隔离 projection smoke",
+    )
     parser.add_argument("--lambda_assoc_ce", type=float, default=None,
                         help="可选 association 分类辅助损失权重，默认使用配置或 0")
     parser.add_argument("--lambda_assoc_raw_ce", type=float, default=None,
@@ -624,12 +652,6 @@ if __name__ == "__main__":
         default=None,
         help="可选：动态 cue_xy，或 train-only 固定几何先验加受限残差 fixed_residual_xy",
     )
-    parser.add_argument(
-        "--power_assoc_gate_strength",
-        type=float,
-        default=None,
-        help="可选：PowerProjection 的可微 association log-gate 强度；0 表示关闭",
-    )
     parser.add_argument("--freeze_assoc_branch", action="store_true",
                         help="split head 下冻结 association 分支，主要用于 Stage B2 训练 q/p")
     parser.add_argument("--freeze_qp_branch", action="store_true",
@@ -650,6 +672,7 @@ if __name__ == "__main__":
         max_length=args.max_length,
         output_dir=args.output_dir,
         train_lora=args.train_lora,
+        load_lora=args.load_lora,
         lambda_assoc_ce=args.lambda_assoc_ce,
         lambda_q=args.lambda_q,
         lambda_a=args.lambda_a,
@@ -665,7 +688,6 @@ if __name__ == "__main__":
         projection_head_type=args.projection_head_type,
         q_projection_mode=args.q_projection_mode,
         q_geometry_mode=args.q_geometry_mode,
-        power_assoc_gate_strength=args.power_assoc_gate_strength,
         freeze_assoc_branch=args.freeze_assoc_branch,
         freeze_qp_branch=args.freeze_qp_branch,
         freeze_all_except_q=args.freeze_all_except_q,

@@ -19,8 +19,6 @@ h_Φ(Z_c) → δ̂ = [Proj_Q(δ̃_q'), Proj_A(δ̃_a'), Proj_P(δ̃_p')]
   Proj_A: Sinkhorn + 容量     (capacitated transport)
 """
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -220,25 +218,13 @@ class PowerProjection(nn.Module):
     避免给未关联用户强制分配功率。默认关闭该可选下界，由下游 SCA-FP
     对关联条件下的最小用户功率做最终可行化。
 
-    可选 ``association_gate_strength > 0`` 时，在 softmax 前对通信概率乘以
-    ``association ** strength``。它保持可微且不做硬掩码，适合关联读出尚不够
-    准确时做保守的 P/A 耦合；默认 0 完全保持旧路径。
     """
 
-    def __init__(
-        self,
-        p_max: float = 1.0,
-        tau: float = 0.5,
-        p_min_ratio: float = 0.0,
-        association_gate_strength: float = 0.0,
-    ):
+    def __init__(self, p_max: float = 1.0, tau: float = 0.5, p_min_ratio: float = 0.0):
         super().__init__()
-        if association_gate_strength < 0:
-            raise ValueError("association_gate_strength must be non-negative")
         self.register_buffer("p_max", torch.tensor(p_max))
         self.p_min = p_min_ratio * p_max  # absolute floor
         self.tau = tau
-        self.association_gate_strength = float(association_gate_strength)
 
     def forward(
         self,
@@ -257,29 +243,8 @@ class PowerProjection(nn.Module):
         B, M, D = p_tilde.shape
         K_comm = D - 1  # number of communication users
 
-        power_logits = p_tilde / self.tau
-        if self.association_gate_strength > 0:
-            if association is None:
-                raise ValueError(
-                    "PowerProjection with association_gate_strength > 0 requires association weights."
-                )
-            if association.shape != p_tilde.shape[:-1] + (K_comm,):
-                raise ValueError(
-                    "association must align with communication power entries: "
-                    f"expected {p_tilde.shape[:-1] + (K_comm,)}, got {tuple(association.shape)}"
-                )
-            assoc = association.to(device=p_tilde.device, dtype=p_tilde.dtype).clamp(1e-6, 1.0)
-            gated_comm_logits = (
-                power_logits[..., :K_comm]
-                + self.association_gate_strength * torch.log(assoc)
-            )
-            power_logits = torch.cat(
-                [gated_comm_logits, power_logits[..., K_comm:]],
-                dim=-1,
-            )
-
         # softmax 归一化 (沿最后一维, 即 UAV 内部)
-        p_soft = F.softmax(power_logits, dim=-1)  # (B, M, D)
+        p_soft = F.softmax(p_tilde / self.tau, dim=-1)  # (B, M, D)
 
         # 缩放到功率预算
         p_hat = self.p_max * p_soft
@@ -427,9 +392,7 @@ class ConstraintProjectionHead(nn.Module):
         q_projection_mode: str = "clip",
         q_geometry_mode: str = "none",
         q_fixed_cue_weights: list = None,
-        q_residual_max_scale: float = 1.0,
-        q_residual_gate_init: float = 0.05,
-        power_assoc_gate_strength: float = 0.0,
+        q_residual_max_scale: float = 0.5,
     ):
         super().__init__()
         self.M = M
@@ -444,8 +407,6 @@ class ConstraintProjectionHead(nn.Module):
             raise ValueError("fixed_residual_xy requires q_projection_mode='direction'")
         if q_residual_max_scale <= 0:
             raise ValueError("q_residual_max_scale must be positive")
-        if not 0 < q_residual_gate_init < 1:
-            raise ValueError("q_residual_gate_init must be strictly between 0 and 1")
         self.head_type = head_type
         self.q_projection_mode = q_projection_mode
         self.q_geometry_mode = q_geometry_mode
@@ -464,10 +425,9 @@ class ConstraintProjectionHead(nn.Module):
         normalized_fixed_weights = fixed_weights_tensor / fixed_weights_tensor.sum()
         if q_geometry_mode == "fixed_residual_xy":
             self.register_buffer("q_fixed_cue_weights", normalized_fixed_weights)
-            gate_logit = math.log(q_residual_gate_init / (1.0 - q_residual_gate_init))
-            self.q_residual_gate_logit = nn.Parameter(
-                torch.tensor(gate_logit, dtype=torch.float32)
-            )
+            self.q_residual_adapter = nn.Linear(3, 3)
+            nn.init.zeros_(self.q_residual_adapter.weight)
+            nn.init.zeros_(self.q_residual_adapter.bias)
         else:
             # Keep old checkpoint state_dicts unchanged when the new geometry mode is unused.
             self.register_buffer(
@@ -475,7 +435,7 @@ class ConstraintProjectionHead(nn.Module):
                 normalized_fixed_weights,
                 persistent=False,
             )
-            self.register_parameter("q_residual_gate_logit", None)
+            self.q_residual_adapter = None
 
         # 读出维度 = M*3 (位移) + M*K (关联) + M*(K+1) (功率)
         self.q_dim = M * 3
@@ -503,11 +463,7 @@ class ConstraintProjectionHead(nn.Module):
         # 投影模块
         self.proj_q = DeploymentProjection(area_w, area_h, h_min, h_max, v_max_dt)
         self.proj_a = AssociationProjection(K_max, tau_assoc, sinkhorn_iters)
-        self.proj_p = PowerProjection(
-            p_max,
-            tau_power,
-            association_gate_strength=power_assoc_gate_strength,
-        )
+        self.proj_p = PowerProjection(p_max, tau_power)
 
     def _unflatten(self, delta_flat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -568,12 +524,9 @@ class ConstraintProjectionHead(nn.Module):
             fixed_xy = torch.sum(weights.view(1, 1, 3, 1) * cues, dim=2)
             fixed_xy = F.normalize(fixed_xy, p=2, dim=-1, eps=1e-6)
             fixed_direction = torch.cat([fixed_xy, torch.zeros_like(fixed_xy[..., :1])], dim=-1)
-            residual_direction = F.normalize(delta_q_raw, p=2, dim=-1, eps=1e-6)
-            residual_gate = self.q_residual_max_scale * torch.sigmoid(
-                self.q_residual_gate_logit.to(dtype=delta_q_raw.dtype)
-            )
+            residual = torch.tanh(self.q_residual_adapter(delta_q_raw))
             combined_direction = F.normalize(
-                fixed_direction + residual_gate * residual_direction,
+                fixed_direction + self.q_residual_max_scale * residual,
                 p=2,
                 dim=-1,
                 eps=1e-6,
@@ -652,8 +605,5 @@ class ConstraintProjectionHead(nn.Module):
             result["q_cue_logits"] = q_cue_logits
             result["q_cue_weights"] = q_cue_weights
         if self.q_geometry_mode == "fixed_residual_xy":
-            result["q_residual_gate"] = self.q_residual_max_scale * torch.sigmoid(
-                self.q_residual_gate_logit
-            )
             result["q_fixed_cue_weights"] = self.q_fixed_cue_weights
         return result

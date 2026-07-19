@@ -1,7 +1,6 @@
 import unittest
 
 import torch.nn as nn
-import torch
 
 from src.training.train_sft_mm import _freeze_projection_except
 
@@ -12,7 +11,7 @@ class _DummyProjectionHead(nn.Module):
         self.readout_q = nn.Linear(2, 2)
         self.q_mlp = nn.Linear(2, 2)
         self.readout_q_cue = nn.Linear(2, 2)
-        self.q_residual_gate_logit = nn.Parameter(torch.tensor(0.0))
+        self.q_residual_adapter = nn.Linear(2, 2)
         self.readout_a = nn.Linear(2, 2)
         self.a_mlp = nn.Linear(2, 2)
         self.readout_p = nn.Linear(2, 2)
@@ -31,7 +30,7 @@ class ProjectionBranchFreezeTest(unittest.TestCase):
 
         frozen, trainable = _freeze_projection_except(
             model,
-            trainable_prefixes=("readout_q", "q_mlp", "q_residual_gate_logit"),
+            trainable_prefixes=("readout_q", "q_mlp", "q_residual_adapter"),
         )
 
         expected_trainable = {
@@ -40,7 +39,11 @@ class ProjectionBranchFreezeTest(unittest.TestCase):
             if name.startswith(("readout_q", "q_mlp"))
             and not name.startswith("readout_q_cue")
         }
-        expected_trainable.add("q_residual_gate_logit")
+        expected_trainable.update(
+            name
+            for name, _ in model.projection_head.named_parameters()
+            if name.startswith("q_residual_adapter")
+        )
         actual_trainable = {
             name
             for name, parameter in model.projection_head.named_parameters()
