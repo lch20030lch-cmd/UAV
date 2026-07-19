@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 """
-分析 SFT 数据集中 Prompt+Response 的真实 Token 长度分布
+分析 SFT 数据集的真实 Token 长度分布。
+
+多模态 control-only 模式使用 AutoProcessor + 实际 BEV 图像展开 image tokens；
+不能用纯 tokenizer 长度推断 Gemma3 多模态 max_length。
 
 如果大部分样本 << 4096, 砍短 max_seq_length 可大幅提速
 (注意力计算与序列长度呈超线性增长)
@@ -21,7 +24,16 @@ os.environ["TORCH_COMPILE_DISABLE"] = "1"
 
 import numpy as np
 from pathlib import Path
-from transformers import AutoTokenizer
+from PIL import Image
+from transformers import AutoProcessor, AutoTokenizer
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.data.multimodal_dataset import (
+    _encode_text_image,
+    ensure_one_image_token,
+)
 
 
 def analyze(
@@ -31,10 +43,6 @@ def analyze(
     num_control_tokens: int = 8,
     current_max_length: int = 4096,
 ):
-    # ---- 加载 tokenizer ----
-    print(f"Loading tokenizer from {model_name}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-
     # ---- 加载数据 ----
     print(f"Loading dataset from {data_path}...")
     samples = []
@@ -44,11 +52,31 @@ def analyze(
 
     print(f"Total samples: {len(samples)}")
 
+    use_multimodal_processor = bool(
+        control_only
+        and samples
+        and all(sample.get("bev_image_path") for sample in samples)
+    )
+    processor = None
+    if use_multimodal_processor:
+        print(f"Loading multimodal processor from {model_name}...")
+        processor = AutoProcessor.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+        )
+        tokenizer = processor.tokenizer
+        print("Length backend: multimodal processor + actual BEV images")
+    else:
+        print(f"Loading tokenizer from {model_name}...")
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        print("Length backend: tokenizer-only text estimate")
+
     # ---- 统计 ----
     lengths = []
     prompt_lengths = []
     response_lengths = []
 
+    data_root = Path(data_path).resolve().parent
     for s in samples:
         # prompt: instruction + control part
         prompt_text = s.get("prompt", "")
@@ -58,8 +86,25 @@ def analyze(
         full_text = prompt_text + response_text
 
         full_len = len(tokenizer.encode(full_text, add_special_tokens=True))
-        prompt_len = len(tokenizer.encode(prompt_text, add_special_tokens=True))
+        if use_multimodal_processor:
+            image_path = data_root / s["bev_image_path"]
+            with Image.open(image_path) as image_handle:
+                image = image_handle.convert("RGB")
+                prompt = ensure_one_image_token(processor, prompt_text)
+                encoded = _encode_text_image(
+                    processor,
+                    prompt,
+                    image,
+                    max_length=None,
+                )
+            prompt_len = int(encoded["input_ids"].shape[-1])
+        else:
+            prompt_len = len(tokenizer.encode(prompt_text, add_special_tokens=True))
         resp_len = full_len - prompt_len
+        if use_multimodal_processor:
+            # Response is not passed to the current control-loss model. Keep its
+            # text-only length as a separate informational field.
+            resp_len = len(tokenizer.encode(response_text, add_special_tokens=False))
 
         lengths.append(
             prompt_len + num_control_tokens if control_only else full_len
@@ -73,7 +118,11 @@ def analyze(
 
     # ---- 报告 ----
     print("\n" + "=" * 60)
-    mode = "Prompt + control tokens" if control_only else "Prompt + Response"
+    mode = (
+        "Multimodal prompt + control tokens"
+        if use_multimodal_processor
+        else ("Prompt + control tokens" if control_only else "Prompt + Response")
+    )
     print(f"  Token 长度分布 ({mode})")
     print("=" * 60)
     print(f"  Samples:     {len(lengths)}")

@@ -41,20 +41,28 @@ def ensure_one_image_token(processor, prompt: str) -> str:
     return f"{image_token}\n{prompt}"
 
 
-def _encode_text_image(processor, prompt: str, image, max_length: int) -> Dict:
+def _encode_text_image(
+    processor,
+    prompt: str,
+    image,
+    max_length: int = None,
+) -> Dict:
+    """Encode one multimodal prompt without truncating through image tokens."""
     kwargs = {
         "text": prompt,
         "images": image,
         "return_tensors": "pt",
-        "truncation": True,
-        "max_length": max_length,
     }
-    try:
-        return processor(**kwargs)
-    except TypeError:
-        kwargs.pop("truncation", None)
-        kwargs.pop("max_length", None)
-        return processor(**kwargs)
+    encoded = processor(**kwargs)
+    input_length = int(encoded["input_ids"].shape[-1])
+    if max_length is not None and input_length > int(max_length):
+        raise ValueError(
+            "Encoded multimodal prompt exceeds the reserved prompt budget: "
+            f"encoded_length={input_length}, prompt_budget={max_length}. "
+            "Increase max_length or compact the prompt; multimodal image tokens "
+            "must not be truncated."
+        )
+    return encoded
 
 
 def _squeeze_batch(encoded: Dict) -> Dict:

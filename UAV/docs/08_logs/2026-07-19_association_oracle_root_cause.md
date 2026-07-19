@@ -1,6 +1,6 @@
 ---
 type: log
-status: corrected_compact_500_100_validated_a_lora_baseline_pending
+status: multimodal_length_analysis_fix_server_test_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -518,7 +518,7 @@ A dominant ratio mean                 0.2673        0.2975
 train/val 分布接近；P std 的约 6.9% 差异可由较小验证集和 sensing 比例波动解释，未伴随
 inactive leakage 或预算异常。
 
-control-only 序列长度：
+首次 control-only 序列长度（tokenizer-only 估计，不能用于多模态 max_length 决策）：
 
 ```text
                     train500    val100
@@ -527,9 +527,33 @@ min/mean/max        2382/2406/2437  2383/2406/2427
 <=3072              500/500         100/100
 ```
 
-判定：数据集通过训练前验收。后续 `max_length=2560`，不截断任何样本，并相对3072获得
-约 1.4x 的注意力计算加速。启动 A+LoRA 前先用 selected Q checkpoint 在完整
-corrected train500/val100 上记录 Q/A/P 基线。
+完整性和 target 分布验收通过；这里给出的长度不包含 Gemma3 processor 展开的完整 image
+token 序列，因此撤销“`max_length=2560` 安全”的结论。
+
+## 2560 多模态长度误判与修复
+
+selected-Q 全量基线在 train 第 2 条、val 第 6 条分别失败：
+
+```text
+ValueError: Mismatch in image token count between text and input_ids
+train: ids=247, text=256
+val:   ids=254, text=256
+```
+
+根因：旧 `analyze_seq_len.py --control-only` 只调用 tokenizer，并未将实际 BEV 图像交给
+Gemma3 `AutoProcessor`。它低估了 processor 展开 image tokens 后的序列长度；随后
+`prompt_budget=2552` 触发 processor truncation，截掉部分 image tokens。
+
+修复：
+
+1. `MultimodalSFTDataset` 不再让 processor 对多模态 prompt 做不安全的 token 截断；
+2. 先无截断编码，若真实 prompt 超过预留预算，抛出包含 encoded length/prompt budget 的
+   明确错误，禁止切穿 image-token block；
+3. `analyze_seq_len.py` 在 control-only 且存在 BEV 图片时，使用 `AutoProcessor + 实际图片`
+   统计真实长度；纯 tokenizer 只保留为文本估计；
+4. 新增测试覆盖“超预算拒绝”和“刚好适配预算”两种情况；
+5. 当前基线恢复使用已经验证过的 `max_length=3072`。失败任务只处理了 2/500 与 6/100，
+   尚未写出 JSON/NPZ，不需要清理 checkpoint。
 
 ## 对现有数据与 Q checkpoint 的影响边界
 

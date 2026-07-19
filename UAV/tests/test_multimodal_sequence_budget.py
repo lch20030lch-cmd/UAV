@@ -1,6 +1,21 @@
 import unittest
 
-from src.data.multimodal_dataset import _compute_prompt_budget
+import torch
+
+from src.data.multimodal_dataset import (
+    _compute_prompt_budget,
+    _encode_text_image,
+)
+
+
+class _FakeProcessor:
+    def __init__(self, encoded_length):
+        self.encoded_length = encoded_length
+
+    def __call__(self, **kwargs):
+        return {
+            "input_ids": torch.ones((1, self.encoded_length), dtype=torch.long),
+        }
 
 
 class MultimodalSequenceBudgetTest(unittest.TestCase):
@@ -13,6 +28,22 @@ class MultimodalSequenceBudgetTest(unittest.TestCase):
     def test_impossible_budget_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "cannot fit reserved"):
             _compute_prompt_budget(8, 8, 0)
+
+    def test_multimodal_encoding_rejects_image_unsafe_truncation(self):
+        processor = _FakeProcessor(encoded_length=11)
+
+        with self.assertRaisesRegex(ValueError, "must not be truncated"):
+            _encode_text_image(processor, "prompt", object(), max_length=10)
+
+    def test_multimodal_encoding_accepts_prompt_that_fits_budget(self):
+        encoded = _encode_text_image(
+            _FakeProcessor(encoded_length=10),
+            "prompt",
+            object(),
+            max_length=10,
+        )
+
+        self.assertEqual(tuple(encoded["input_ids"].shape), (1, 10))
 
 
 if __name__ == "__main__":
