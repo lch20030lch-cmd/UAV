@@ -1,6 +1,6 @@
 ---
 type: log
-status: independent_gradient_clipping_server_test_pending
+status: independent_gradient_clipping_controlled_rerun_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -769,3 +769,22 @@ loss, data, or checkpoint format was changed.
 Before repeating A8, run the unit test and a two-update clean selected-Q smoke. Its
 first step must show projection post-clip equal to projection pre-clip while LoRA is
 independently limited to 1.0.
+
+## Independent-clipping real-model verification
+
+The clean selected-Q two-update smoke confirms the fix on the real Gemma/LoRA path:
+
+```text
+step 1 projection pre/post: 0.249436 / 0.249436
+step 1 LoRA pre/post:       7.355278 / 1.000000
+step 2 projection pre/post: 0.912840 / 0.912840
+step 2 LoRA pre/post:       33.135729 / 1.000000
+Q residual grad:            0.0
+```
+
+The safe projection gradient is no longer suppressed, and the oversized LoRA group
+is independently bounded. Step-to-step loss values use different shuffled groups of
+eight environments, so the step2 loss increase alone is not a fixed-batch regression
+measurement. The next controlled test repeats the 50-update A8 configuration from
+the same clean selected-Q checkpoint with the clipping implementation as the only
+changed variable. No learning-rate or architecture change is allowed in that run.
