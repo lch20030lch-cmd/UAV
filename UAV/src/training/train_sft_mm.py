@@ -132,16 +132,6 @@ def _freeze_projection_except(model, trainable_prefixes):
     return frozen, trainable
 
 
-_QP_PROJECTION_BRANCH_PREFIXES = (
-    "readout_q",
-    "q_mlp",
-    "readout_q_cue",
-    "q_residual_adapter",
-    "readout_p",
-    "p_mlp",
-)
-
-
 def train_mm_sft_smoke(
     config_path: str,
     data_dir: str = None,
@@ -301,11 +291,13 @@ def train_mm_sft_smoke(
             trainable=False,
         )
     elif freeze_qp_branch:
-        frozen_projection_branches = _set_projection_branch_trainable(
-            model,
-            branch_prefixes=_QP_PROJECTION_BRANCH_PREFIXES,
-            trainable=False,
+        (
+            frozen_projection_branches,
+            trainable_projection_branches,
+        ) = _freeze_projection_except(
+            model, trainable_prefixes=("readout_a", "a_mlp")
         )
+        isolated_projection_branch = "association"
 
     dataset = MultimodalSFTDataset(
         data_path=str(sft_path),

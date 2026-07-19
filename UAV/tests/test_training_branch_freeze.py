@@ -2,11 +2,7 @@ import unittest
 
 import torch.nn as nn
 
-from src.training.train_sft_mm import (
-    _freeze_projection_except,
-    _QP_PROJECTION_BRANCH_PREFIXES,
-    _set_projection_branch_trainable,
-)
+from src.training.train_sft_mm import _freeze_projection_except
 
 
 class _DummyProjectionHead(nn.Module):
@@ -32,10 +28,9 @@ class ProjectionBranchFreezeTest(unittest.TestCase):
     def test_qp_freeze_includes_fixed_geometry_residual_adapter(self):
         model = _DummyModel()
 
-        _set_projection_branch_trainable(
+        frozen, trainable = _freeze_projection_except(
             model,
-            branch_prefixes=_QP_PROJECTION_BRANCH_PREFIXES,
-            trainable=False,
+            trainable_prefixes=("readout_a", "a_mlp"),
         )
 
         actual_trainable = {
@@ -49,6 +44,8 @@ class ProjectionBranchFreezeTest(unittest.TestCase):
             if name.startswith(("readout_a", "a_mlp"))
         }
         self.assertEqual(actual_trainable, expected_trainable)
+        self.assertEqual(set(trainable), expected_trainable)
+        self.assertTrue(set(frozen).isdisjoint(expected_trainable))
 
     def test_direct_q_isolation_only_keeps_q_readout_and_mlp_trainable(self):
         model = _DummyModel()
