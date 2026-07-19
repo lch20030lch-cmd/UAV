@@ -2,7 +2,10 @@ import unittest
 
 import numpy as np
 
-from scripts.analyze_mm_delta_outputs import _summarize_association_alignment
+from scripts.analyze_mm_delta_outputs import (
+    _summarize_association_alignment,
+    _summarize_q_alignment,
+)
 
 
 class AssociationAlignmentDiagnosticTest(unittest.TestCase):
@@ -36,6 +39,32 @@ class AssociationAlignmentDiagnosticTest(unittest.TestCase):
             _summarize_association_alignment(
                 np.zeros((2, 4, 3), dtype=np.float32),
                 np.zeros((2, 4, 2), dtype=np.float32),
+            )
+
+
+class QAlignmentDiagnosticTest(unittest.TestCase):
+    def test_exact_boundary_direction_reports_perfect_alignment(self):
+        prediction = np.array(
+            [
+                [[15.0, 0.0, 0.0], [0.0, 12.0, 9.0]],
+                [[-15.0, 0.0, 0.0], [0.0, -12.0, -9.0]],
+            ],
+            dtype=np.float32,
+        )
+
+        summary = _summarize_q_alignment(prediction, prediction, q_max_norm=15.0)
+
+        self.assertAlmostEqual(summary["delta_q_norm_mean"], 15.0)
+        self.assertAlmostEqual(summary["delta_q_norm_mae"], 0.0)
+        self.assertAlmostEqual(summary["delta_q_vs_target_3d_cosine_mean"], 1.0)
+        self.assertAlmostEqual(summary["delta_q_near_max_radius_ratio"], 1.0)
+        self.assertAlmostEqual(summary["delta_q_mobility_violation_ratio"], 0.0)
+
+    def test_rejects_q_shape_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "shapes differ"):
+            _summarize_q_alignment(
+                np.zeros((2, 4, 3), dtype=np.float32),
+                np.zeros((1, 4, 3), dtype=np.float32),
             )
 
 

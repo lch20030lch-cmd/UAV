@@ -118,6 +118,64 @@ def _summarize_association_alignment(
     }
 
 
+def _summarize_q_alignment(
+    delta_q: np.ndarray,
+    delta_q_target: np.ndarray,
+    q_max_norm: float = None,
+) -> Dict:
+    """统计投影后 Q 的方向、位移范数与移动约束。"""
+    if delta_q.shape != delta_q_target.shape:
+        raise ValueError(
+            "delta_q prediction/target shapes differ: "
+            f"{delta_q.shape} != {delta_q_target.shape}"
+        )
+    if delta_q.ndim != 3 or delta_q.shape[-1] != 3:
+        raise ValueError(f"delta_q must have shape (N, M, 3), got {delta_q.shape}")
+
+    pred_norm = np.linalg.norm(delta_q, axis=-1)
+    target_norm = np.linalg.norm(delta_q_target, axis=-1)
+    pred_dir = delta_q / np.maximum(pred_norm[..., None], 1e-8)
+    target_dir = delta_q_target / np.maximum(target_norm[..., None], 1e-8)
+    cosine_3d = (pred_dir * target_dir).sum(axis=-1)
+
+    pred_xy = delta_q[..., :2]
+    target_xy = delta_q_target[..., :2]
+    pred_xy_dir = pred_xy / np.maximum(
+        np.linalg.norm(pred_xy, axis=-1, keepdims=True),
+        1e-8,
+    )
+    target_xy_dir = target_xy / np.maximum(
+        np.linalg.norm(target_xy, axis=-1, keepdims=True),
+        1e-8,
+    )
+    cosine_xy = (pred_xy_dir * target_xy_dir).sum(axis=-1)
+    flat_pred_dir = pred_dir.reshape(pred_dir.shape[0], -1)
+
+    result = {
+        "delta_q_norm_mean": float(pred_norm.mean()),
+        "delta_q_norm_std": float(pred_norm.std()),
+        "delta_q_target_norm_mean": float(target_norm.mean()),
+        "delta_q_target_norm_std": float(target_norm.std()),
+        "delta_q_norm_mae": float(np.abs(pred_norm - target_norm).mean()),
+        "delta_q_vs_target_3d_cosine_mean": float(cosine_3d.mean()),
+        "delta_q_vs_target_3d_cosine_std": float(cosine_3d.std()),
+        "delta_q_vs_target_xy_cosine_mean": float(cosine_xy.mean()),
+        "delta_q_vs_target_xy_cosine_std": float(cosine_xy.std()),
+        "delta_q_direction_per_dim_std_mean": float(
+            flat_pred_dir.std(axis=0).mean()
+        ),
+    }
+    if q_max_norm is not None:
+        tolerance = max(1e-4, float(q_max_norm) * 1e-4)
+        result["delta_q_mobility_violation_ratio"] = float(
+            (pred_norm > float(q_max_norm) + tolerance).mean()
+        )
+        result["delta_q_near_max_radius_ratio"] = float(
+            (np.abs(pred_norm - float(q_max_norm)) <= 0.1).mean()
+        )
+    return result
+
+
 def _summarize_q_cues(
     q_cue_logits: np.ndarray,
     q_geometry_cues: np.ndarray,
@@ -203,6 +261,7 @@ def _summarize_deltas(
     q_geometry_cues: np.ndarray = None,
     control_states: np.ndarray = None,
     delta_raw: np.ndarray = None,
+    q_max_norm: float = None,
 ) -> Dict:
     summary = {}
     summary.update(_summarize_tensor("delta_q", delta_q))
@@ -211,6 +270,8 @@ def _summarize_deltas(
 
     # 关联矩阵的 argmax 如果长期不变，说明模型还没有学到“按场景换 UAV”的能力。
     summary.update(_summarize_association("delta_a", delta_a))
+    if delta_q_target is not None:
+        summary.update(_summarize_q_alignment(delta_q, delta_q_target, q_max_norm))
     if delta_a_target is not None:
         summary.update(_summarize_association_alignment(delta_a, delta_a_target))
     if delta_q_raw is not None:
@@ -249,6 +310,8 @@ def _summarize_deltas(
     warnings = []
     if summary["delta_q_per_dim_std_mean"] < 1e-3:
         warnings.append("delta_q_low_cross_sample_variance")
+    if summary.get("delta_q_mobility_violation_ratio", 0.0) > 0.0:
+        warnings.append("delta_q_mobility_violation")
     if summary["delta_a_per_dim_std_mean"] < 1e-3:
         warnings.append("delta_a_low_cross_sample_variance")
     if summary["delta_p_per_dim_std_mean"] < 1e-4:
@@ -494,6 +557,10 @@ def main():
         q_geometry_cues=deltas.get("q_geometry_cues"),
         control_states=deltas.get("control_states"),
         delta_raw=deltas.get("delta_raw"),
+        q_max_norm=(
+            float(sim_cfg["uav_max_speed_ms"])
+            * float(sim_cfg["slot_duration_s"])
+        ),
     )
 
     result = {
@@ -547,6 +614,14 @@ def main():
         "delta_p_total_per_uav_target_mean",
         "delta_p_total_per_uav_mae",
         "delta_q_raw_per_dim_std_mean",
+        "delta_q_norm_mean",
+        "delta_q_target_norm_mean",
+        "delta_q_norm_mae",
+        "delta_q_near_max_radius_ratio",
+        "delta_q_mobility_violation_ratio",
+        "delta_q_vs_target_3d_cosine_mean",
+        "delta_q_vs_target_xy_cosine_mean",
+        "delta_q_direction_per_dim_std_mean",
         "delta_q_raw_dir_cosine_mean",
         "delta_q_raw_dir_mse_mean",
         "q_cue_accuracy",

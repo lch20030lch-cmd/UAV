@@ -1,6 +1,6 @@
 ---
 type: log
-status: direct_q_lora_preflight_complete_validation_pending
+status: direct_q_preflight_improved_projected_q_diagnostics_pending
 stage: multimodal_direct_q_direction
 last_updated: 2026-07-19
 ---
@@ -99,3 +99,55 @@ lambda_p/raw_kl: 0.05 / 0.2
 val100，并以 raw Q direction cosine 为主指标；`direction` 投影会机械地把 Q 幅度
 拉到 15m，因此不能仅凭 projected Q 方差增大判定成功。A/P 指标也必须与 A4 基线
 比较，以确认 retention loss 是否有效。
+
+## Q1 训练趋势与原有诊断结果
+
+前 20 / 后 20 step 平均：
+
+```text
+loss_q_dir:                 0.497985 -> 0.514331
+loss_a_ce:                  1.179702 -> 1.037897
+loss_a_raw_ce:              1.170218 -> 1.054717
+loss_p_raw_kl:              0.989697 -> 0.933993
+delta_p_inactive_leakage:   0.027847 -> 0.026233
+grad_norm_proj:             1.465515 -> 0.238640
+grad_norm_lora:             1.085328 -> 0.822210
+```
+
+单步 batch size 为 1，且 200 step 尚未遍历完整 train500，因此 `loss_q_dir` 的两段
+均值不能单独证明收敛；但梯度持续非零，A/P retention loss 与 leakage 没有恶化。
+
+Train500 / 独立 val100：
+
+```text
+Q raw dir cosine:       0.2412 / 0.2140
+Q raw dir MSE:          0.5059 / 0.5240
+A accuracy:             0.4695 / 0.4400
+P overall MSE:          0.007868 / 0.007590
+P leakage:              0.025185 / 0.025394
+```
+
+相对 A4 独立 val100：
+
+```text
+Q raw cosine:  0.0871 -> 0.2140
+A accuracy:    0.4300 -> 0.4400
+P leakage:     0.02688 -> 0.02539
+```
+
+判定：direct-Q 信号有实质提升且能泛化，A/P retention 有效；但 Q cosine 仍低于历史
+最好约 0.274，更未达到阶段目标 0.4，暂不进入长训。
+
+原诊断只打印 `delta_q_per_dim_std_mean`，不足以区分“位移长度不足”和“15m 固定方向
+模板”。因此新增投影后 Q 诊断：
+
+```text
+delta_q_norm_mean / target_norm_mean / norm_mae
+delta_q_near_max_radius_ratio
+delta_q_mobility_violation_ratio
+delta_q_vs_target_3d_cosine_mean
+delta_q_vs_target_xy_cosine_mean
+delta_q_direction_per_dim_std_mean
+```
+
+使用现有 Q1 checkpoint 重跑诊断即可确认，不需要重新训练。
