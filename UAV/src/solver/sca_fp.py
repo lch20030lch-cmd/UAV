@@ -158,9 +158,9 @@ class SCAFPOptimizer:
                 Q, A, P_comm, P_sense, gains_comm, target_positions, environment
             )
 
-            # Step 3: 固定 Q, P → 优化关联
+            # Step 3: 按候选链路速率与容量约束优化关联
             A = self._optimize_association(
-                Q, gains_comm, P_comm, P_sense, user_weights
+                gains_comm, user_weights
             )
 
             # 计算效用
@@ -443,62 +443,47 @@ class SCAFPOptimizer:
 
     def _optimize_association(
         self,
-        Q: np.ndarray,
         channel_gains: np.ndarray,
-        P_comm: np.ndarray,
-        P_sense: np.ndarray,
         user_weights: np.ndarray,
     ) -> np.ndarray:
         """
-        关联优化 (固定 Q, W)
+        关联优化：使用非零候选链路功率计算反事实速率，再做容量约束指派。
 
         min Σ_{m,k} A_{m,k} * cost(m,k)
         s.t.  Σ_m A_{m,k} = 1       (每用户一个 UAV)
               Σ_k A_{m,k} ≤ K_max   (每 UAV 负载上限)
 
-        使用: Hungarian 算法 (无容量) + 后处理 (容量)
-        完整版: 最小费用流
+        不能直接使用当前 P_comm[m,k] 计算候选代价：beamforming 步会把未关联
+        (m,k) 的功率置零，随后 association 步便永远无法把用户切换到该 UAV。
+        这里为每个候选链路使用同一个可用功率份额，表示下一轮 beamforming 重分配
+        后的反事实速率；再把每架 UAV 展开为 K_max 个 slot，用一次 Hungarian 指派
+        同时满足单关联与容量约束。
         """
         M, K = self.M, self.K
+        gains = np.asarray(channel_gains, dtype=np.float64)
+        weights = np.asarray(user_weights, dtype=np.float64)
+        if gains.shape != (M, K):
+            raise ValueError(
+                f"channel_gains must have shape {(M, K)}, got {gains.shape}"
+            )
+        if weights.shape != (K,):
+            raise ValueError(f"user_weights must have shape {(K,)}, got {weights.shape}")
+        if self.K_max <= 0 or M * self.K_max < K:
+            raise ValueError(
+                "association capacity is infeasible: "
+                f"M={M}, K={K}, K_max={self.K_max}"
+            )
 
-        # 代价矩阵: 负速率 (我们想最大化速率的加权和)
-        cost = np.zeros((M, K))
-        for m in range(M):
-            for k in range(K):
-                # 可达速率
-                sinr = channel_gains[m, k] * P_comm[m, k] / self.N0
-                rate = np.log2(1 + sinr + 1e-12)
-                cost[m, k] = -user_weights[k] * rate
+        candidate_power = self.P_max / float(self.K_max + 1)
+        sinr = np.maximum(gains, 0.0) * candidate_power / max(self.N0, 1e-30)
+        cost = -weights[None, :] * np.log2(1.0 + sinr)
 
-        # Hungarian 算法 (处理单用户约束)
-        if M >= K:
-            row_ind, col_ind = linear_sum_assignment(cost)
-            A = np.zeros((M, K), dtype=np.float32)
-            for r, c in zip(row_ind, col_ind):
-                A[r, c] = 1.0
-        else:
-            # M < K: 需要复制 UAV 行并处理容量
-            # 简化: 每用户分配最佳 UAV, 然后裁切溢出
-            A = np.zeros((M, K), dtype=np.float32)
-            best_m = np.argmin(cost, axis=0)  # 每列最小代价
-            for k in range(K):
-                A[best_m[k], k] = 1.0
+        slot_to_uav = np.repeat(np.arange(M), self.K_max)
+        slot_cost = cost[slot_to_uav, :]
+        assigned_slots, assigned_users = linear_sum_assignment(slot_cost)
 
-            # 容量裁切
-            for m in range(M):
-                if A[m].sum() > self.K_max:
-                    # 移出最差的用户
-                    users_of_m = np.where(A[m] > 0.5)[0]
-                    excess = int(A[m].sum() - self.K_max)
-                    # 按代价排序, 移出代价最高的
-                    sorted_users = users_of_m[np.argsort(cost[m, users_of_m])[::-1]]
-                    for uk in sorted_users[:excess]:
-                        A[m, uk] = 0.0
-                        # 重分配给次优 UAV
-                        other_ms = [om for om in range(M) if om != m]
-                        if other_ms:
-                            best_other = other_ms[np.argmin([cost[om, uk] for om in other_ms])]
-                            A[best_other, uk] = 1.0
+        A = np.zeros((M, K), dtype=np.float32)
+        A[slot_to_uav[assigned_slots], assigned_users] = 1.0
 
         return A
 
