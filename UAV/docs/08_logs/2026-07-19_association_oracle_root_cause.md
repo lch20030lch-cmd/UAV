@@ -1,6 +1,6 @@
 ---
 type: log
-status: normalized_association_probe_server_test_pending
+status: association_lora_preflight_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -670,3 +670,25 @@ logged iterate with the lowest train CE for final reporting.
 No production model, projection head, checkpoint, or training loop was modified.
 The normalized lower-learning-rate cached probe must pass server tests and run once
 before deciding between A-only and A+LoRA.
+
+## Normalized 500/100 probe decision
+
+```text
+                              train accuracy   val accuracy   train CE
+online-equivalent             1.0000           0.2920         0.000840
+flat linear                   1.0000           0.2760         0.011279
+validation fixed-user majority                 0.2975
+predefined useful validation threshold         0.3300
+```
+
+The conditioning fix resolves the earlier false train-fit failure: both readouts
+memorize train500 completely. Neither readout generalizes beyond the val100 majority
+baseline, so extending frozen-state A-only training is rejected. The remaining
+bottleneck is the frozen backbone/LoRA representation of the corrected compact
+association prompt.
+
+The next authorized experiment is a 50-update A+LoRA preflight initialized from the
+selected Q checkpoint. Only `readout_a/a_mlp` and LoRA are trainable; Q/P projection
+parameters and all Q/P losses remain frozen/zero. Because LoRA is shared, Q and P
+outputs may still move and must be re-evaluated after the preflight before any longer
+run is authorized.
