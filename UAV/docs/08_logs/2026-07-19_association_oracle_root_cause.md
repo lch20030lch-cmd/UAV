@@ -1,6 +1,6 @@
 ---
 type: log
-status: association_probe_optimization_audit_pending
+status: normalized_association_probe_server_test_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -643,3 +643,30 @@ Before authorizing A+LoRA, inspect the recorded optimization history. If CE fall
 and later rebounds, add best-iterate selection and lower the learning rate. If it
 never falls, test train-fitted state normalization. No main-model training should
 start until this distinction is resolved.
+
+## Association probe conditioning fix
+
+The optimization history showed two different regimes:
+
+```text
+online-equivalent CE: 1.387331 -> 1.213380, gradual improvement
+flat-linear CE:       26.266222 -> 2.755661
+flat-linear pre-clip gradient norm: 58.4 to 81.8 (clip threshold 5.0)
+nearest-state cosine mean: train 0.999269, val 0.999184
+duplicate state pairs: 0
+```
+
+The states are not duplicates, but a large shared hidden-state component dominates
+their raw cosine and makes the flattened linear optimization badly conditioned.
+Therefore the first result cannot yet prove a frozen-state information bottleneck.
+
+The diagnostic script now supports `--state_normalization hidden_feature`. It uses
+only train-set mean/std, one affine transform per hidden dimension shared by all
+control-token slots, then applies the same transform to validation. This transform
+is foldable into the readout parameters and introduces no label or validation-set
+information. The probe also records the final iterate separately and restores the
+logged iterate with the lowest train CE for final reporting.
+
+No production model, projection head, checkpoint, or training loop was modified.
+The normalized lower-learning-rate cached probe must pass server tests and run once
+before deciding between A-only and A+LoRA.

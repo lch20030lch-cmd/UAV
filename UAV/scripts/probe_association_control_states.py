@@ -7,6 +7,7 @@ flattened linear upper bound without loading Gemma or changing the main model.
 """
 
 import argparse
+import copy
 import json
 import random
 import sys
@@ -108,6 +109,35 @@ def _state_summary(states: torch.Tensor) -> Dict:
     }
 
 
+def _normalize_cached_states(
+    train_states: torch.Tensor,
+    validation_states: torch.Tensor,
+    mode: str,
+):
+    """Normalize cached states using training-set statistics only.
+
+    ``hidden_feature`` uses one affine transform per hidden dimension, shared
+    across control-token slots. That transform can be folded into the attention
+    queries and readout layers, so it improves probe conditioning without adding
+    label information or per-environment parameters.
+    """
+    if mode == "none":
+        return train_states, validation_states, {"mode": mode}
+    if mode != "hidden_feature":
+        raise ValueError(f"unsupported state normalization mode: {mode}")
+
+    mean = train_states.mean(dim=(0, 1), keepdim=True)
+    scale = train_states.std(dim=(0, 1), unbiased=False, keepdim=True).clamp_min(1e-4)
+    normalized_train = (train_states - mean) / scale
+    normalized_validation = (validation_states - mean) / scale
+    return normalized_train, normalized_validation, {
+        "mode": mode,
+        "scale_mean": float(scale.mean().item()),
+        "scale_min": float(scale.min().item()),
+        "scale_max": float(scale.max().item()),
+    }
+
+
 def _association_metrics(logits: torch.Tensor, targets: torch.Tensor) -> Dict:
     target_idx = targets.argmax(dim=1)
     pred_idx = logits.argmax(dim=1)
@@ -186,6 +216,9 @@ def _train_probe(
     )
     target_idx = train_targets.argmax(dim=1)
     history = []
+    best_logged_state = None
+    best_logged_step = None
+    best_logged_cross_entropy = float("inf")
 
     for step in range(1, steps + 1):
         model.train()
@@ -210,6 +243,10 @@ def _train_probe(
                 "validation_accuracy": validation_metrics["accuracy"],
             }
             history.append(row)
+            if row["train_cross_entropy"] < best_logged_cross_entropy:
+                best_logged_cross_entropy = row["train_cross_entropy"]
+                best_logged_step = step
+                best_logged_state = copy.deepcopy(model.state_dict())
             print(
                 f"step={step} loss={row['train_cross_entropy']:.6f} "
                 f"train_accuracy={row['train_accuracy']:.4f} "
@@ -217,9 +254,18 @@ def _train_probe(
                 f"grad_norm={row['gradient_norm']:.6f}"
             )
 
+    final_train = _evaluate(model, train_states, train_targets)
+    final_validation = _evaluate(model, validation_states, validation_targets)
+    if best_logged_state is not None:
+        model.load_state_dict(best_logged_state)
+
     return {
         "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
         "history": history,
+        "selected_step": best_logged_step,
+        "selection_metric": "lowest_logged_train_cross_entropy",
+        "final_iterate_train": final_train,
+        "final_iterate_validation": final_validation,
         "train": _evaluate(model, train_states, train_targets),
         "validation": _evaluate(model, validation_states, validation_targets),
     }
@@ -240,6 +286,12 @@ def main():
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument(
+        "--state_normalization",
+        choices=("none", "hidden_feature"),
+        default="none",
+        help="Training-statistics-only normalization applied before both probes",
+    )
     parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overfit_threshold", type=float, default=0.9)
@@ -269,6 +321,13 @@ def main():
     train_targets = torch.from_numpy(train_targets_np).to(device)
     val_states = torch.from_numpy(val_states_np).to(device)
     val_targets = torch.from_numpy(val_targets_np).to(device)
+    raw_training_state_summary = _state_summary(train_states)
+    raw_validation_state_summary = _state_summary(val_states)
+    train_states, val_states, normalization_summary = _normalize_cached_states(
+        train_states,
+        val_states,
+        args.state_normalization,
+    )
     _, num_tokens, hidden_dim = train_states.shape
     _, num_uavs, num_users = train_targets.shape
 
@@ -281,6 +340,7 @@ def main():
     print(f"  training states:    {tuple(train_states.shape)}")
     print(f"  validation states:  {tuple(val_states.shape)}")
     print(f"  association target: {tuple(train_targets.shape)}")
+    print(f"  state normalization:{args.state_normalization}")
 
     report = {
         "training_npz": args.prediction_npz,
@@ -289,10 +349,14 @@ def main():
         "steps": args.steps,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
+        "state_normalization": args.state_normalization,
+        "normalization_summary": normalization_summary,
         "seed": args.seed,
         "overfit_threshold": args.overfit_threshold,
-        "training_state_summary": _state_summary(train_states),
-        "validation_state_summary": _state_summary(val_states),
+        "training_state_summary": raw_training_state_summary,
+        "validation_state_summary": raw_validation_state_summary,
+        "probe_training_state_summary": _state_summary(train_states),
+        "probe_validation_state_summary": _state_summary(val_states),
         "probes": {},
     }
 
@@ -342,6 +406,7 @@ def main():
 
     print("\n=== FINAL ===")
     for name, probe in report["probes"].items():
+        print(f"  {name} selected step:       {probe['selected_step']}")
         print(f"  {name} train accuracy:      {probe['train']['accuracy']:.4f}")
         print(f"  {name} validation accuracy: {probe['validation']['accuracy']:.4f}")
         print(f"  {name} train CE:            {probe['train']['cross_entropy']:.6f}")
