@@ -1,6 +1,6 @@
 ---
 type: log
-status: direct_q_preflight_improved_projected_q_diagnostics_pending
+status: direct_q_fixed_template_rejected_fixed_residual_implemented
 stage: multimodal_direct_q_direction
 last_updated: 2026-07-19
 ---
@@ -152,3 +152,86 @@ delta_q_target_direction_per_dim_std_mean
 ```
 
 使用现有 Q1 checkpoint 重跑诊断即可确认，不需要重新训练。
+
+## 投影后诊断结论：Q1 退化为固定方向模板
+
+独立 val100 的完整投影后结果：
+
+```text
+delta_q_norm_mean:                         15.000000
+delta_q_target_norm_mean:                  14.995847
+delta_q_norm_mae:                          0.004158
+delta_q_near_max_radius_ratio:             1.000000
+delta_q_mobility_violation_ratio:          0.000000
+delta_q_vs_target_3d_cosine_mean:           0.214046
+delta_q_vs_target_xy_cosine_mean:          -0.088626
+delta_q_direction_per_dim_std_mean:         0.008251
+delta_q_target_direction_per_dim_std_mean:  0.556831
+```
+
+判定分为两部分：
+
+1. `Proj_Q` 正常：位移范数贴近 15m，且没有移动约束违规；
+2. direct-Q 方向学习失败：预测方向方差只有目标的约 1.48%，XY cosine 为负，
+   3D cosine 的小幅正值不能证明学到了有用的场景水平方向。
+
+因此 Q1 checkpoint 只保留为失败诊断/消融，不允许直接继续 500/1000 step 长训。
+A/P retention 是有效的：独立 val100 的 A accuracy 为 0.4400，P MSE 为 0.007590，
+P leakage 为 0.025394，均未因 Q1 回退。
+
+## Q2 修复：固定几何先验 + 受限 MLLM 残差
+
+独立 train500/val100 探针中，动态 selector 在验证集的 XY cosine 为 0.6440，
+而 train500-only 固定混合为 0.6937。因此不再让模型自由选择 cue，也不再从零自由预测
+整个方向。新增：
+
+```text
+q_geometry_mode = fixed_residual_xy
+fixed weights = [0.31186843, 0.09240539, 0.59572625]
+cue order = [weighted_center, nearest_user, nearest_target]
+```
+
+权重只由 train500 探针的平均输出得到，未使用 val100。前向路径为：
+
+```text
+fixed_xy = normalize(sum(fixed_weight_i * cue_i))
+residual = normalize(q_raw_from_MLLM)
+gate = sigmoid(trainable_logit), initial gate = 0.05, maximum = 1.0
+q_direction = normalize([fixed_xy, 0] + gate * residual)
+delta_q = 15m * q_direction -> Proj_Q
+```
+
+这样 MLLM 仍学习场景相关三维残差，但训练初始状态由独立验证更稳健的固定几何方向
+托底。门控限制残差，防止模型在训练早期再次破坏水平方向。
+
+同时新增：
+
+```text
+--lambda_q_projected_dir
+loss_q_projected_dir
+q_residual_gate
+q_fixed_geometry_vs_target_xy_cosine_mean
+q_fixed_geometry_vs_target_3d_cosine_mean
+delta_q_below_fixed_geometry_baseline warning
+```
+
+`--freeze_all_except_q` 也会训练新增的 `q_residual_gate_logit`；旧的 `none/cue_xy`
+checkpoint state dict 不新增无关 key，保持兼容。
+
+## Q2 验收顺序
+
+先用 A4/Q1 checkpoint 做不训练的 val100 基线前向，确认代码输出不低于 fixed geometry；
+再做 200-step 预检，禁止直接长训。预检验收以独立 val100 为准：
+
+```text
+projected XY cosine >= fixed geometry XY cosine + 0.01   # 残差确有增益
+projected 3D cosine > fixed geometry 3D cosine
+direction std 明显高于 Q1 的 0.00825
+A accuracy >= 0.42
+P MSE <= 0.009
+P leakage <= 0.03
+mobility violation ratio = 0
+```
+
+如果残差不能超过固定基线，则将 gate 固定为 0，把 fixed mixture 作为最终 Q 几何分支；
+这不否定整篇方法，A/P 仍由 MLLM 学习，Q 的动态残差则作为失败消融如实报告。

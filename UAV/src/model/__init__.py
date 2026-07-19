@@ -30,4 +30,7 @@ def build_proj_head_config(model_cfg: dict, sim_cfg: dict) -> dict:
         "head_type": model_cfg["projection_head"].get("head_type", "shared"),
         "q_projection_mode": model_cfg["projection_head"].get("q_projection_mode", "clip"),
         "q_geometry_mode": model_cfg["projection_head"].get("q_geometry_mode", "none"),
+        "q_fixed_cue_weights": model_cfg["projection_head"].get("q_fixed_cue_weights"),
+        "q_residual_max_scale": model_cfg["projection_head"].get("q_residual_max_scale", 1.0),
+        "q_residual_gate_init": model_cfg["projection_head"].get("q_residual_gate_init", 0.05),
     }

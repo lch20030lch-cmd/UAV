@@ -89,8 +89,13 @@ def main():
                         help="可选 projection head 类型；加载 split checkpoint 时需要传 split")
     parser.add_argument("--q_projection_mode", type=str, choices=["clip", "direction"], default=None,
                         help="可选 q 投影模式；加载 direction checkpoint 时需要传 direction")
-    parser.add_argument("--q_geometry_mode", type=str, choices=["none", "cue_xy"], default=None,
-                        help="可选：加载 cue_xy checkpoint 时需要传 cue_xy")
+    parser.add_argument(
+        "--q_geometry_mode",
+        type=str,
+        choices=["none", "cue_xy", "fixed_residual_xy"],
+        default=None,
+        help="可选：加载 cue_xy 或 fixed_residual_xy checkpoint 时传入对应模式",
+    )
     args = parser.parse_args()
 
     with (PROJECT_ROOT / args.config).open("r", encoding="utf-8") as f:

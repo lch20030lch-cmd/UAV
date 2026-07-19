@@ -208,6 +208,43 @@ def _summarize_q_cues(
     }
 
 
+def _summarize_fixed_q_geometry(
+    q_geometry_cues: np.ndarray,
+    delta_q_target: np.ndarray,
+    fixed_weights,
+) -> Dict:
+    """Evaluate the train-derived fixed geometry mixture without model predictions."""
+    if q_geometry_cues.shape[:2] != delta_q_target.shape[:2]:
+        raise ValueError("q geometry cues and q targets must align on sample/UAV axes")
+    weights = np.asarray(fixed_weights, dtype=np.float32)
+    if weights.shape != (3,) or np.any(weights < 0) or weights.sum() <= 0:
+        raise ValueError("fixed q cue weights must be three non-negative values with positive sum")
+    weights = weights / weights.sum()
+    fixed_xy = (q_geometry_cues * weights.reshape(1, 1, 3, 1)).sum(axis=2)
+    fixed_xy = fixed_xy / np.maximum(
+        np.linalg.norm(fixed_xy, axis=-1, keepdims=True),
+        1e-8,
+    )
+    target_xy = delta_q_target[..., :2]
+    target_xy = target_xy / np.maximum(
+        np.linalg.norm(target_xy, axis=-1, keepdims=True),
+        1e-8,
+    )
+    fixed_xy_cosine = (fixed_xy * target_xy).sum(axis=-1)
+
+    fixed_3d = np.concatenate([fixed_xy, np.zeros_like(fixed_xy[..., :1])], axis=-1)
+    target_3d = delta_q_target / np.maximum(
+        np.linalg.norm(delta_q_target, axis=-1, keepdims=True),
+        1e-8,
+    )
+    fixed_3d_cosine = (fixed_3d * target_3d).sum(axis=-1)
+    return {
+        "q_fixed_geometry_weights": weights.tolist(),
+        "q_fixed_geometry_vs_target_xy_cosine_mean": float(fixed_xy_cosine.mean()),
+        "q_fixed_geometry_vs_target_3d_cosine_mean": float(fixed_3d_cosine.mean()),
+    }
+
+
 def _summarize_power_alignment(
     delta_p: np.ndarray,
     delta_p_target: np.ndarray,
@@ -263,6 +300,7 @@ def _summarize_deltas(
     delta_p_target: np.ndarray = None,
     q_cue_logits: np.ndarray = None,
     q_geometry_cues: np.ndarray = None,
+    q_fixed_cue_weights=None,
     control_states: np.ndarray = None,
     delta_raw: np.ndarray = None,
     q_max_norm: float = None,
@@ -290,6 +328,18 @@ def _summarize_deltas(
         summary["delta_q_raw_dir_mse_mean"] = float(mse.mean())
     if q_cue_logits is not None and q_geometry_cues is not None and delta_q_target is not None:
         summary.update(_summarize_q_cues(q_cue_logits, q_geometry_cues, delta_q_target))
+    if (
+        q_geometry_cues is not None
+        and delta_q_target is not None
+        and q_fixed_cue_weights is not None
+    ):
+        summary.update(
+            _summarize_fixed_q_geometry(
+                q_geometry_cues,
+                delta_q_target,
+                q_fixed_cue_weights,
+            )
+        )
     if delta_a_raw is not None:
         summary.update(_summarize_tensor("delta_a_raw", delta_a_raw))
         summary.update(_summarize_association("delta_a_raw", delta_a_raw))
@@ -316,6 +366,12 @@ def _summarize_deltas(
         warnings.append("delta_q_low_cross_sample_variance")
     if summary.get("delta_q_mobility_violation_ratio", 0.0) > 0.0:
         warnings.append("delta_q_mobility_violation")
+    if (
+        "q_fixed_geometry_vs_target_xy_cosine_mean" in summary
+        and summary.get("delta_q_vs_target_xy_cosine_mean", -1.0)
+        < summary["q_fixed_geometry_vs_target_xy_cosine_mean"] - 0.01
+    ):
+        warnings.append("delta_q_below_fixed_geometry_baseline")
     if summary["delta_a_per_dim_std_mean"] < 1e-3:
         warnings.append("delta_a_low_cross_sample_variance")
     if summary["delta_p_per_dim_std_mean"] < 1e-4:
@@ -495,8 +551,13 @@ def main():
                         help="可选 projection head 类型；分析 split checkpoint 时需要传 split")
     parser.add_argument("--q_projection_mode", type=str, choices=["clip", "direction"], default=None,
                         help="可选 q 投影模式；分析 direction checkpoint 时需要传 direction")
-    parser.add_argument("--q_geometry_mode", type=str, choices=["none", "cue_xy"], default=None,
-                        help="可选：分析 cue_xy checkpoint 时需要传 cue_xy")
+    parser.add_argument(
+        "--q_geometry_mode",
+        type=str,
+        choices=["none", "cue_xy", "fixed_residual_xy"],
+        default=None,
+        help="可选：分析 cue_xy 或 fixed_residual_xy checkpoint 时传入对应模式",
+    )
     args = parser.parse_args()
 
     with (PROJECT_ROOT / args.config).open("r", encoding="utf-8") as f:
@@ -559,6 +620,7 @@ def main():
         delta_p_target=deltas.get("delta_p_target"),
         q_cue_logits=deltas.get("q_cue_logits"),
         q_geometry_cues=deltas.get("q_geometry_cues"),
+        q_fixed_cue_weights=proj_head_config.get("q_fixed_cue_weights"),
         control_states=deltas.get("control_states"),
         delta_raw=deltas.get("delta_raw"),
         q_max_norm=(
@@ -566,6 +628,13 @@ def main():
             * float(sim_cfg["slot_duration_s"])
         ),
     )
+    if proj_head_config.get("q_geometry_mode") == "fixed_residual_xy":
+        summary["q_residual_gate"] = float(
+            (
+                model.projection_head.q_residual_max_scale
+                * torch.sigmoid(model.projection_head.q_residual_gate_logit)
+            ).detach().cpu().item()
+        )
 
     result = {
         "name": args.name,
@@ -627,6 +696,10 @@ def main():
         "delta_q_vs_target_xy_cosine_mean",
         "delta_q_direction_per_dim_std_mean",
         "delta_q_target_direction_per_dim_std_mean",
+        "q_fixed_geometry_weights",
+        "q_fixed_geometry_vs_target_xy_cosine_mean",
+        "q_fixed_geometry_vs_target_3d_cosine_mean",
+        "q_residual_gate",
         "delta_q_raw_dir_cosine_mean",
         "delta_q_raw_dir_mse_mean",
         "q_cue_accuracy",

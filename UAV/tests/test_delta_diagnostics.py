@@ -4,6 +4,7 @@ import numpy as np
 
 from scripts.analyze_mm_delta_outputs import (
     _summarize_association_alignment,
+    _summarize_fixed_q_geometry,
     _summarize_q_alignment,
 )
 
@@ -66,6 +67,21 @@ class QAlignmentDiagnosticTest(unittest.TestCase):
                 np.zeros((2, 4, 3), dtype=np.float32),
                 np.zeros((1, 4, 3), dtype=np.float32),
             )
+
+    def test_fixed_geometry_summary_uses_configured_mixture(self):
+        cues = np.array([[[[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]]], dtype=np.float32)
+        target = np.array([[[0.0, 15.0, 0.0]]], dtype=np.float32)
+
+        summary = _summarize_fixed_q_geometry(cues, target, [0.0, 1.0, 0.0])
+
+        self.assertAlmostEqual(
+            summary["q_fixed_geometry_vs_target_xy_cosine_mean"],
+            1.0,
+        )
+        self.assertAlmostEqual(
+            summary["q_fixed_geometry_vs_target_3d_cosine_mean"],
+            1.0,
+        )
 
 
 if __name__ == "__main__":

@@ -41,6 +41,7 @@ class UAVISACLosses:
         lambda_assoc_ce: float = 0.0,
         lambda_assoc_raw_ce: float = 0.0,
         lambda_q_dir: float = 0.0,
+        lambda_q_projected_dir: float = 0.0,
         lambda_q_cue_ce: float = 0.0,
         lambda_p_raw_kl: float = 0.0,
         power_temperature: float = 0.5,
@@ -55,6 +56,7 @@ class UAVISACLosses:
         self.lambda_assoc_ce = lambda_assoc_ce
         self.lambda_assoc_raw_ce = lambda_assoc_raw_ce
         self.lambda_q_dir = lambda_q_dir
+        self.lambda_q_projected_dir = lambda_q_projected_dir
         self.lambda_q_cue_ce = lambda_q_cue_ce
         self.lambda_p_raw_kl = lambda_p_raw_kl
         if power_temperature <= 0:
@@ -290,6 +292,12 @@ class UAVISACLosses:
         else:
             loss_q_dir = dq_hat.new_tensor(0.0)
 
+        loss_q_projected_dir = (
+            self.compute_q_direction_loss(dq_hat, dq_tgt)
+            if self.lambda_q_projected_dir != 0
+            else dq_hat.new_tensor(0.0)
+        )
+
         if (
             "q_cue_logits" in delta_hat
             and "q_geometry_cues" in delta_target
@@ -328,6 +336,7 @@ class UAVISACLosses:
             + self.lambda_assoc_ce * loss_a_ce
             + self.lambda_assoc_raw_ce * loss_a_raw_ce
             + self.lambda_q_dir * loss_q_dir
+            + self.lambda_q_projected_dir * loss_q_projected_dir
             + self.lambda_q_cue_ce * loss_q_cue_ce
             + self.lambda_p_raw_kl * loss_p_raw_kl
         )
@@ -339,6 +348,7 @@ class UAVISACLosses:
                 "loss_a_ce": loss_a_ce,
                 "loss_a_raw_ce": loss_a_raw_ce,
                 "loss_q_dir": loss_q_dir,
+                "loss_q_projected_dir": loss_q_projected_dir,
                 "loss_q_cue_ce": loss_q_cue_ce,
                 "loss_p": loss_p,
                 "loss_p_raw_kl": loss_p_raw_kl,
@@ -481,6 +491,7 @@ class UAVISACLosses:
             "loss_a_ce": ctl_parts["loss_a_ce"].item(),
             "loss_a_raw_ce": ctl_parts["loss_a_raw_ce"].item(),
             "loss_q_dir": ctl_parts["loss_q_dir"].item(),
+            "loss_q_projected_dir": ctl_parts["loss_q_projected_dir"].item(),
             "loss_q_cue_ce": ctl_parts["loss_q_cue_ce"].item(),
             "loss_p": ctl_parts["loss_p"].item(),
             "loss_p_raw_kl": ctl_parts["loss_p_raw_kl"].item(),
@@ -490,6 +501,7 @@ class UAVISACLosses:
             "lambda_assoc_ce": self.lambda_assoc_ce,
             "lambda_assoc_raw_ce": self.lambda_assoc_raw_ce,
             "lambda_q_dir": self.lambda_q_dir,
+            "lambda_q_projected_dir": self.lambda_q_projected_dir,
             "lambda_q_cue_ce": self.lambda_q_cue_ce,
             "lambda_p_raw_kl": self.lambda_p_raw_kl,
         }

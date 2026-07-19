@@ -76,6 +76,10 @@ model:
     tau_power: 0.5
     tau_assoc: 0.5
     sinkhorn_iters: 20
+    # train500-only fixed geometry prior: weighted center / nearest user / nearest target
+    q_fixed_cue_weights: [0.31186843, 0.09240539, 0.59572625]
+    q_residual_max_scale: 1.0
+    q_residual_gate_init: 0.05
 
   loss:
     lambda_ctl: 0.5

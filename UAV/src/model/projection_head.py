@@ -19,6 +19,8 @@ h_Φ(Z_c) → δ̂ = [Proj_Q(δ̃_q'), Proj_A(δ̃_a'), Proj_P(δ̃_p')]
   Proj_A: Sinkhorn + 容量     (capacitated transport)
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -390,6 +392,9 @@ class ConstraintProjectionHead(nn.Module):
         head_type: str = "shared",
         q_projection_mode: str = "clip",
         q_geometry_mode: str = "none",
+        q_fixed_cue_weights: list = None,
+        q_residual_max_scale: float = 1.0,
+        q_residual_gate_init: float = 0.05,
     ):
         super().__init__()
         self.M = M
@@ -398,11 +403,44 @@ class ConstraintProjectionHead(nn.Module):
             raise ValueError(f"Unsupported projection head_type: {head_type}")
         if q_projection_mode not in {"clip", "direction"}:
             raise ValueError(f"Unsupported q_projection_mode: {q_projection_mode}")
-        if q_geometry_mode not in {"none", "cue_xy"}:
+        if q_geometry_mode not in {"none", "cue_xy", "fixed_residual_xy"}:
             raise ValueError(f"Unsupported q_geometry_mode: {q_geometry_mode}")
+        if q_geometry_mode == "fixed_residual_xy" and q_projection_mode != "direction":
+            raise ValueError("fixed_residual_xy requires q_projection_mode='direction'")
+        if q_residual_max_scale <= 0:
+            raise ValueError("q_residual_max_scale must be positive")
+        if not 0 < q_residual_gate_init < 1:
+            raise ValueError("q_residual_gate_init must be strictly between 0 and 1")
         self.head_type = head_type
         self.q_projection_mode = q_projection_mode
         self.q_geometry_mode = q_geometry_mode
+        self.q_residual_max_scale = float(q_residual_max_scale)
+
+        fixed_weights = q_fixed_cue_weights or [
+            0.31186842918395996,
+            0.09240538626909256,
+            0.5957262516021729,
+        ]
+        if len(fixed_weights) != 3 or any(float(weight) < 0 for weight in fixed_weights):
+            raise ValueError("q_fixed_cue_weights must contain three non-negative values")
+        fixed_weights_tensor = torch.tensor(fixed_weights, dtype=torch.float32)
+        if float(fixed_weights_tensor.sum()) <= 0:
+            raise ValueError("q_fixed_cue_weights must have a positive sum")
+        normalized_fixed_weights = fixed_weights_tensor / fixed_weights_tensor.sum()
+        if q_geometry_mode == "fixed_residual_xy":
+            self.register_buffer("q_fixed_cue_weights", normalized_fixed_weights)
+            gate_logit = math.log(q_residual_gate_init / (1.0 - q_residual_gate_init))
+            self.q_residual_gate_logit = nn.Parameter(
+                torch.tensor(gate_logit, dtype=torch.float32)
+            )
+        else:
+            # Keep old checkpoint state_dicts unchanged when the new geometry mode is unused.
+            self.register_buffer(
+                "q_fixed_cue_weights",
+                normalized_fixed_weights,
+                persistent=False,
+            )
+            self.register_parameter("q_residual_gate_logit", None)
 
         # 读出维度 = M*3 (位移) + M*K (关联) + M*(K+1) (功率)
         self.q_dim = M * 3
@@ -477,14 +515,37 @@ class ConstraintProjectionHead(nn.Module):
         nearest target。xy 方向由 cue 权重加权，z 方向暂时保留 raw q 的 dh，
         因为当前 v3 几何提示主要表达水平移动方向。
         """
-        if self.q_geometry_mode != "cue_xy" or q_geometry_cues is None or q_cue_logits is None:
+        if self.q_geometry_mode == "none":
             return self._prepare_delta_q(delta_q_raw)
 
+        if q_geometry_cues is None:
+            raise ValueError(f"q_geometry_cues are required for q_geometry_mode={self.q_geometry_mode}")
+
         cues = q_geometry_cues.to(device=delta_q_raw.device, dtype=delta_q_raw.dtype)
+        radius = self.proj_q.v_max_dt.to(device=delta_q_raw.device, dtype=delta_q_raw.dtype)
+
+        if self.q_geometry_mode == "fixed_residual_xy":
+            weights = self.q_fixed_cue_weights.to(device=cues.device, dtype=cues.dtype)
+            fixed_xy = torch.sum(weights.view(1, 1, 3, 1) * cues, dim=2)
+            fixed_xy = F.normalize(fixed_xy, p=2, dim=-1, eps=1e-6)
+            fixed_direction = torch.cat([fixed_xy, torch.zeros_like(fixed_xy[..., :1])], dim=-1)
+            residual_direction = F.normalize(delta_q_raw, p=2, dim=-1, eps=1e-6)
+            residual_gate = self.q_residual_max_scale * torch.sigmoid(
+                self.q_residual_gate_logit.to(dtype=delta_q_raw.dtype)
+            )
+            combined_direction = F.normalize(
+                fixed_direction + residual_gate * residual_direction,
+                p=2,
+                dim=-1,
+                eps=1e-6,
+            )
+            return combined_direction * radius
+
+        if q_cue_logits is None:
+            raise ValueError("q_cue_logits are required for q_geometry_mode=cue_xy")
         weights = F.softmax(q_cue_logits.to(dtype=delta_q_raw.dtype), dim=-1)
         cue_xy = torch.sum(weights.unsqueeze(-1) * cues, dim=2)
         cue_xy = F.normalize(cue_xy, p=2, dim=-1, eps=1e-6)
-        radius = self.proj_q.v_max_dt.to(device=delta_q_raw.device, dtype=delta_q_raw.dtype)
         q_xy = cue_xy * radius
         return torch.cat([q_xy, delta_q_raw[..., 2:3]], dim=-1)
 
@@ -551,4 +612,9 @@ class ConstraintProjectionHead(nn.Module):
         if q_cue_logits is not None:
             result["q_cue_logits"] = q_cue_logits
             result["q_cue_weights"] = q_cue_weights
+        if self.q_geometry_mode == "fixed_residual_xy":
+            result["q_residual_gate"] = self.q_residual_max_scale * torch.sigmoid(
+                self.q_residual_gate_logit
+            )
+            result["q_fixed_cue_weights"] = self.q_fixed_cue_weights
         return result

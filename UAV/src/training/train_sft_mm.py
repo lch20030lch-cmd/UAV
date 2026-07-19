@@ -139,6 +139,7 @@ def train_mm_sft_smoke(
     lambda_p: float = None,
     lambda_assoc_raw_ce: float = None,
     lambda_q_dir: float = None,
+    lambda_q_projected_dir: float = None,
     lambda_q_cue_ce: float = None,
     lambda_p_raw_kl: float = None,
     projection_lr: float = None,
@@ -243,7 +244,7 @@ def train_mm_sft_smoke(
     elif freeze_all_except_q:
         frozen_projection_branches, trainable_projection_branches = _freeze_projection_except(
             model,
-            trainable_prefixes=("readout_q", "q_mlp"),
+            trainable_prefixes=("readout_q", "q_mlp", "q_residual_gate_logit"),
         )
         isolated_projection_branch = "q"
     elif freeze_all_except_q_cue:
@@ -298,6 +299,11 @@ def train_mm_sft_smoke(
         if lambda_q_dir is not None
         else float(train_cfg.get("phase1", {}).get("lambda_q_dir", 0.0))
     )
+    lambda_q_projected_dir_value = (
+        float(lambda_q_projected_dir)
+        if lambda_q_projected_dir is not None
+        else float(train_cfg.get("phase1", {}).get("lambda_q_projected_dir", 0.0))
+    )
     lambda_q_cue_ce_value = (
         float(lambda_q_cue_ce)
         if lambda_q_cue_ce is not None
@@ -322,6 +328,7 @@ def train_mm_sft_smoke(
         lambda_assoc_ce=assoc_ce_weight,
         lambda_assoc_raw_ce=assoc_raw_ce_weight,
         lambda_q_dir=lambda_q_dir_value,
+        lambda_q_projected_dir=lambda_q_projected_dir_value,
         lambda_q_cue_ce=lambda_q_cue_ce_value,
         lambda_p_raw_kl=lambda_p_raw_kl_value,
         power_temperature=float(model_cfg["projection_head"]["tau_power"]),
@@ -360,6 +367,7 @@ def train_mm_sft_smoke(
     print(f"  isolated trainable tensors:   {len(trainable_projection_branches)}")
     print(f"  lambda_q/a/p:                 {lambda_q_value} / {lambda_a_value} / {lambda_p_value}")
     print(f"  q direction weight:           {lambda_q_dir_value}")
+    print(f"  projected q direction weight: {lambda_q_projected_dir_value}")
     print(f"  q cue CE weight:              {lambda_q_cue_ce_value}")
     print(f"  power raw KL weight:          {lambda_p_raw_kl_value}")
     print(f"  association CE weight:        {assoc_ce_weight}")
@@ -431,6 +439,11 @@ def train_mm_sft_smoke(
                 metrics["delta_p_inactive_leakage"] = float(
                     inactive_power.mean().item() if inactive_power.numel() else 0.0
                 )
+                metrics["q_residual_gate"] = float(
+                    outputs["q_residual_gate"].float().item()
+                    if "q_residual_gate" in outputs
+                    else 0.0
+                )
 
             optimizer.zero_grad(set_to_none=True)
             total_loss.backward()
@@ -449,6 +462,7 @@ def train_mm_sft_smoke(
                 f"loss_a_ce={metrics['loss_a_ce']:.6f} "
                 f"loss_a_raw_ce={metrics['loss_a_raw_ce']:.6f} "
                 f"loss_q_dir={metrics['loss_q_dir']:.6f} "
+                f"loss_q_projected_dir={metrics['loss_q_projected_dir']:.6f} "
                 f"loss_q_cue_ce={metrics['loss_q_cue_ce']:.6f} "
                 f"loss_p={metrics['loss_p']:.6f} "
                 f"loss_p_raw_kl={metrics['loss_p_raw_kl']:.6f} "
@@ -457,6 +471,7 @@ def train_mm_sft_smoke(
                 f"loss_p_sensing={metrics['loss_p_sensing']:.6f} "
                 f"delta_p_entropy={metrics['delta_p_entropy']:.6f} "
                 f"delta_p_inactive_leakage={metrics['delta_p_inactive_leakage']:.6f} "
+                f"q_residual_gate={metrics['q_residual_gate']:.6f} "
                 f"grad_norm_proj={grad_norm:.6f} "
                 f"grad_norm_lora={grad_norm_lora:.6f}"
             )
@@ -482,6 +497,8 @@ def train_mm_sft_smoke(
                         "projection_head_type": head_type,
                         "q_projection_mode": q_mode,
                         "q_geometry_mode": q_geom_mode,
+                        "q_fixed_cue_weights": proj_head_config.get("q_fixed_cue_weights"),
+                        "q_residual_max_scale": proj_head_config.get("q_residual_max_scale", 1.0),
                         "freeze_assoc_branch": freeze_assoc_branch,
                         "freeze_qp_branch": freeze_qp_branch,
                         "freeze_all_except_q": freeze_all_except_q,
@@ -497,6 +514,7 @@ def train_mm_sft_smoke(
                         "lambda_a": lambda_a_value,
                         "lambda_p": lambda_p_value,
                         "lambda_q_dir": lambda_q_dir_value,
+                        "lambda_q_projected_dir": lambda_q_projected_dir_value,
                         "lambda_q_cue_ce": lambda_q_cue_ce_value,
                         "lambda_p_raw_kl": lambda_p_raw_kl_value,
                         "lambda_assoc_ce": assoc_ce_weight,
@@ -524,6 +542,8 @@ def train_mm_sft_smoke(
             "projection_head_type": head_type,
             "q_projection_mode": q_mode,
             "q_geometry_mode": q_geom_mode,
+            "q_fixed_cue_weights": proj_head_config.get("q_fixed_cue_weights"),
+            "q_residual_max_scale": proj_head_config.get("q_residual_max_scale", 1.0),
             "freeze_assoc_branch": freeze_assoc_branch,
             "freeze_qp_branch": freeze_qp_branch,
             "freeze_all_except_q": freeze_all_except_q,
@@ -539,6 +559,7 @@ def train_mm_sft_smoke(
             "lambda_a": lambda_a_value,
             "lambda_p": lambda_p_value,
             "lambda_q_dir": lambda_q_dir_value,
+            "lambda_q_projected_dir": lambda_q_projected_dir_value,
             "lambda_q_cue_ce": lambda_q_cue_ce_value,
             "lambda_p_raw_kl": lambda_p_raw_kl_value,
             "lambda_assoc_ce": assoc_ce_weight,
@@ -573,6 +594,8 @@ if __name__ == "__main__":
                         help="可选 delta_p 损失权重覆盖值")
     parser.add_argument("--lambda_q_dir", type=float, default=None,
                         help="可选 delta_q raw 方向辅助损失权重，适用于 q target 贴移动边界的 smoke")
+    parser.add_argument("--lambda_q_projected_dir", type=float, default=None,
+                        help="可选：投影后 delta_q 方向损失权重，用于 fixed_residual_xy")
     parser.add_argument("--lambda_q_cue_ce", type=float, default=None,
                         help="可选：q 几何候选方向分类损失权重，用于 cue_xy 几何蒸馏")
     parser.add_argument("--lambda_p_raw_kl", type=float, default=None,
@@ -587,8 +610,13 @@ if __name__ == "__main__":
                         help="可选 projection head 类型；默认使用配置文件，split 用于 q/a/p 分支解耦实验")
     parser.add_argument("--q_projection_mode", type=str, choices=["clip", "direction"], default=None,
                         help="可选 q 投影模式；direction 用于 15m 边界饱和的 q 方向实验")
-    parser.add_argument("--q_geometry_mode", type=str, choices=["none", "cue_xy"], default=None,
-                        help="可选：cue_xy 使用 prompt/BEV 几何候选方向组合 q 水平移动")
+    parser.add_argument(
+        "--q_geometry_mode",
+        type=str,
+        choices=["none", "cue_xy", "fixed_residual_xy"],
+        default=None,
+        help="可选：动态 cue_xy，或 train-only 固定几何先验加受限残差 fixed_residual_xy",
+    )
     parser.add_argument("--freeze_assoc_branch", action="store_true",
                         help="split head 下冻结 association 分支，主要用于 Stage B2 训练 q/p")
     parser.add_argument("--freeze_qp_branch", action="store_true",
@@ -615,6 +643,7 @@ if __name__ == "__main__":
         lambda_p=args.lambda_p,
         lambda_assoc_raw_ce=args.lambda_assoc_raw_ce,
         lambda_q_dir=args.lambda_q_dir,
+        lambda_q_projected_dir=args.lambda_q_projected_dir,
         lambda_q_cue_ce=args.lambda_q_cue_ce,
         lambda_p_raw_kl=args.lambda_p_raw_kl,
         projection_lr=args.projection_lr,
