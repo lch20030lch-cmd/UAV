@@ -1,6 +1,6 @@
 ---
 type: log
-status: association_gradient_accumulation_fixed_corrected_data_scaleup_pending
+status: corrected_compact_500_100_generated_validation_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -462,6 +462,29 @@ Q residual norm: 0.045474 -> 0.045474
 4. 无 NaN/Inf，真实 Gemma + image + control-token 训练链路通过；
 5. 梯度累积修复完成。下一步不再在 train20 上长训，生成 compact corrected
    train500/val100 后做 A+LoRA 泛化预检。
+
+## Corrected compact train500/val100 生成完成
+
+```text
+train seed: 42
+train SFT / DPO: 500 / 500
+train generation time: 6675.8 s
+
+validation seed: 2026
+validation SFT / DPO: 100 / 100
+validation generation time: 1377.3 s
+```
+
+路径：
+
+```text
+/root/autodl-tmp/data/mm_geom_v4_compact_train500_seed42
+/root/autodl-tmp/data/mm_geom_v4_compact_val100_seed2026
+```
+
+`wc -l` 总计 `1200` 行，四个 JSONL 文件数量均与预期一致。当前仅确认生成数量完整；
+在 ID 唯一性、prompt type、图像存在性、target 约束、train/val 分布和真实序列长度验收前，
+不得启动 A+LoRA。
 
 ## 对现有数据与 Q checkpoint 的影响边界
 
