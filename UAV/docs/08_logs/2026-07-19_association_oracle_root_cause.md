@@ -334,6 +334,70 @@ control-state std mean/max:  0.125314 / 2.190320
    仅用 corrected train20 过拟合 A readout；此实验将判断现有 control states 是否仍包含
    可供 A 头读取的场景信息。
 
+## A5 corrected train20 projection-only 结果
+
+配置：冻结 backbone/LoRA/Q/P，仅训练 `readout_a/a_mlp`，`500` step（train20 共
+`25` epoch），raw CE / projected CE 权重为 `1.0 / 0.2`。
+
+训练曲线：
+
+```text
+                         first 50    last 50
+projected association CE  1.434598    1.334904
+raw association CE        1.397178    1.313226
+projection grad norm      0.556447    0.675340
+LoRA grad norm            0.000000    0.000000
+Q residual grad norm      0.000000    0.000000
+```
+
+最终指标：
+
+```text
+                         train20      val20
+projected top-1          0.4125       0.2575
+raw top-1                0.4125       0.2575
+raw top-2                0.6775       0.5250
+fixed-user majority      0.3450       0.3675
+raw oracle probability   0.287632     0.251114
+gain over majority      +0.0675      -0.1100
+```
+
+判定：
+
+1. 梯度存在，且 LoRA/Q residual 均未被误更新，分支隔离正确；
+2. 25 epoch 后 train top-1 仍只有 `0.4125`，A projection-only 未通过 train20
+   过拟合门槛，禁止通过继续堆 step 宣称修复；
+3. train/val gap 为 `0.155`，独立 val 低于 fixed-user majority；
+4. raw 与 projected top-1 完全一致，当前主要瓶颈不在 Sinkhorn；
+5. 下一步使用已保存的 train/val NPZ 做缓存 control-state probe，对比线上同构 A 头的
+   full-batch 优化与 flattened linear 上界，再决定是否需要 A+LoRA。
+
+## 缓存 A control-state probe
+
+新增 `scripts/probe_association_control_states.py`，只读取诊断 NPZ，不加载 Gemma、不修改
+主模型，按相同 train20/val20 划分比较：
+
+1. `online_equivalent`：与 split A 分支相同的 `ControlReadout + ResidualMLP`，但使用
+   full-batch 优化，隔离逐样本 SGD 噪声；
+2. `flat_linear`：保留全部 8 个 control-token slot 的线性上界，用于判断缓存 states
+   至少能否区分 20 个训练环境。
+
+判定顺序：
+
+```text
+online_equivalent train >= 0.90
+  -> states 与 A 结构可拟合，线上逐样本优化是主要瓶颈
+
+online_equivalent train < 0.90, flat_linear train >= 0.90
+  -> states 可区分，但 attention-pooling A 头构成瓶颈
+
+两者 train 均 < 0.90
+  -> frozen states 不足以支撑当前 A 读出，不再延长 projection-only，转 A+LoRA
+```
+
+新增单元测试覆盖两种 readout 输出形状及精确 logits 的 ranking 指标。本机已完成 Python
+语法检查和 `git diff --check`；PyTorch/NumPy 单测需在服务器 `uavmllm` 环境执行。
+
 ## 对现有数据与 Q checkpoint 的影响边界
 
 现有 train500/val100 是旧 solver 生成的，不能直接用于验证修复后的 A 标签质量。
