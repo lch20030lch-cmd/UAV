@@ -1,6 +1,6 @@
 ---
 type: log
-status: association_lora_preflight_pending
+status: association_lora_preflight_diagnostics_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -692,3 +692,27 @@ selected Q checkpoint. Only `readout_a/a_mlp` and LoRA are trainable; Q/P projec
 parameters and all Q/P losses remain frozen/zero. Because LoRA is shared, Q and P
 outputs may still move and must be re-evaluated after the preflight before any longer
 run is authorized.
+
+## A8 A+LoRA 50-update training-path preflight
+
+Configuration: corrected train500, effective batch 8, 50 optimizer updates / 400
+micro-batches, selected-Q initialization, trainable A projection plus LoRA, frozen
+Q/P projection, and zero Q/P losses.
+
+```text
+step / micro-step:            50 / 400
+raw A CE step 1 / step 50:    1.388285 / 1.397191
+projected A CE step 1 / 50:   1.444904 / 1.418079
+LoRA gradient norm:           nonzero throughout (0.65 to 7.37 at sampled steps)
+projection gradient norm:     nonzero throughout
+Q residual gradient norm:     0.0 throughout
+Q residual adapter norm:      0.045474 unchanged
+Q/P loss terms:               0.0 throughout
+NaN / Inf / OOM:              none
+```
+
+The branch-isolation and accumulated A+LoRA training path pass. The sampled raw CE
+still fluctuates around random four-class CE and shows no learning trend, so no
+additional optimizer steps are authorized yet. Evaluate the final checkpoint on
+train500 and val100, compare against the preflight baseline, and audit Q regression
+from the shared LoRA before changing learning rates or extending training.
