@@ -1,6 +1,6 @@
 ---
 type: log
-status: multimodal_length_validated_selected_q_baseline_pending
+status: corrected_val100_q_closed_association_probe_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -591,3 +591,32 @@ Decision:
 4. The next experiment is read-only selected-Q inference on corrected train500 and
    val100, saving JSON summaries and NPZ control states. It does not train Q, A, P,
    the projection head, or LoRA.
+
+## Selected Q closure on corrected val100
+
+The selected step-150 Q checkpoint was evaluated on all 100 independent corrected
+validation environments:
+
+```text
+selected Q 3D cosine:        0.625692
+fixed geometry 3D cosine:    0.583727
+3D gain over fixed:         +0.041965
+selected Q XY cosine:        0.702825
+fixed geometry XY cosine:    0.702770
+XY gain over fixed:         +0.000056
+mobility violation ratio:    0.0
+predicted / target Q norm:   15.000000 / 14.996517
+Q norm MAE:                  0.003489
+```
+
+Decision:
+
+1. Q passes the full corrected val100 gate: 3D alignment improves materially over
+   fixed geometry, XY alignment does not regress, and all mobility constraints hold.
+2. The Q selected checkpoint is frozen as the current Q result; do not retrain it
+   before the A investigation.
+3. Current A accuracy (`0.2410`) is below the fixed-user majority (`0.2975`) and
+   current P still reports inactive leakage. These are untrained corrected-data
+   baselines, not evidence against Q closure.
+4. The next stage is the 500/100 cached-state association probe. It is diagnostic
+   only and must precede any A projection or A+LoRA training.
