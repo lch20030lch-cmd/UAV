@@ -1,6 +1,6 @@
 ---
 type: log
-status: multimodal_length_analysis_fix_server_test_pending
+status: multimodal_length_validated_selected_q_baseline_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -567,3 +567,27 @@ Gemma3 `AutoProcessor`。它低估了 processor 展开 image tokens 后的序列
 5. 只有 `delta_q` 标签确实发生实质变化时，才重新验证 Q selected checkpoint。
 
 在完成小规模影响评估前，保留并冻结现有 Q selected checkpoint，不删除、不重训。
+## Actual multimodal sequence-length validation
+
+The corrected compact datasets were measured again with the Gemma 3 multimodal
+processor and the actual BEV images, rather than with tokenizer-only estimates.
+
+```text
+                                      train500       val100
+min / mean / max (prompt + controls)  2641/2665/2696 2642/2665/2686
+samples fitting 2560                  0/500           0/100
+samples fitting 3072                  500/500         100/100
+```
+
+Decision:
+
+1. The earlier `max_length=2560` failure is fully explained: every sample exceeds
+   2560 after the processor expands the image-token block.
+2. `max_length=3072` covers all 600 current samples with at least 376 tokens of
+   headroom at the observed maximum.
+3. `2688` is not selected even though it covers val100: it truncates 7/500 training
+   samples. `2816` would cover the measured data, but 3072 is retained for safer
+   training/evaluation consistency.
+4. The next experiment is read-only selected-Q inference on corrected train500 and
+   val100, saving JSON summaries and NPZ control states. It does not train Q, A, P,
+   the projection head, or LoRA.
