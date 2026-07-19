@@ -1,6 +1,6 @@
 ---
 type: log
-status: ready_for_server_run
+status: training_complete_validation_pending
 stage: q_only_controlled_learning_curve
 last_updated: 2026-07-19
 ---
@@ -162,3 +162,33 @@ python -m py_compile src/training/train_sft_mm.py: PASS
 
 本机 Python 环境没有安装 torch/numpy，相关 17 个单元测试无法在本机导入；服务器拉取后
 仍需在 `uavmllm` 环境执行现有测试集，本次没有通过降低或删除测试绕过该限制。
+
+## Q4 200-step 服务器训练结果
+
+训练已完成，最终 checkpoint：
+
+```text
+/root/autodl-tmp/outputs/mm_geom_v3_stage_q4_residual_curve200/mm_sft_lora_smoke_final
+```
+
+关键轨迹：
+
+```text
+step   projected loss   residual grad norm   adapter norm   LoRA grad norm
+1      0.274353         4.335295             0.003464       0.0
+50     0.133906         3.758512             0.032536       0.0
+100    0.072724         5.474355             0.042406       0.0
+150    0.467487         2.670131             0.045474       0.0
+200    0.070081         0.543273             0.052957       0.0
+```
+
+阶段判定：
+
+1. step 1/50 与 Q3 轨迹一致，zero-init 重跑具备可复现性；
+2. residual adapter 梯度始终非零，参数范数持续增长，梯度链路没有再次堵塞；
+3. LoRA 梯度始终为 0，A/P/LoRA 隔离边界保持正确；
+4. 没有 NaN/Inf/OOM；
+5. step 150 是单个 batch 的损失尖峰，不能由此判断 checkpoint 退化；是否过拟合或发生
+   3D/XY 权衡必须由四个独立 val100 结果决定。
+
+当前不选择 step 200，也不转入 A；下一步严格执行 50/100/150/200 的独立验证比较。
