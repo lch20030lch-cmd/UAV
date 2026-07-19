@@ -1,6 +1,6 @@
 ---
 type: log
-status: independent_gradient_clipping_output_diagnostics_pending
+status: lora_scope_and_control_path_code_audit_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -807,3 +807,27 @@ or repair the A failure. Do not extend A10. Evaluate its train500/val100 outputs
 If A10 reproduces A8's state/output variance collapse, audit the mismatch between
 the normalized full-batch cached probe and the unnormalized minibatch production
 readout before authorizing another training run.
+
+## A10 output diagnostics: collapse reproduced
+
+```text
+val100 metric                         selected-Q       A8 step50   A10 step50
+A top-1 accuracy                      0.2410           0.2435      0.2415
+A per-dim output std                  0.03680          0.00546     0.00385
+control-state per-dim std             0.13807          0.07370     0.07634
+fixed users                           0               6           14
+Q 3D cosine                           0.625692         0.625693    0.625691
+Q XY cosine                           0.702825         0.702823    0.702822
+```
+
+A10 predicts only UAV 0/3 on val100 (`1657/0/0/343`) and remains below the train
+and validation majority baselines. Independent clipping is retained as the correct
+optimizer-group behavior, but it is not the collapse root cause.
+
+The next code audit checks LoRA scope. Generic target names (`q_proj/k_proj/v_proj/
+o_proj`) are injected before the current vision-freeze lookup. After PEFT wrapping,
+the direct `vision_tower`/`vision_model` lookup may miss nested vision LoRA modules.
+Compare selected-Q and A10 adapter tensors grouped by parameter path before changing
+training or architecture. If vision-path LoRA tensors changed, fix the freeze/injection
+scope first. If they did not, audit control-token placement and production-readout
+conditioning next.
