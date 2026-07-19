@@ -1,6 +1,6 @@
 ---
 type: log
-status: compact_v4_input_implemented_length_recheck_pending
+status: control_only_sequence_budget_implemented_server_test_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -203,6 +203,39 @@ multimodal_bev_image_v4_compact_indexed_association
 
 `analyze_seq_len.py` 也新增 prompt 与 response 各自的 mean/max，下一轮能明确长度主要来自
 哪一部分。旧 verbose v4 train20 仅保留为失败审计样本，不用于训练。
+
+## Compact v4 长度复查与控制序列根因
+
+紧凑 train20：
+
+```text
+full text min / mean / max: 3199 / 3219 / 3240
+prompt mean / max:          2400 / 2425
+response mean / max:         819 / 823
+3072 内 full text:             0 / 20
+```
+
+继续审计发现 `train_sft_mm.py` 明确只计算 control loss，forward 也设置
+`logits_to_keep=1`，不会使用语言 labels；但 `MultimodalSFTDataset` 仍把约 819 个 response
+token 附加在 control token 后。这些 token 不提供当前训练目标，只增加计算与截断风险。
+
+同时旧数据集先允许 image prompt 占满 `max_length`，再附加 control token，最后统一从尾部
+截断；极端情况下 control token 会被静默裁掉，而模型用零向量补齐。这会隐藏数据过长问题。
+
+修复：
+
+1. `MultimodalSFTDataset` 新增 `include_response`，默认保持兼容；
+2. 当前 control-loss 训练、delta 诊断和 forward smoke 显式使用
+   `include_response=False`；
+3. processor 编码 prompt 前先硬预留 8 个 control token 的预算；
+4. 截断后若 control token 数量不是 8，立即报错，不再静默用零向量掩盖；
+5. checkpoint metadata 记录 `include_response_tokens=false`；
+6. `analyze_seq_len.py --control-only` 按真实主线统计 prompt + control tokens，而不是把
+   未参与损失的 response 算入预算。
+
+这不是删除监督标签：`delta_q/a/p` 仍由 JSONL 独立字段提供并参与 control loss；只是当前
+训练不再把未使用的自然语言 JSON response 送入 backbone。未来若启用 token-level LM CE，
+仍可使用默认 `include_response=True`，届时会同时为 response 与 control token 预留预算。
 
 ## 对现有数据与 Q checkpoint 的影响边界
 

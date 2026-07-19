@@ -142,6 +142,7 @@ def main():
         processor=model.processor,
         max_length=max_length,
         num_control_tokens=model_cfg["control_token"]["num_tokens"],
+        include_response=False,
     )
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
     batch = next(iter(dataloader))

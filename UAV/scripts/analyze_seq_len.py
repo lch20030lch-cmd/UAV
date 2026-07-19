@@ -24,7 +24,13 @@ from pathlib import Path
 from transformers import AutoTokenizer
 
 
-def analyze(data_path: str, model_name: str = "/root/autodl-tmp/huggingface/models/gemma-3-12b-it"):
+def analyze(
+    data_path: str,
+    model_name: str = "/root/autodl-tmp/huggingface/models/gemma-3-12b-it",
+    control_only: bool = False,
+    num_control_tokens: int = 8,
+    current_max_length: int = 4096,
+):
     # ---- 加载 tokenizer ----
     print(f"Loading tokenizer from {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -55,7 +61,9 @@ def analyze(data_path: str, model_name: str = "/root/autodl-tmp/huggingface/mode
         prompt_len = len(tokenizer.encode(prompt_text, add_special_tokens=True))
         resp_len = full_len - prompt_len
 
-        lengths.append(full_len)
+        lengths.append(
+            prompt_len + num_control_tokens if control_only else full_len
+        )
         prompt_lengths.append(prompt_len)
         response_lengths.append(resp_len)
 
@@ -65,7 +73,8 @@ def analyze(data_path: str, model_name: str = "/root/autodl-tmp/huggingface/mode
 
     # ---- 报告 ----
     print("\n" + "=" * 60)
-    print("  Token 长度分布 (Prompt + Response)")
+    mode = "Prompt + control tokens" if control_only else "Prompt + Response"
+    print(f"  Token 长度分布 ({mode})")
     print("=" * 60)
     print(f"  Samples:     {len(lengths)}")
     print(f"  Min:         {lengths.min()}")
@@ -108,7 +117,7 @@ def analyze(data_path: str, model_name: str = "/root/autodl-tmp/huggingface/mode
               f"(截断 {truncated}/{len(lengths)} = {trunc_pct:.2f}% 样本)")
 
     # ---- 加速预估 ----
-    current = 4096
+    current = current_max_length
     print(f"\n  当前 max_seq_length = {current}")
     for candidate in [2048, 2560, 3072]:
         if candidate < p95:
@@ -126,6 +135,10 @@ if __name__ == "__main__":
                         help="Path to data directory containing sft_dataset.jsonl")
     parser.add_argument("--model", type=str,
                         default="/root/autodl-tmp/huggingface/models/gemma-3-12b-it")
+    parser.add_argument("--control-only", action="store_true",
+                        help="按当前 multimodal control-loss 管线统计 prompt + control tokens")
+    parser.add_argument("--num-control-tokens", type=int, default=8)
+    parser.add_argument("--current-max-length", type=int, default=4096)
     args = parser.parse_args()
 
     data_path = os.path.join(args.data_dir, "sft_dataset.jsonl")
@@ -133,4 +146,10 @@ if __name__ == "__main__":
         print(f"ERROR: {data_path} not found!")
         sys.exit(1)
 
-    analyze(data_path, args.model)
+    analyze(
+        data_path,
+        args.model,
+        control_only=args.control_only,
+        num_control_tokens=args.num_control_tokens,
+        current_max_length=args.current_max_length,
+    )

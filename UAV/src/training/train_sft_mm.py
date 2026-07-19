@@ -205,6 +205,7 @@ def train_mm_sft_smoke(
     print(f"  max_length: {max_seq_length}")
     print(f"  steps:      {steps_limit}")
     print(f"  checkpoints:{ckpt_root} (every {checkpoint_interval} steps)")
+    print("  input mode: prompt + image + control tokens (response omitted)")
     if train_lora:
         trainable_label = "projection_head + LoRA"
     elif load_lora:
@@ -302,6 +303,7 @@ def train_mm_sft_smoke(
         processor=model.processor,
         max_length=max_seq_length,
         num_control_tokens=model_cfg["control_token"]["num_tokens"],
+        include_response=False,
     )
     dataloader = DataLoader(
         dataset,
@@ -531,6 +533,7 @@ def train_mm_sft_smoke(
                         "load_lora": load_lora,
                         "init_lora_checkpoint": init_lora_checkpoint,
                         "checkpoint_interval": checkpoint_interval,
+                        "include_response_tokens": False,
                         "projection_lr": proj_lr,
                         "lora_lr": lora_lr if train_lora else 0.0,
                         "lora_rank": model_cfg["lora"]["rank"] if lora_enabled else 0,
@@ -582,6 +585,7 @@ def train_mm_sft_smoke(
             "load_lora": load_lora,
             "init_lora_checkpoint": init_lora_checkpoint,
             "checkpoint_interval": checkpoint_interval,
+            "include_response_tokens": False,
             "projection_lr": proj_lr,
             "lora_lr": lora_lr if train_lora else 0.0,
             "lora_rank": model_cfg["lora"]["rank"] if lora_enabled else 0,

@@ -2,8 +2,8 @@
 BEV 图像多模态数据集。
 
 当前主要服务于 SFT / 前向传播烟雾测试：
-先用模型 processor 编码 prompt + BEV image，再追加 control tokens 和
-response labels。最终 batch 仍保持与 text-grid baseline 一致的
+先用模型 processor 编码 prompt + BEV image，再追加 control tokens；仅在显式要求时
+追加 response labels。最终 batch 仍保持与 text-grid baseline 一致的
 solver-facing 字段，便于复用 projection head 与控制损失。
 """
 
@@ -67,6 +67,21 @@ def _squeeze_batch(encoded: Dict) -> Dict:
     return result
 
 
+def _compute_prompt_budget(
+    max_length: int,
+    num_control_tokens: int,
+    response_length: int,
+) -> int:
+    budget = int(max_length) - int(num_control_tokens) - int(response_length)
+    if budget <= 0:
+        raise ValueError(
+            "max_length cannot fit reserved control/response tokens: "
+            f"max_length={max_length}, controls={num_control_tokens}, "
+            f"response={response_length}"
+        )
+    return budget
+
+
 class MultimodalSFTDataset(Dataset):
     """用于 prompt + BEV image + control-token forward 的 SFT 风格数据集。"""
 
@@ -77,6 +92,7 @@ class MultimodalSFTDataset(Dataset):
         processor,
         max_length: int = 4096,
         num_control_tokens: int = 8,
+        include_response: bool = True,
     ):
         self.data_path = Path(data_path)
         self.data_dir = Path(data_dir)
@@ -84,6 +100,7 @@ class MultimodalSFTDataset(Dataset):
         self.tokenizer = processor.tokenizer
         self.max_length = max_length
         self.num_control_tokens = num_control_tokens
+        self.include_response = include_response
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -108,9 +125,24 @@ class MultimodalSFTDataset(Dataset):
         image_path = self.data_dir / item["bev_image_path"]
         image = Image.open(image_path).convert("RGB")
 
-        # 先让官方 processor 处理 text + image，再把控制 token 和监督标签接到序列尾部。
+        response_ids = []
+        if self.include_response:
+            response_enc = self.tokenizer(
+                item["response"],
+                truncation=True,
+                max_length=1024,
+                add_special_tokens=False,
+            )
+            response_ids = response_enc["input_ids"] + [self.tokenizer.eos_token_id]
+
+        # 先为 control/response 预留硬预算，防止 prompt 截断后把控制 token 静默裁掉。
+        prompt_budget = _compute_prompt_budget(
+            self.max_length,
+            self.num_control_tokens,
+            len(response_ids),
+        )
         prompt = ensure_one_image_token(self.processor, item["prompt"])
-        encoded = _encode_text_image(self.processor, prompt, image, self.max_length)
+        encoded = _encode_text_image(self.processor, prompt, image, prompt_budget)
         encoded = _squeeze_batch(encoded)
 
         prompt_ids = encoded["input_ids"].tolist()
@@ -121,14 +153,6 @@ class MultimodalSFTDataset(Dataset):
             prompt_token_type += [fill_value] * (len(prompt_ids) - len(prompt_token_type))
         elif len(prompt_token_type) > len(prompt_ids):
             prompt_token_type = prompt_token_type[:len(prompt_ids)]
-
-        response_enc = self.tokenizer(
-            item["response"],
-            truncation=True,
-            max_length=1024,
-            add_special_tokens=False,
-        )
-        response_ids = response_enc["input_ids"] + [self.tokenizer.eos_token_id]
 
         input_ids = prompt_ids + self.control_token_ids + response_ids
         attention_mask = prompt_attention + [1] * self.num_control_tokens + [1] * len(response_ids)
@@ -153,6 +177,12 @@ class MultimodalSFTDataset(Dataset):
             labels = labels[:self.max_length]
             label_mask = label_mask[:self.max_length]
             control_mask = control_mask[:self.max_length]
+
+        if sum(control_mask) != self.num_control_tokens:
+            raise RuntimeError(
+                "Control tokens were truncated from the multimodal sequence: "
+                f"expected {self.num_control_tokens}, got {sum(control_mask)}"
+            )
 
         if not (len(input_ids) == len(attention_mask) == len(token_type_ids) == len(labels) == len(control_mask)):
             raise RuntimeError("Multimodal token fields have inconsistent lengths after padding/truncation.")

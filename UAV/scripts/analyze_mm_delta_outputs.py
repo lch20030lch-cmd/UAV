@@ -604,6 +604,7 @@ def main():
         processor=model.processor,
         max_length=max_length,
         num_control_tokens=model_cfg["control_token"]["num_tokens"],
+        include_response=False,
     )
 
     num_samples = min(args.num_samples, len(dataset))
