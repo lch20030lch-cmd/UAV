@@ -43,13 +43,20 @@ class IndexedAssociationPromptTest(unittest.TestCase):
     def test_map_preserves_user_column_ids_and_channel_rank(self):
         text = build_indexed_association_str(self._environment())
 
-        self.assertIn("columns follow user IDs u0..", text)
-        self.assertIn("u0:xy=[10.0, 20.0]", text)
-        self.assertIn("w=1.25", text)
-        self.assertIn("best_sinr_db=12.5", text)
-        self.assertIn("rank=m1>m0", text)
-        self.assertIn("u1:xy=[80.0, 90.0]", text)
-        self.assertIn("rank=m0>m1", text)
+        self.assertIn("rows=m0..;cols=u0..uK-1", text)
+        self.assertIn("entry=u|x,y|weight|UAV-rank|relative-gain-dB", text)
+        self.assertIn("0|10,20|1.25|1,0|0,-10", text)
+        self.assertIn("1|80,90|0.75|0,1|0,-3", text)
+
+    def test_numeric_summaries_do_not_emit_full_precision_repr(self):
+        prompt = build_multimodal_prompt(
+            self._environment(),
+            {"num_uavs": 2, "num_users": 2, "num_targets": 1},
+        )
+
+        self.assertIn("Per-user SINR dB (u0..): [12.5,8.0]", prompt)
+        self.assertIn("Rate pressure (u0..): [0.50,0.80]", prompt)
+        self.assertNotIn("0.800000", prompt)
 
     def test_multimodal_prompt_contains_index_map_before_image_description(self):
         config = {

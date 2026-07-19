@@ -1,6 +1,6 @@
 ---
 type: log
-status: indexed_input_tests_passed_comparison_tool_pending
+status: compact_v4_input_implemented_length_recheck_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -152,6 +152,57 @@ current / reference prompt_type histogram
 
 新增 `tests/test_target_distribution_comparison.py`，覆盖乱序 ID 对齐、完全一致标签、Q
 方向改变、A 切换、P 差异和重复 ID 拒绝。该工具只读取 JSONL 与 numpy，不加载大模型。
+
+## Corrected train20 首轮结果
+
+新旧同 ID 的 20 个 seed42 样本：
+
+```text
+delta_q 3D cosine:       0.953551
+delta_q XY cosine:       0.972835
+delta_q norm MAE:        0.002025
+delta_a argmax match:    0.6975
+delta_a switch rate:     0.3025
+delta_p MSE:             0.013188
+delta_p sensing MSE:     0.110250
+```
+
+判定：
+
+1. solver 修复不是无效改动，约 30.25% 用户关联标签发生变化；旧 A 标签停止使用；
+2. P 标签也发生实质变化，后续 P 必须建立在 corrected association 上；
+3. Q 位移范数不变，方向变化相对较小但非零；保留 Q selected checkpoint，等待新 val
+   复验，不直接宣称在 v4 上达标，也不立即重训。
+
+## 首版 indexed map 长度失败与替换
+
+首版 v4 train20 token 统计：
+
+```text
+min / mean / max: 4681 / 4746 / 4806
+3072 内样本:      0 / 20
+4096 内样本:      0 / 20
+```
+
+该表示会让 association map 或响应被 100% 截断，因此禁止继续生成或训练，也不通过把
+`max_length` 硬加到 4800 掩盖问题。
+
+替换方案仍保留全部必要信息，但删除每行重复字段：
+
+```text
+一次性表头: u|x,y|weight|UAV-rank|relative-gain-dB
+每用户一行: 0|123,456|1.25|2,0,3,1|0,-3,-8,-12
+```
+
+同时把通信/感知摘要中的 Python 全精度浮点列表改为任务足够的固定精度紧凑列表。
+新 prompt type：
+
+```text
+multimodal_bev_image_v4_compact_indexed_association
+```
+
+`analyze_seq_len.py` 也新增 prompt 与 response 各自的 mean/max，下一轮能明确长度主要来自
+哪一部分。旧 verbose v4 train20 仅保留为失败审计样本，不用于训练。
 
 ## 对现有数据与 Q checkpoint 的影响边界
 

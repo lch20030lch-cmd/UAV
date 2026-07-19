@@ -77,6 +77,8 @@ def analyze(data_path: str, model_name: str = "/root/autodl-tmp/huggingface/mode
     print(f"  95th %ile:   {np.percentile(lengths, 95):.0f}")
     print(f"  99th %ile:   {np.percentile(lengths, 99):.0f}")
     print(f"  99.9th %ile: {np.percentile(lengths, 99.9):.0f}")
+    print(f"  Prompt mean/max:   {prompt_lengths.mean():.0f} / {prompt_lengths.max()}")
+    print(f"  Response mean/max: {response_lengths.mean():.0f} / {response_lengths.max()}")
 
     # ---- 分桶 ----
     buckets = [512, 1024, 1536, 2048, 2560, 3072, 3584, 4096]

@@ -42,6 +42,22 @@ Return ONLY a valid JSON object with the following structure:
 Propose a warm start that maximizes: weighted sum-rate + λ_s × sensing SINR − λ_f × idle UAV penalty."""
 
 
+def _fmt_numeric_list(values, ndigits: int) -> str:
+    """紧凑格式化数值列表，避免 Python 浮点 repr 浪费 prompt token。"""
+    formatted = []
+    for value in values:
+        number = float(value)
+        if np.isnan(number):
+            formatted.append("nan")
+        elif np.isposinf(number):
+            formatted.append("inf")
+        elif np.isneginf(number):
+            formatted.append("-inf")
+        else:
+            formatted.append(f"{number:.{ndigits}f}")
+    return "[" + ",".join(formatted) + "]"
+
+
 def build_system_prompt(config: dict) -> str:
     """
     构造系统指令 (填入具体参数值)
@@ -70,19 +86,38 @@ def build_system_prompt(config: dict) -> str:
 def build_communication_summary_str(summary: dict) -> str:
     """格式化通信摘要 c(t) 为文本"""
     lines = ["[Communication Summary c(t)]"]
-    lines.append(f"  Per-user SINR (dB): {summary['per_user_sinr_db']}")
-    lines.append(f"  Per-UAV load (#users): {summary['per_uav_load']}")
-    lines.append(f"  Rate pressure (req/achievable): {summary['rate_pressure']}")
+    lines.append(
+        f"  Per-user SINR dB (u0..): {_fmt_numeric_list(summary['per_user_sinr_db'], 1)}"
+    )
+    lines.append(
+        "  Per-UAV load (m0..): ["
+        + ",".join(str(int(value)) for value in summary["per_uav_load"])
+        + "]"
+    )
+    lines.append(
+        "  Rate pressure (u0..): "
+        + _fmt_numeric_list(summary["rate_pressure"], 2)
+    )
     return "\n".join(lines)
 
 
 def build_sensing_summary_str(summary: dict) -> str:
     """格式化感知摘要 r(t) 为文本"""
     lines = ["[Sensing Summary r(t)]"]
-    lines.append(f"  Per-target sensing SINR (dB): {summary['per_target_sinr_db']}")
-    lines.append(f"  Localization difficulty (CRB/ε_max): {summary['localization_difficulty']}")
+    lines.append(
+        "  Per-target sensing SINR dB (t0..): "
+        + _fmt_numeric_list(summary["per_target_sinr_db"], 1)
+    )
+    lines.append(
+        "  Localization difficulty (t0..): "
+        + _fmt_numeric_list(summary["localization_difficulty"], 2)
+    )
     lines.append(f"  Uncovered targets (< Γ_s^min): {summary['uncovered_targets']}")
-    lines.append(f"  Best UAV per target: {summary['best_uav_per_target']}")
+    lines.append(
+        "  Best UAV per target (t0..): ["
+        + ",".join(str(int(value)) for value in summary["best_uav_per_target"])
+        + "]"
+    )
     return "\n".join(lines)
 
 
@@ -184,25 +219,19 @@ def build_indexed_association_str(env_sample) -> str:
 
     lines = [
         "[Indexed Association Map]",
-        "  delta_a rows follow UAV IDs m0..; columns follow user IDs u0.. in the order below.",
-        "  rank lists candidate UAVs from strongest to weakest channel; rel_db uses the same rank order.",
+        "  delta_a rows=m0..;cols=u0..uK-1. entry=u|x,y|weight|UAV-rank|relative-gain-dB.",
+        "  UAV-rank and relative-gain-dB share order; 0 dB is that user's strongest UAV.",
     ]
-    per_user_sinr = env_sample.comm_summary.get("per_user_sinr_db", [])
     for k in range(num_users):
         gain_k = np.maximum(gains[:, k], 1e-30)
         rank = np.argsort(-gain_k)
         best_gain = gain_k[rank[0]]
         rel_db = 10.0 * np.log10(gain_k[rank] / best_gain)
-        rank_text = ">".join(f"m{int(m)}" for m in rank)
-        rel_text = ",".join(f"{float(value):.1f}" for value in rel_db)
-        sinr_text = (
-            f"{float(per_user_sinr[k]):.1f}"
-            if k < len(per_user_sinr)
-            else "n/a"
-        )
+        rank_text = ",".join(str(int(m)) for m in rank)
+        rel_text = ",".join(f"{float(value):.0f}" for value in rel_db)
         lines.append(
-            f"  u{k}:xy={_fmt_vec(users[k], 1)},w={float(weights[k]):.2f},"
-            f"best_sinr_db={sinr_text},rank={rank_text},rel_db=[{rel_text}]"
+            f"  {k}|{float(users[k, 0]):.0f},{float(users[k, 1]):.0f}|"
+            f"{float(weights[k]):.2f}|{rank_text}|{rel_text}"
         )
 
     return "\n".join(lines)
