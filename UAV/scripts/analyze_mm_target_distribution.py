@@ -150,6 +150,102 @@ def _load_targets(records: List[Dict]) -> Dict[str, np.ndarray]:
     }
 
 
+def _align_records_by_id(
+    records: List[Dict],
+    reference_records: List[Dict],
+) -> tuple[List[Dict], List[Dict], Dict]:
+    def index_unique(items: List[Dict], label: str) -> Dict[str, Dict]:
+        indexed = {}
+        for item in items:
+            sample_id = item.get("id")
+            if not sample_id:
+                raise ValueError(f"{label} record is missing id")
+            if sample_id in indexed:
+                raise ValueError(f"duplicate {label} id: {sample_id}")
+            indexed[sample_id] = item
+        return indexed
+
+    current_by_id = index_unique(records, "current")
+    reference_by_id = index_unique(reference_records, "reference")
+    common_ids = [sample_id for sample_id in current_by_id if sample_id in reference_by_id]
+    if not common_ids:
+        raise ValueError("current and reference datasets have no common sample ids")
+
+    return (
+        [current_by_id[sample_id] for sample_id in common_ids],
+        [reference_by_id[sample_id] for sample_id in common_ids],
+        {
+            "reference_common_samples": len(common_ids),
+            "reference_current_only_samples": len(current_by_id) - len(common_ids),
+            "reference_reference_only_samples": len(reference_by_id) - len(common_ids),
+        },
+    )
+
+
+def _mean_cosine(first: np.ndarray, second: np.ndarray) -> float:
+    first_flat = first.reshape(-1, first.shape[-1]).astype(np.float64)
+    second_flat = second.reshape(-1, second.shape[-1]).astype(np.float64)
+    numerator = np.sum(first_flat * second_flat, axis=-1)
+    denominator = np.linalg.norm(first_flat, axis=-1) * np.linalg.norm(second_flat, axis=-1)
+    return float(np.mean(numerator / np.maximum(denominator, 1e-12)))
+
+
+def _compare_target_sets(
+    records: List[Dict],
+    reference_records: List[Dict],
+) -> Dict:
+    current_aligned, reference_aligned, alignment = _align_records_by_id(
+        records, reference_records
+    )
+    current = _load_targets(current_aligned)
+    reference = _load_targets(reference_aligned)
+    for name in current:
+        if current[name].shape != reference[name].shape:
+            raise ValueError(
+                f"aligned {name} shapes differ: "
+                f"{current[name].shape} != {reference[name].shape}"
+            )
+
+    current_a = np.argmax(current["delta_a"], axis=1)
+    reference_a = np.argmax(reference["delta_a"], axis=1)
+    association_match = current_a == reference_a
+    q_norm_delta = np.abs(
+        np.linalg.norm(current["delta_q"], axis=-1)
+        - np.linalg.norm(reference["delta_q"], axis=-1)
+    )
+
+    prompt_type_hist = Counter(
+        str(record.get("prompt_type", "missing")) for record in current_aligned
+    )
+    reference_prompt_type_hist = Counter(
+        str(record.get("prompt_type", "missing")) for record in reference_aligned
+    )
+
+    return {
+        **alignment,
+        "reference_delta_q_3d_cosine_mean": _mean_cosine(
+            current["delta_q"], reference["delta_q"]
+        ),
+        "reference_delta_q_xy_cosine_mean": _mean_cosine(
+            current["delta_q"][..., :2], reference["delta_q"][..., :2]
+        ),
+        "reference_delta_q_mse": float(
+            np.mean((current["delta_q"] - reference["delta_q"]) ** 2)
+        ),
+        "reference_delta_q_norm_mae": float(q_norm_delta.mean()),
+        "reference_delta_a_argmax_match_rate": float(association_match.mean()),
+        "reference_delta_a_argmax_switch_rate": float(1.0 - association_match.mean()),
+        "reference_delta_p_mse": float(
+            np.mean((current["delta_p"] - reference["delta_p"]) ** 2)
+        ),
+        "reference_delta_p_sensing_mse": float(
+            np.mean((current["delta_p"][..., -1] - reference["delta_p"][..., -1]) ** 2)
+        ),
+        "current_prompt_type_hist": dict(prompt_type_hist),
+        "reference_prompt_type_hist": dict(reference_prompt_type_hist),
+    }
+
+
 def _load_predictions(path: Optional[str]) -> Optional[Dict[str, np.ndarray]]:
     if not path:
         return None
@@ -183,6 +279,13 @@ def main():
     parser.add_argument("--sft_file", type=str, default=None)
     parser.add_argument("--prediction_npz", type=str, default=None,
                         help="可选：analyze_mm_delta_outputs.py --save_raw 生成的 npz")
+    parser.add_argument(
+        "--reference_data_dir",
+        type=str,
+        default=None,
+        help="可选：旧数据目录；按样本 id 对齐并比较新旧 q/a/p oracle 标签",
+    )
+    parser.add_argument("--reference_sft_file", type=str, default=None)
     parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
 
@@ -203,6 +306,15 @@ def main():
         summary.update(_summarize_tensor(f"target_{name}", values))
     summary.update(_summarize_association("target_delta_a", targets["delta_a"]))
     summary.update(_summarize_power_targets(targets["delta_p"], targets["delta_a"]))
+
+    if args.reference_data_dir:
+        reference_dir = Path(args.reference_data_dir)
+        reference_path = reference_dir / (
+            args.reference_sft_file or data_cfg.get("sft_file", "sft_dataset.jsonl")
+        )
+        reference_records = _load_jsonl(reference_path)
+        summary.update(_compare_target_sets(records, reference_records))
+        summary["reference_data_path"] = str(reference_path)
 
     predictions = _load_predictions(args.prediction_npz)
     if predictions is not None:
@@ -256,6 +368,25 @@ def main():
             "pred_delta_p_inactive_comm_mse",
             "pred_delta_p_sensing_mse",
             "pred_delta_p_inactive_power_leakage_mean",
+        ):
+            print(f"  {key}: {summary[key]}")
+
+    if args.reference_data_dir:
+        print("\n=== Current vs Reference Oracle Targets ===")
+        for key in (
+            "reference_common_samples",
+            "reference_current_only_samples",
+            "reference_reference_only_samples",
+            "reference_delta_q_3d_cosine_mean",
+            "reference_delta_q_xy_cosine_mean",
+            "reference_delta_q_mse",
+            "reference_delta_q_norm_mae",
+            "reference_delta_a_argmax_match_rate",
+            "reference_delta_a_argmax_switch_rate",
+            "reference_delta_p_mse",
+            "reference_delta_p_sensing_mse",
+            "current_prompt_type_hist",
+            "reference_prompt_type_hist",
         ):
             print(f"  {key}: {summary[key]}")
 

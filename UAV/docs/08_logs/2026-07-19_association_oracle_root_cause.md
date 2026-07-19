@@ -1,6 +1,6 @@
 ---
 type: log
-status: indexed_input_implemented_server_tests_pending
+status: indexed_input_tests_passed_comparison_tool_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -123,6 +123,35 @@ python -m py_compile src/data/prompt_builder.py scripts/generate_mm_smoke.py
                      tests/test_association_prompt.py: PASS
 git diff --check: PASS
 ```
+
+服务器随后完成包含 indexed prompt 在内的完整回归：
+
+```text
+Ran 24 tests in 0.248s
+OK
+```
+
+## Corrected-data 影响比较工具
+
+在生成小规模 v4 数据前，扩展现有 `analyze_mm_target_distribution.py`，新增：
+
+```text
+--reference_data_dir
+--reference_sft_file
+```
+
+脚本严格按样本 `id` 对齐新旧数据，不按文件行号猜测对应关系；输出：
+
+```text
+new-vs-old delta_q 3D / XY cosine
+delta_q MSE / norm MAE
+delta_a argmax match / switch rate
+delta_p overall / sensing MSE
+current / reference prompt_type histogram
+```
+
+新增 `tests/test_target_distribution_comparison.py`，覆盖乱序 ID 对齐、完全一致标签、Q
+方向改变、A 切换、P 差异和重复 ID 拒绝。该工具只读取 JSONL 与 numpy，不加载大模型。
 
 ## 对现有数据与 Q checkpoint 的影响边界
 
