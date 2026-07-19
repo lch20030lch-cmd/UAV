@@ -1,6 +1,6 @@
 ---
 type: log
-status: training_complete_validation_pending
+status: q_closed_step150_selected
 stage: q_only_controlled_learning_curve
 last_updated: 2026-07-19
 ---
@@ -192,3 +192,41 @@ step   projected loss   residual grad norm   adapter norm   LoRA grad norm
    3D/XY 权衡必须由四个独立 val100 结果决定。
 
 当前不选择 step 200，也不转入 A；下一步严格执行 50/100/150/200 的独立验证比较。
+
+## 四节点独立 val100 结果
+
+```text
+step   3D cosine   XY cosine   direction std   Q warning   violation
+50     0.615960    0.683122    0.442655        yes         0.0
+100    0.623934    0.692386    0.432132        no          0.0
+150    0.624318    0.693525    0.434704        no          0.0
+200    0.624162    0.692636    0.431530        no          0.0
+
+fixed  0.582721    0.693712
+target direction std: 0.556831
+```
+
+step 150 相对 fixed geometry：
+
+```text
+3D cosine gain:  +0.041597
+XY cosine change: -0.000187
+mobility violation ratio: 0.0
+```
+
+最终判定：
+
+1. 选择 step 150，不默认选择最后的 step 200；
+2. step 150 在独立验证集上获得明确 3D 增益，同时基本保持 fixed XY；
+3. step 100–200 的 direction std 在 0.4315–0.4347 范围内进入平台，没有继续训练导致的
+   渐进坍缩，但仍低于 target 0.5568，作为后续联合评估的监控项保留；
+4. step 100 起 Q warning 消失，所有 checkpoint 的物理违规率均为 0；
+5. Q residual 通过本阶段单分支效果门槛，Q 主线闭环，不再增加步数或新增 Q 模式；
+6. 后续使用 step 150 的 projection/control states，并配套 Q2 中已冻结的同一份 LoRA；
+7. 只有把 step 150 提升成自包含 checkpoint 后，主线才转入 A。
+
+用于后续阶段的自包含目录命名为：
+
+```text
+/root/autodl-tmp/outputs/mm_geom_v3_stage_q4_residual_curve200/mm_sft_lora_selected_step150
+```
