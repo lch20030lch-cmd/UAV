@@ -1,6 +1,6 @@
 ---
 type: log
-status: association_gradient_accumulation_fix_server_test_pending
+status: association_gradient_accumulation_fixed_corrected_data_scaleup_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -429,6 +429,39 @@ flat-linear train CE:           0.000246
 该修复会改变旧 smoke 的实际训练语义：默认配置下一个 optimizer step 现在消耗 8 个
 micro-batch。旧 checkpoint 仍可加载，但旧日志中的 `step` 实际代表 batch-size-1 update，
 与修复后的 optimizer step 不可直接按步数比较。
+
+## A6 真实模型梯度累积烟雾验证
+
+从干净的 selected Q checkpoint 初始化，冻结 LoRA/Q/P，仅训练 A；使用 train20、
+`gradient_accumulation_steps=20`、`max_steps=2`：
+
+```text
+optimizer steps:             2
+gradient accumulation:       20
+effective batch size:        20
+isolated projection branch:  association
+trainable A tensors:          17
+trainable LoRA tensors:       0
+```
+
+真实运行日志：
+
+```text
+step=1 micro_step=20 epoch=1 loss_ctl=1.733209 raw_ce=1.428772 grad_A=0.231336
+step=2 micro_step=40 epoch=2 loss_ctl=1.695446 raw_ce=1.404761 grad_A=0.146547
+LoRA grad: 0.0
+Q residual grad: 0.0
+Q residual norm: 0.045474 -> 0.045474
+```
+
+判定：
+
+1. 每 20 个 micro-batch 只执行一次 optimizer update，累积边界正确；
+2. 日志 loss 是完整窗口均值，两个 update 的 loss/raw CE 均下降；
+3. A 梯度非零，LoRA/Q residual 梯度为零，分支隔离正确；
+4. 无 NaN/Inf，真实 Gemma + image + control-token 训练链路通过；
+5. 梯度累积修复完成。下一步不再在 train20 上长训，生成 compact corrected
+   train500/val100 后做 A+LoRA 泛化预检。
 
 ## 对现有数据与 Q checkpoint 的影响边界
 
