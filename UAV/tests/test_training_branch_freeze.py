@@ -1,8 +1,14 @@
 import unittest
 
+import torch
 import torch.nn as nn
 
-from src.training.train_sft_mm import _freeze_projection_except
+from src.training.train_sft_mm import (
+    _backward_accumulated_loss,
+    _freeze_projection_except,
+    _is_accumulation_boundary,
+    _resolve_gradient_accumulation_steps,
+)
 
 
 class _DummyProjectionHead(nn.Module):
@@ -46,6 +52,41 @@ class ProjectionBranchFreezeTest(unittest.TestCase):
         self.assertEqual(actual_trainable, expected_trainable)
         self.assertEqual(set(trainable), expected_trainable)
         self.assertTrue(set(frozen).isdisjoint(expected_trainable))
+
+    def test_gradient_accumulation_uses_config_or_explicit_override(self):
+        config = {"gradient_accumulation_steps": 8}
+
+        self.assertEqual(_resolve_gradient_accumulation_steps(config), 8)
+        self.assertEqual(_resolve_gradient_accumulation_steps(config, 20), 20)
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            _resolve_gradient_accumulation_steps(config, 0)
+
+    def test_optimizer_boundary_occurs_only_after_full_accumulation_window(self):
+        boundaries = [
+            step
+            for step in range(1, 17)
+            if _is_accumulation_boundary(step, 8)
+        ]
+        self.assertEqual(boundaries, [8, 16])
+
+    def test_accumulated_gradient_matches_full_batch_mean(self):
+        accumulated = nn.Linear(1, 1, bias=False)
+        full_batch = nn.Linear(1, 1, bias=False)
+        full_batch.load_state_dict(accumulated.state_dict())
+        inputs = torch.tensor([[1.0], [3.0]])
+        targets = torch.tensor([[0.5], [-0.5]])
+
+        for index in range(2):
+            prediction = accumulated(inputs[index:index + 1])
+            loss = (prediction - targets[index:index + 1]).square().mean()
+            _backward_accumulated_loss(loss, accumulation_steps=2)
+
+        full_loss = (full_batch(inputs) - targets).square().mean()
+        full_loss.backward()
+
+        self.assertTrue(
+            torch.allclose(accumulated.weight.grad, full_batch.weight.grad)
+        )
 
     def test_direct_q_isolation_only_keeps_q_readout_and_mlp_trainable(self):
         model = _DummyModel()

@@ -9,7 +9,7 @@ BEV-image Gemma3 多模态 SFT 烟雾测试。
 
 它用于在前向传播烟雾测试已通过后验证训练闭环：
   dataset -> multimodal forward -> projection head -> control loss
-  -> backward -> optimizer step -> checkpoint
+  -> accumulated backward -> optimizer step -> checkpoint
 
 如需测试 LoRA 链路，可显式传入 --train_lora。
 """
@@ -61,6 +61,26 @@ def _parameter_norm(parameters) -> float:
     for param in parameters:
         total += param.detach().float().norm().item() ** 2
     return total ** 0.5
+
+
+def _resolve_gradient_accumulation_steps(train_cfg: dict, override=None) -> int:
+    steps = int(
+        override
+        if override is not None
+        else train_cfg.get("gradient_accumulation_steps", 1)
+    )
+    if steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be a positive integer")
+    return steps
+
+
+def _is_accumulation_boundary(micro_step: int, accumulation_steps: int) -> bool:
+    return micro_step > 0 and micro_step % accumulation_steps == 0
+
+
+def _backward_accumulated_loss(loss: torch.Tensor, accumulation_steps: int):
+    """Scale one micro-batch loss so accumulated gradients form a batch mean."""
+    (loss / accumulation_steps).backward()
 
 
 def _save_mm_smoke(model, save_dir: Path, metadata: dict, save_lora: bool = False):
@@ -163,6 +183,7 @@ def train_mm_sft_smoke(
     freeze_all_except_q: bool = False,
     freeze_all_except_q_cue: bool = False,
     freeze_all_except_p: bool = False,
+    gradient_accumulation_steps: int = None,
 ):
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -179,6 +200,10 @@ def train_mm_sft_smoke(
     model_name = model_path or model_cfg["backbone"]
     max_seq_length = int(max_length or train_cfg["max_seq_length"])
     steps_limit = int(max_steps or train_cfg.get("phase1", {}).get("max_steps", 30))
+    grad_accum_steps = _resolve_gradient_accumulation_steps(
+        train_cfg,
+        gradient_accumulation_steps,
+    )
     out_root = Path(output_dir or cfg.get("output_dir", "/root/autodl-tmp/outputs/mm_smoke"))
     ckpt_root = Path(
         checkpoint_dir
@@ -203,7 +228,12 @@ def train_mm_sft_smoke(
     print(f"  data:       {sft_path}")
     print(f"  model:      {model_name}")
     print(f"  max_length: {max_seq_length}")
-    print(f"  steps:      {steps_limit}")
+    print(f"  optimizer steps: {steps_limit}")
+    print(f"  gradient accumulation: {grad_accum_steps}")
+    print(
+        "  effective batch size: "
+        f"{int(train_cfg['per_device_batch_size']) * grad_accum_steps}"
+    )
     print(f"  checkpoints:{ckpt_root} (every {checkpoint_interval} steps)")
     print("  input mode: prompt + image + control tokens (response omitted)")
     if train_lora:
@@ -409,7 +439,10 @@ def train_mm_sft_smoke(
 
     device = model.device
     global_step = 0
+    micro_step = 0
     epoch = 0
+    metric_sums = {}
+    optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(total=steps_limit, desc="MM SFT smoke")
 
     while global_step < steps_limit:
@@ -474,8 +507,23 @@ def train_mm_sft_smoke(
                     inactive_power.mean().item() if inactive_power.numel() else 0.0
                 )
 
-            optimizer.zero_grad(set_to_none=True)
-            total_loss.backward()
+            if not torch.isfinite(total_loss):
+                raise RuntimeError("Non-finite loss detected in multimodal SFT smoke.")
+
+            _backward_accumulated_loss(total_loss, grad_accum_steps)
+            micro_step += 1
+            for key, value in metrics.items():
+                if isinstance(value, (int, float)):
+                    metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
+
+            if not _is_accumulation_boundary(micro_step, grad_accum_steps):
+                continue
+
+            metrics = {
+                key: value / grad_accum_steps
+                for key, value in metric_sums.items()
+            }
+            metric_sums = {}
             grad_norm = _grad_norm(model.projection_head.parameters())
             grad_norm_lora = _grad_norm(lora_params) if train_lora else 0.0
             q_residual_adapter = getattr(model.projection_head, "q_residual_adapter", None)
@@ -487,6 +535,7 @@ def train_mm_sft_smoke(
             clip_params = list(model.projection_head.parameters()) + lora_params
             torch.nn.utils.clip_grad_norm_(clip_params, cfg["hardware"].get("max_grad_norm", 1.0))
             optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
             q_residual_adapter_norm = (
                 _parameter_norm(q_residual_adapter.parameters())
                 if q_residual_adapter is not None
@@ -496,7 +545,7 @@ def train_mm_sft_smoke(
             global_step += 1
             pbar.update(1)
             pbar.write(
-                f"step={global_step} epoch={epoch} "
+                f"step={global_step} micro_step={micro_step} epoch={epoch} "
                 f"loss_ctl={metrics['loss_ctl']:.6f} "
                 f"loss_total={metrics['loss_total']:.6f} "
                 f"loss_a_ce={metrics['loss_a_ce']:.6f} "
@@ -517,15 +566,17 @@ def train_mm_sft_smoke(
                 f"q_residual_adapter_norm={q_residual_adapter_norm:.6f}"
             )
 
-            if torch.isnan(total_loss):
-                raise RuntimeError("NaN loss detected in multimodal SFT smoke.")
-
             if global_step % checkpoint_interval == 0:
                 _save_mm_smoke(
                     model,
                     ckpt_root / f"mm_sft_{'lora_' if lora_enabled else ''}smoke_step_{global_step}",
                     {
                         "global_step": global_step,
+                        "micro_step": micro_step,
+                        "gradient_accumulation_steps": grad_accum_steps,
+                        "effective_batch_size": (
+                            int(train_cfg["per_device_batch_size"]) * grad_accum_steps
+                        ),
                         "loss_ctl": metrics["loss_ctl"],
                         "loss_total": metrics["loss_total"],
                         "grad_norm_proj": grad_norm,
@@ -580,6 +631,11 @@ def train_mm_sft_smoke(
         final_dir,
         {
             "global_step": global_step,
+            "micro_step": micro_step,
+            "gradient_accumulation_steps": grad_accum_steps,
+            "effective_batch_size": (
+                int(train_cfg["per_device_batch_size"]) * grad_accum_steps
+            ),
             "max_steps": steps_limit,
             "max_seq_length": max_seq_length,
             "trainable": trainable_label,
@@ -697,6 +753,12 @@ if __name__ == "__main__":
                         help="只训练 q 几何候选方向头 readout_q_cue，用于 B6")
     parser.add_argument("--freeze_all_except_p", action="store_true",
                         help="split head 下只训练 readout_p / p_mlp，用于 P-only 修复")
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=None,
+        help="覆盖配置中的梯度累积步数；max_steps 始终表示 optimizer updates",
+    )
     args = parser.parse_args()
 
     train_mm_sft_smoke(
@@ -730,4 +792,5 @@ if __name__ == "__main__":
         freeze_all_except_q=args.freeze_all_except_q,
         freeze_all_except_q_cue=args.freeze_all_except_q_cue,
         freeze_all_except_p=args.freeze_all_except_p,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )

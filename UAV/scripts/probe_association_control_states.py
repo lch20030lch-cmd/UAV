@@ -324,8 +324,9 @@ def main():
     flat_accuracy = report["probes"].get("flat_linear", {}).get("train", {}).get("accuracy")
     if exact_accuracy is not None and exact_accuracy >= args.overfit_threshold:
         conclusion = (
-            "ONLINE OPTIMIZATION BOTTLENECK: the online-equivalent A head can overfit "
-            "cached states with full-batch optimization."
+            "TRAIN-FIT REGIME BOTTLENECK: the online-equivalent A head can memorize "
+            "cached training states with full-batch optimization; this does not "
+            "establish held-out generalization."
         )
     elif flat_accuracy is not None and flat_accuracy >= args.overfit_threshold:
         conclusion = (

@@ -1,6 +1,6 @@
 ---
 type: log
-status: corrected_val20_q_preflight_passed_a_overfit_pending
+status: association_gradient_accumulation_fix_server_test_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -397,6 +397,38 @@ online_equivalent train < 0.90, flat_linear train >= 0.90
 
 新增单元测试覆盖两种 readout 输出形状及精确 logits 的 ranking 指标。本机已完成 Python
 语法检查和 `git diff --check`；PyTorch/NumPy 单测需在服务器 `uavmllm` 环境执行。
+
+## 缓存探针结果与训练器根因
+
+```text
+online-equivalent train / val:  1.0000 / 0.2275
+online-equivalent train CE:     0.000320
+flat-linear train / val:        1.0000 / 0.2150
+flat-linear train CE:           0.000246
+```
+
+结论边界：
+
+1. 相同 A 头在缓存 states 上可以完全拟合，排除 A 头容量不足；
+2. flat linear 同样完全拟合，说明 20 个训练环境的 states 可区分；
+3. 两种 probe 的独立 val 都接近随机，因此 train `1.0` 只是记忆，不能证明 frozen states
+   含有可泛化的 corrected-association 表示；
+4. 审计 `train_sft_mm.py` 发现配置中的 `gradient_accumulation_steps: 8` 从未被使用：旧循环
+   每个 micro-batch 都执行 `zero_grad -> backward -> optimizer.step`，实际有效 batch 始终为 1。
+
+训练器修复：
+
+- `max_steps` 明确定义为 optimizer update 数；
+- loss 除以 accumulation steps 后累积梯度，只在完整累积窗口执行 clip/step/zero-grad；
+- 日志同时记录 `step`（optimizer step）和 `micro_step`；
+- loss 日志改为累积窗口均值；
+- checkpoint metadata 写入 accumulation steps、micro step 和 effective batch size；
+- 新增 CLI `--gradient_accumulation_steps`，可覆盖配置；
+- 单元测试覆盖配置/覆盖值、optimizer boundary，以及累积梯度与 full-batch mean 等价性。
+
+该修复会改变旧 smoke 的实际训练语义：默认配置下一个 optimizer step 现在消耗 8 个
+micro-batch。旧 checkpoint 仍可加载，但旧日志中的 `step` 实际代表 batch-size-1 update，
+与修复后的 optimizer step 不可直接按步数比较。
 
 ## 对现有数据与 Q checkpoint 的影响边界
 
