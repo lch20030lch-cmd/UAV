@@ -1,6 +1,6 @@
 ---
 type: log
-status: vision_frozen_association_controlled_rerun_pending
+status: vision_frozen_association_output_diagnostics_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -896,3 +896,23 @@ The fix now passes the full path from trainable-parameter selection through opti
 updates and checkpoint serialization. A controlled 50-update rerun from the same clean
 selected-Q checkpoint is authorized. Relative to A10, the only training-path change is
 that vision LoRA remains frozen; language LoRA and the A projection branch still train.
+
+## A12 vision-frozen controlled training curve
+
+The 50-update run satisfies all repaired contracts: 272 trainable language LoRA,
+zero trainable vision LoRA, 599 frozen vision parameters, isolated A projection,
+independent clipping, zero Q-residual gradient, and no numerical/runtime errors.
+
+Its raw association CE remains essentially identical to A10:
+
+```text
+step                 10        20        30        40        50
+A10 raw CE         1.39645   1.38707   1.39479   1.41007   1.39661
+A12 raw CE         1.39634   1.39016   1.39270   1.40226   1.39713
+```
+
+Thus the vision-freeze defect is real and must remain fixed, but it is not sufficient
+to make online A optimization learn. Do not extend A12. Compare train500/val100 output
+and control-state variance against selected-Q/A10 next. If state variance still halves,
+language-LoRA adaptation or production-readout conditioning is the remaining collapse
+path; if variance is preserved but A remains random, focus on the A optimizer/readout.
