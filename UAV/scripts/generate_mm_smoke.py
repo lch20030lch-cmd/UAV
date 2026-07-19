@@ -133,7 +133,7 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
 
     common = {
         "bev_image_path": env_sample.bev_image_path,
-        "prompt_type": "multimodal_bev_image_v3_compact_geometry",
+        "prompt_type": "multimodal_bev_image_v4_indexed_association",
         "bev_grid_text": env_sample.bev_grid_text,
         "q_current": q_current.tolist(),
         "delta_q": delta_q.tolist(),

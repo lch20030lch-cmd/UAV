@@ -163,6 +163,51 @@ def build_geometry_guidance_str(env_sample, config: dict) -> str:
     return "\n".join(lines)
 
 
+def build_indexed_association_str(env_sample) -> str:
+    """为 association 输出补齐用户列索引与候选 UAV 链路信息。"""
+    users = np.asarray(env_sample.u_positions, dtype=np.float64)
+    weights = np.asarray(env_sample.user_weights, dtype=np.float64)
+    gains = np.asarray(env_sample.channel_gains_users, dtype=np.float64)
+
+    if users.ndim != 2 or users.shape[1] != 2:
+        raise ValueError(f"u_positions must have shape (K, 2), got {users.shape}")
+    num_users = users.shape[0]
+    if weights.shape != (num_users,):
+        raise ValueError(
+            f"user_weights must have shape {(num_users,)}, got {weights.shape}"
+        )
+    if gains.ndim != 2 or gains.shape[1] != num_users:
+        raise ValueError(
+            "channel_gains_users must have shape (M, K) aligned with users, "
+            f"got {gains.shape}"
+        )
+
+    lines = [
+        "[Indexed Association Map]",
+        "  delta_a rows follow UAV IDs m0..; columns follow user IDs u0.. in the order below.",
+        "  rank lists candidate UAVs from strongest to weakest channel; rel_db uses the same rank order.",
+    ]
+    per_user_sinr = env_sample.comm_summary.get("per_user_sinr_db", [])
+    for k in range(num_users):
+        gain_k = np.maximum(gains[:, k], 1e-30)
+        rank = np.argsort(-gain_k)
+        best_gain = gain_k[rank[0]]
+        rel_db = 10.0 * np.log10(gain_k[rank] / best_gain)
+        rank_text = ">".join(f"m{int(m)}" for m in rank)
+        rel_text = ",".join(f"{float(value):.1f}" for value in rel_db)
+        sinr_text = (
+            f"{float(per_user_sinr[k]):.1f}"
+            if k < len(per_user_sinr)
+            else "n/a"
+        )
+        lines.append(
+            f"  u{k}:xy={_fmt_vec(users[k], 1)},w={float(weights[k]):.2f},"
+            f"best_sinr_db={sinr_text},rank={rank_text},rel_db=[{rel_text}]"
+        )
+
+    return "\n".join(lines)
+
+
 def build_full_prompt(
     env_sample,
     config: dict,
@@ -216,12 +261,14 @@ def build_multimodal_prompt(
     parts.append(build_communication_summary_str(env_sample.comm_summary))
     parts.append(build_sensing_summary_str(env_sample.sensing_summary))
     parts.append(build_geometry_guidance_str(env_sample, config))
+    parts.append(build_indexed_association_str(env_sample))
     parts.append(
         "[Bird's-Eye-View Image]\n"
         "The attached BEV image uses the same compact geometry cues: blue triangles are UAVs, "
         "green users are scaled by demand weight, red X markers are sensing targets, "
         "blue rings show the per-slot mobility radius, purple lines point to the weighted user center, "
-        "green lines point to nearest users, and orange dashed lines point to nearest sensing targets."
+        "green lines point to nearest users, and orange dashed lines point to nearest sensing targets. "
+        "Visual markers are intentionally uncluttered; use the Indexed Association Map for exact user IDs."
     )
     parts.append("\nNow propose the warm-start decision prior delta in JSON format.")
 

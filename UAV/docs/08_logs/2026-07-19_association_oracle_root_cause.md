@@ -1,6 +1,6 @@
 ---
 type: log
-status: solver_repair_implemented_server_tests_pending
+status: indexed_input_implemented_server_tests_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -71,6 +71,16 @@ git diff --check: PASS
 
 本机没有 numpy/scipy，数值单测需在服务器 `uavmllm` 环境运行。
 
+服务器已执行包含新 solver 测试在内的完整回归：
+
+```text
+Ran 21 tests in 0.200s
+OK
+```
+
+三个 association solver 测试、Q geometry、delta diagnostics、分支冻结与 power 测试
+全部通过。Oracle 标签锁死修复验收完成。
+
 ## 根因 2：输入缺少输出矩阵的索引映射
 
 当前 BEV 将所有用户画为没有编号的绿色点、所有 UAV 画为没有编号的蓝色三角；
@@ -82,6 +92,37 @@ git diff --check: PASS
 
 该问题暂不和 solver 修复混在同一个提交中。solver 数值测试通过后，再用一个紧凑的
 indexed association map 补齐 user/UAV 身份与候选链路信息，不修改 A 投影头结构。
+
+## Indexed Association Map 实现
+
+solver 的 21 项回归通过后，第二个提交只修改数据输入，不修改模型：
+
+```text
+[Indexed Association Map]
+delta_a rows: m0..m3
+delta_a columns: u0..u19
+u{k}: xy, demand weight, best SINR, UAV channel rank, ranked relative gain dB
+```
+
+设计选择：
+
+1. UAV 坐标继续复用已有 Geometry Guidance，不重复增加一套视觉分支；
+2. 每个用户一行，明确矩阵列索引与 BEV 位置的对应关系；
+3. 给出完整四 UAV 候选排名和相对增益，容量约束导致首选 UAV 满载时仍有次优信息；
+4. BEV 保持无文字拥挤，精确 ID 由文本 map 提供；
+5. 新数据写入 `prompt_type=multimodal_bev_image_v4_indexed_association`，防止和旧 v3
+   数据静默混用。
+
+新增 `tests/test_association_prompt.py`，覆盖用户列 ID、位置、权重、SINR、候选 UAV
+排名、map 在图像说明前的顺序以及 shape 校验。
+
+本地静态检查：
+
+```text
+python -m py_compile src/data/prompt_builder.py scripts/generate_mm_smoke.py
+                     tests/test_association_prompt.py: PASS
+git diff --check: PASS
+```
 
 ## 对现有数据与 Q checkpoint 的影响边界
 
