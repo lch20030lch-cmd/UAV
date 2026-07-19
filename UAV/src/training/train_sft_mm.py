@@ -102,7 +102,7 @@ def _set_projection_branch_trainable(model, branch_prefixes, trainable: bool):
     """按名称冻结/解冻 split projection head 的指定分支。"""
     changed = []
     for name, param in model.projection_head.named_parameters():
-        if any(name.startswith(prefix) for prefix in branch_prefixes):
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in branch_prefixes):
             param.requires_grad = trainable
             changed.append(name)
     return changed
@@ -113,7 +113,10 @@ def _freeze_projection_except(model, trainable_prefixes):
     frozen = []
     trainable = []
     for name, param in model.projection_head.named_parameters():
-        keep_trainable = any(name.startswith(prefix) for prefix in trainable_prefixes)
+        keep_trainable = any(
+            name == prefix or name.startswith(f"{prefix}.")
+            for prefix in trainable_prefixes
+        )
         param.requires_grad = keep_trainable
         if keep_trainable:
             trainable.append(name)
@@ -146,6 +149,7 @@ def train_mm_sft_smoke(
     q_geometry_mode: str = None,
     freeze_assoc_branch: bool = False,
     freeze_qp_branch: bool = False,
+    freeze_all_except_q: bool = False,
     freeze_all_except_q_cue: bool = False,
     freeze_all_except_p: bool = False,
 ):
@@ -192,6 +196,7 @@ def train_mm_sft_smoke(
     freeze_modes = (
         freeze_assoc_branch,
         freeze_qp_branch,
+        freeze_all_except_q,
         freeze_all_except_q_cue,
         freeze_all_except_p,
     )
@@ -235,6 +240,12 @@ def train_mm_sft_smoke(
             trainable_prefixes=("readout_p", "p_mlp"),
         )
         isolated_projection_branch = "power"
+    elif freeze_all_except_q:
+        frozen_projection_branches, trainable_projection_branches = _freeze_projection_except(
+            model,
+            trainable_prefixes=("readout_q", "q_mlp"),
+        )
+        isolated_projection_branch = "q"
     elif freeze_all_except_q_cue:
         frozen_projection_branches, trainable_projection_branches = _freeze_projection_except(
             model,
@@ -473,6 +484,7 @@ def train_mm_sft_smoke(
                         "q_geometry_mode": q_geom_mode,
                         "freeze_assoc_branch": freeze_assoc_branch,
                         "freeze_qp_branch": freeze_qp_branch,
+                        "freeze_all_except_q": freeze_all_except_q,
                         "freeze_all_except_q_cue": freeze_all_except_q_cue,
                         "freeze_all_except_p": freeze_all_except_p,
                         "frozen_projection_tensors": len(frozen_projection_branches),
@@ -514,6 +526,7 @@ def train_mm_sft_smoke(
             "q_geometry_mode": q_geom_mode,
             "freeze_assoc_branch": freeze_assoc_branch,
             "freeze_qp_branch": freeze_qp_branch,
+            "freeze_all_except_q": freeze_all_except_q,
             "freeze_all_except_q_cue": freeze_all_except_q_cue,
             "freeze_all_except_p": freeze_all_except_p,
             "frozen_projection_tensors": len(frozen_projection_branches),
@@ -580,6 +593,8 @@ if __name__ == "__main__":
                         help="split head 下冻结 association 分支，主要用于 Stage B2 训练 q/p")
     parser.add_argument("--freeze_qp_branch", action="store_true",
                         help="split head 下冻结 q/p 分支，主要用于 Stage A2 训练 association")
+    parser.add_argument("--freeze_all_except_q", action="store_true",
+                        help="split head 下只训练 readout_q / q_mlp，用于 direct Q 修复")
     parser.add_argument("--freeze_all_except_q_cue", action="store_true",
                         help="只训练 q 几何候选方向头 readout_q_cue，用于 B6")
     parser.add_argument("--freeze_all_except_p", action="store_true",
@@ -610,6 +625,7 @@ if __name__ == "__main__":
         q_geometry_mode=args.q_geometry_mode,
         freeze_assoc_branch=args.freeze_assoc_branch,
         freeze_qp_branch=args.freeze_qp_branch,
+        freeze_all_except_q=args.freeze_all_except_q,
         freeze_all_except_q_cue=args.freeze_all_except_q_cue,
         freeze_all_except_p=args.freeze_all_except_p,
     )

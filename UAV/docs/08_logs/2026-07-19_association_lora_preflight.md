@@ -1,6 +1,6 @@
 ---
 type: log
-status: a4_lora_preflight_complete_validation_pending
+status: a4_safe_but_negligible_gain_stop
 stage: multimodal_association_lora_preflight
 last_updated: 2026-07-19
 ---
@@ -55,3 +55,54 @@ LoRA 会改变 q/a/p 共享的 control states。即使 `freeze_qp_branch` 冻结
 5. train/val gap 不能明显扩大。
 
 只有 A 提升且 P/Q 没有不可接受回退，才允许从 200-step 预检进入更长 A+LoRA 训练。
+
+## Train500 / 独立 val100 结果
+
+Train500：
+
+```text
+association accuracy: 0.4445
+fixed-user baseline:  0.3173
+oracle probability:   0.3920
+power MSE:             0.008004
+power leakage:         0.026634
+q raw dir cosine:      0.1550
+```
+
+独立 val100：
+
+```text
+association accuracy: 0.4300
+fixed-user baseline:  0.3115
+oracle probability:   0.3735
+power MSE:             0.007733
+power leakage:         0.026880
+q raw dir cosine:      0.0871
+loaded_lora_checkpoint: <checkpoint>/lora
+```
+
+相对 A3 projection-only 独立 val100：
+
+```text
+A accuracy:        0.4280 -> 0.4300  (+0.0020)
+A oracle prob:     0.3559 -> 0.3735  (+0.0176)
+P overall MSE:     0.007854 -> 0.007733
+P leakage:         0.027736 -> 0.026880
+P sensing MSE:     0.093709 -> 0.091488
+Q dir cosine:      0.1026 -> 0.0871
+train/val A gap:   0.0145
+```
+
+判定：
+
+```text
+PASS: LoRA checkpoint 正确加载，train/val gap 仍小；
+PASS: P 没有回退，总误差、泄漏和 sensing MSE 小幅改善；
+PASS: Q 没有数值塌缩；
+FAIL: A accuracy 只提升 0.2 个百分点，不构成长训 A-only LoRA 的收益证据；
+FAIL: Q direction cosine 略有下降。
+```
+
+因此停止继续延长 A-only LoRA。A4 可作为后续 direct-Q + LoRA 的初始化，但 A 仅
+作为 soft signal，不启用 hard association mask；A3 与 P0.1 checkpoint 继续保留为
+无 LoRA 回滚点。
