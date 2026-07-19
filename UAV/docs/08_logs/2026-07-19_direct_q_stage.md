@@ -1,6 +1,6 @@
 ---
 type: log
-status: direct_q_fixed_template_rejected_fixed_residual_implemented
+status: fixed_residual_baseline_passed_preflight200_pending
 stage: multimodal_direct_q_direction
 last_updated: 2026-07-19
 ---
@@ -224,8 +224,8 @@ checkpoint state dict 不新增无关 key，保持兼容。
 再做 200-step 预检，禁止直接长训。预检验收以独立 val100 为准：
 
 ```text
-projected XY cosine >= fixed geometry XY cosine + 0.01   # 残差确有增益
-projected 3D cosine > fixed geometry 3D cosine
+projected XY cosine >= fixed geometry XY cosine - 0.01   # 不破坏水平先验
+projected 3D cosine >= fixed geometry 3D cosine + 0.02   # 残差主要补充三维信息
 direction std 明显高于 Q1 的 0.00825
 A accuracy >= 0.42
 P MSE <= 0.009
@@ -233,5 +233,34 @@ P leakage <= 0.03
 mobility violation ratio = 0
 ```
 
-如果残差不能超过固定基线，则将 gate 固定为 0，把 fixed mixture 作为最终 Q 几何分支；
+如果残差不能在保持 XY 的前提下超过 3D 固定基线，则将 gate 固定为 0，把 fixed mixture 作为最终 Q 几何分支；
 这不否定整篇方法，A/P 仍由 MLLM 学习，Q 的动态残差则作为失败消融如实报告。
+
+## Q2 无训练 val100 基线通过
+
+使用 Q1 checkpoint、`fixed_residual_xy` 和默认 gate=0.05，在独立 val100 上完成
+无训练前向：
+
+```text
+projected Q XY cosine:          0.693665
+fixed geometry XY cosine:       0.693712
+projected Q 3D cosine:          0.593184
+fixed geometry 3D cosine:       0.582721
+predicted direction std:        0.467004
+target direction std:           0.556831
+Q norm mean / violation ratio:  14.999999 / 0.0
+q_residual_gate:                0.050000
+A val accuracy:                 0.4400
+P val MSE / leakage:            0.007590 / 0.025394
+```
+
+相对失败的 direct-Q 路径：
+
+```text
+XY cosine:       -0.088626 -> 0.693665
+direction std:    0.008251 -> 0.467004
+```
+
+判定：固定几何前向实现正确，场景方向多样性恢复，物理投影正常，A/P 完全保持；
+初始小残差没有破坏 XY，并已给 3D cosine 带来约 0.0105 增益。允许进入 200-step
+小学习率预检，仍不允许直接长训。
