@@ -1,6 +1,6 @@
 ---
 type: log
-status: lora_scope_and_control_path_code_audit_pending
+status: nested_vision_lora_freeze_server_test_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -831,3 +831,36 @@ Compare selected-Q and A10 adapter tensors grouped by parameter path before chan
 training or architecture. If vision-path LoRA tensors changed, fix the freeze/injection
 scope first. If they did not, audit control-token placement and production-readout
 conditioning next.
+
+## Confirmed vision-LoRA freeze defect and fix
+
+Selected-Q versus A10 adapter comparison:
+
+```text
+adapter tensor keys:              434 -> 434, exact match
+language LoRA changed tensors:    272 / 272
+language relative delta norm:     0.037790
+vision LoRA changed tensors:      162 / 162
+vision relative delta norm:       0.032448
+control embedding delta norm:     0.0
+```
+
+This confirms that `freeze_vision_tower=true` did not freeze nested vision-side LoRA
+after PEFT wrapping. The old direct top-level attribute lookup missed parameters whose
+actual paths are nested below wrapper layers. A-only supervision therefore updated all
+162 vision adapter tensors on 500 environments while the control-state variance
+collapsed.
+
+Fix:
+
+1. After LoRA load/injection, recursively traverse full parameter names and freeze all
+   paths containing `vision`, preserving their loaded selected-Q values.
+2. At trainer startup, separately count language and vision LoRA tensors.
+3. If vision freezing is configured but any trainable vision LoRA remains, abort before
+   constructing the optimizer.
+4. Print and persist trainable-language, trainable-vision, and frozen-vision counts.
+5. Add a nested-wrapper regression test proving vision base/LoRA parameters freeze while
+   language parameters remain trainable.
+
+Do not reuse A8/A10. First run server tests and a two-update clean selected-Q smoke; the
+startup contract is `trainable vision LoRA: 0` with nonzero language LoRA.

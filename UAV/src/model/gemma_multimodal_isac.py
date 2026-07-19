@@ -22,6 +22,27 @@ def _first_device(module: nn.Module) -> torch.device:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def is_vision_parameter_name(name: str) -> bool:
+    """Return whether a nested PEFT parameter belongs to the vision tower."""
+    return "vision" in name.lower()
+
+
+def freeze_vision_parameter_tree(module: nn.Module) -> list[str]:
+    """Freeze vision parameters after PEFT wrapping, including injected LoRA.
+
+    PEFT nests the original Gemma3 model below several wrappers, so direct
+    ``getattr(model, 'vision_tower')`` lookup can miss the actual parameters.
+    Matching full parameter paths freezes both base vision weights and every
+    vision-side LoRA tensor without relying on wrapper-specific attributes.
+    """
+    frozen = []
+    for name, parameter in module.named_parameters():
+        if is_vision_parameter_name(name):
+            parameter.requires_grad = False
+            frozen.append(name)
+    return frozen
+
+
 class Gemma3MultimodalISAC(nn.Module):
     def __init__(
         self,
@@ -122,13 +143,15 @@ class Gemma3MultimodalISAC(nn.Module):
             raise AttributeError("Cannot find hidden_size in Gemma3 multimodal config.")
         self.hidden_dim = hidden_dim
 
+        self.frozen_vision_parameter_names = []
         if freeze_vision_tower:
-            vision_tower = getattr(self.base_model, "vision_tower", None)
-            if vision_tower is None:
-                vision_tower = getattr(self.base_model, "vision_model", None)
-            if vision_tower is not None:
-                for param in vision_tower.parameters():
-                    param.requires_grad = False
+            self.frozen_vision_parameter_names = freeze_vision_parameter_tree(
+                self.base_model
+            )
+            if not self.frozen_vision_parameter_names:
+                raise RuntimeError(
+                    "freeze_vision_tower=True but no nested vision parameters were found"
+                )
 
         if hasattr(self.base_model, "gradient_checkpointing_enable"):
             self.base_model.gradient_checkpointing_enable()

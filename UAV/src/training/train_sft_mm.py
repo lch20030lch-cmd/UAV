@@ -35,6 +35,7 @@ from transformers import set_seed
 
 from src.data.multimodal_dataset import MultimodalSFTDataset
 from src.model import Gemma3MultimodalISAC, UAVISACLosses, build_proj_head_config
+from src.model.gemma_multimodal_isac import is_vision_parameter_name
 
 
 def _move_batch(batch, device):
@@ -428,10 +429,24 @@ def train_mm_sft_smoke(
     )
     # 默认只训练投影头；--load_lora 只加载并冻结 adapter，--train_lora 才更新它。
     proj_params = [p for p in model.projection_head.parameters() if p.requires_grad]
-    lora_params = [
-        p for n, p in model.base_model.named_parameters()
-        if p.requires_grad and "lora_" in n
+    lora_named_params = [
+        (name, parameter)
+        for name, parameter in model.base_model.named_parameters()
+        if parameter.requires_grad and "lora_" in name
     ]
+    lora_params = [parameter for _, parameter in lora_named_params]
+    trainable_vision_lora_names = [
+        name for name, _ in lora_named_params if is_vision_parameter_name(name)
+    ]
+    trainable_language_lora_names = [
+        name for name, _ in lora_named_params if not is_vision_parameter_name(name)
+    ]
+    freeze_vision_tower = bool(model_cfg.get("freeze_vision_tower", True))
+    if freeze_vision_tower and trainable_vision_lora_names:
+        raise RuntimeError(
+            "freeze_vision_tower=True but trainable vision LoRA tensors remain: "
+            f"{trainable_vision_lora_names[:5]}"
+        )
     proj_lr = float(projection_lr) if projection_lr is not None else 1e-3
     lora_lr = (
         float(lora_lr_override)
@@ -450,6 +465,12 @@ def train_mm_sft_smoke(
     )
     print(f"  trainable projection tensors: {len(proj_params)}")
     print(f"  trainable LoRA tensors:       {len(lora_params)}")
+    print(f"  trainable language LoRA:      {len(trainable_language_lora_names)}")
+    print(f"  trainable vision LoRA:        {len(trainable_vision_lora_names)}")
+    print(
+        "  frozen vision parameters:    "
+        f"{len(getattr(model, 'frozen_vision_parameter_names', []))}"
+    )
     print(f"  projection lr:                {proj_lr}")
     print(f"  LoRA lr:                      {lora_lr if train_lora else 0.0}")
     print(f"  projection head type:         {head_type}")
@@ -623,6 +644,11 @@ def train_mm_sft_smoke(
                         "trainable": trainable_label,
                         "train_lora": train_lora,
                         "load_lora": load_lora,
+                        "trainable_language_lora_tensors": len(trainable_language_lora_names),
+                        "trainable_vision_lora_tensors": len(trainable_vision_lora_names),
+                        "frozen_vision_parameters": len(
+                            getattr(model, "frozen_vision_parameter_names", [])
+                        ),
                         "init_lora_checkpoint": init_lora_checkpoint,
                         "checkpoint_interval": checkpoint_interval,
                         "include_response_tokens": False,
@@ -680,6 +706,11 @@ def train_mm_sft_smoke(
             "trainable": trainable_label,
             "train_lora": train_lora,
             "load_lora": load_lora,
+            "trainable_language_lora_tensors": len(trainable_language_lora_names),
+            "trainable_vision_lora_tensors": len(trainable_vision_lora_names),
+            "frozen_vision_parameters": len(
+                getattr(model, "frozen_vision_parameter_names", [])
+            ),
             "init_lora_checkpoint": init_lora_checkpoint,
             "checkpoint_interval": checkpoint_interval,
             "include_response_tokens": False,
