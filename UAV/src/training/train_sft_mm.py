@@ -139,6 +139,8 @@ def train_mm_sft_smoke(
     max_steps: int = None,
     max_length: int = None,
     output_dir: str = None,
+    checkpoint_dir: str = None,
+    save_steps: int = None,
     train_lora: bool = False,
     load_lora: bool = False,
     lambda_assoc_ce: float = None,
@@ -178,7 +180,15 @@ def train_mm_sft_smoke(
     max_seq_length = int(max_length or train_cfg["max_seq_length"])
     steps_limit = int(max_steps or train_cfg.get("phase1", {}).get("max_steps", 30))
     out_root = Path(output_dir or cfg.get("output_dir", "/root/autodl-tmp/outputs/mm_smoke"))
-    ckpt_root = Path(cfg.get("checkpoint_dir", "/root/autodl-tmp/checkpoints/mm_smoke"))
+    ckpt_root = Path(
+        checkpoint_dir
+        or cfg.get("checkpoint_dir", "/root/autodl-tmp/checkpoints/mm_smoke")
+    )
+    checkpoint_interval = int(
+        save_steps if save_steps is not None else train_cfg.get("save_steps", 10)
+    )
+    if checkpoint_interval <= 0:
+        raise ValueError("save_steps must be a positive integer")
     ckpt_root.mkdir(parents=True, exist_ok=True)
     lora_enabled = bool(train_lora or load_lora)
     init_lora_checkpoint = _resolve_lora_checkpoint(init_checkpoint, lora_enabled)
@@ -194,6 +204,7 @@ def train_mm_sft_smoke(
     print(f"  model:      {model_name}")
     print(f"  max_length: {max_seq_length}")
     print(f"  steps:      {steps_limit}")
+    print(f"  checkpoints:{ckpt_root} (every {checkpoint_interval} steps)")
     if train_lora:
         trainable_label = "projection_head + LoRA"
     elif load_lora:
@@ -505,7 +516,7 @@ def train_mm_sft_smoke(
             if torch.isnan(total_loss):
                 raise RuntimeError("NaN loss detected in multimodal SFT smoke.")
 
-            if global_step % train_cfg.get("save_steps", 10) == 0:
+            if global_step % checkpoint_interval == 0:
                 _save_mm_smoke(
                     model,
                     ckpt_root / f"mm_sft_{'lora_' if lora_enabled else ''}smoke_step_{global_step}",
@@ -518,6 +529,8 @@ def train_mm_sft_smoke(
                         "trainable": trainable_label,
                         "train_lora": train_lora,
                         "load_lora": load_lora,
+                        "init_lora_checkpoint": init_lora_checkpoint,
+                        "checkpoint_interval": checkpoint_interval,
                         "projection_lr": proj_lr,
                         "lora_lr": lora_lr if train_lora else 0.0,
                         "lora_rank": model_cfg["lora"]["rank"] if lora_enabled else 0,
@@ -549,7 +562,9 @@ def train_mm_sft_smoke(
                         "lambda_assoc_raw_ce": assoc_raw_ce_weight,
                         "loaded_init": loaded_init,
                     },
-                    save_lora=lora_enabled,
+                    # A frozen LoRA is unchanged and already stored in init_checkpoint.
+                    # Do not duplicate it in every projection-only checkpoint.
+                    save_lora=train_lora,
                 )
 
     pbar.close()
@@ -565,6 +580,8 @@ def train_mm_sft_smoke(
             "trainable": trainable_label,
             "train_lora": train_lora,
             "load_lora": load_lora,
+            "init_lora_checkpoint": init_lora_checkpoint,
+            "checkpoint_interval": checkpoint_interval,
             "projection_lr": proj_lr,
             "lora_lr": lora_lr if train_lora else 0.0,
             "lora_rank": model_cfg["lora"]["rank"] if lora_enabled else 0,
@@ -611,6 +628,18 @@ if __name__ == "__main__":
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default=None,
+        help="可选：中间 checkpoint 独立目录，避免不同 smoke 实验使用同名路径",
+    )
+    parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=None,
+        help="可选：中间 checkpoint 保存间隔；默认读取配置文件",
+    )
     parser.add_argument("--train_lora", action="store_true")
     parser.add_argument(
         "--load_lora",
@@ -671,6 +700,8 @@ if __name__ == "__main__":
         max_steps=args.max_steps,
         max_length=args.max_length,
         output_dir=args.output_dir,
+        checkpoint_dir=args.checkpoint_dir,
+        save_steps=args.save_steps,
         train_lora=args.train_lora,
         load_lora=args.load_lora,
         lambda_assoc_ce=args.lambda_assoc_ce,

@@ -139,6 +139,9 @@ P MSE / leakage:              0.007581 / 0.025418
 
 1. Q residual adapter 的 forward/backward/checkpoint/冻结 LoRA/独立验证全部跑通；
 2. 三维方向提升是真实的，旧 sigmoid gate 梯度瓶颈已修复；
-3. 当前 Q3 选择为后续联合 smoke 的 Q checkpoint；
-4. 不继续 Q-only 200-step，不再添加 Q 模式；
-5. 后续联合评估必须同时报告 3D 与 XY，避免只选择有利指标。
+3. Q3 只通过代码与可学习性 smoke，不能直接视为最终 Q checkpoint；
+4. 由于 XY 仍低于 fixed geometry，下一步先做 Q-only 50/100/150/200-step 同轨迹验证；
+5. 在 Q 得出“保留 residual”或“回退 fixed geometry”的明确结论前，不进入联合训练；
+6. 后续评估必须同时报告 3D 与 XY，避免只选择有利指标。
+
+该决策的具体执行方法见 `2026-07-19_q_controlled_learning_curve.md`。

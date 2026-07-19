@@ -1,0 +1,164 @@
+---
+type: log
+status: ready_for_server_run
+stage: q_only_controlled_learning_curve
+last_updated: 2026-07-19
+---
+
+# 2026-07-19 Q-only 受控学习曲线
+
+## 主线与边界
+
+当前立即处理 Q，不进入 A、P 或联合训练。Q3 的 50-step 结果只证明 residual adapter
+能够获得梯度并改善三维方向，尚未完成效果验收：
+
+```text
+Q3 val100 3D cosine:       0.615960
+fixed geometry 3D cosine:  0.582721
+Q3 val100 XY cosine:       0.683122
+fixed geometry XY cosine:  0.693712
+```
+
+因此下一步从同一个 Q2 基线重新启动一条 200-step Q-only 轨迹，在 50/100/150/200
+step 保存并验证。这样不会把多次重启、不同 optimizer 状态或 A/P/LoRA 更新混入比较。
+
+## 本次最小代码调整
+
+`train_sft_mm.py` 新增两个不改变默认行为的参数：
+
+```text
+--checkpoint_dir PATH
+--save_steps N
+```
+
+用途：
+
+1. 中间 checkpoint 写入本实验独立目录，避免不同 smoke 的同名 step checkpoint 相互覆盖；
+2. 本轮每 50 步保存一次，直接得到同一轨迹的 50/100/150/200-step 模型；
+3. `--load_lora` 且 LoRA 冻结时，中间 checkpoint 不再重复复制 LoRA；分析时显式加载
+   Q2 基线的同一份 LoRA。最终 checkpoint 仍保持自包含。
+
+未修改 Q 网络、损失或投影逻辑。
+
+## 服务器训练命令
+
+```bash
+cd ~/Projects/UAV/UAV
+git pull --ff-only origin main
+
+Q_BASE=/root/autodl-tmp/outputs/mm_geom_v3_stage_q2_fixed_residual_lora_preflight200/mm_sft_lora_smoke_final
+Q4_OUT=/root/autodl-tmp/outputs/mm_geom_v3_stage_q4_residual_curve200
+Q4_CKPT="$Q4_OUT/checkpoints"
+
+mkdir -p "$Q4_OUT" "$Q4_CKPT"
+set -o pipefail
+
+python src/training/train_sft_mm.py \
+  --config configs/rtx5090_multimodal_smoke.yaml \
+  --data_dir /root/autodl-tmp/data/mm_geom_v3_train500_seed42 \
+  --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+  --init_checkpoint "$Q_BASE" \
+  --load_lora \
+  --max_steps 200 \
+  --max_length 3072 \
+  --output_dir "$Q4_OUT" \
+  --checkpoint_dir "$Q4_CKPT" \
+  --save_steps 50 \
+  --projection_head_type split \
+  --q_projection_mode direction \
+  --q_geometry_mode fixed_residual_xy \
+  --freeze_all_except_q \
+  --projection_lr 0.001 \
+  --lambda_q 0 \
+  --lambda_a 0 \
+  --lambda_p 0 \
+  --lambda_q_dir 0 \
+  --lambda_q_projected_dir 1.0 \
+  --lambda_q_cue_ce 0 \
+  --lambda_assoc_ce 0 \
+  --lambda_assoc_raw_ce 0 \
+  --lambda_p_raw_kl 0 \
+  2>&1 | tee "$Q4_OUT/train.log"
+```
+
+本轮从 Q2 而不是 Q3 开始。当前实现加载 Q2 时会忽略已删除的旧 global gate，并以
+zero-init residual adapter 开始，因此 step 50 应当能够复现 Q3 的学习阶段，同时
+100/150/200 属于同一条连续轨迹。
+
+## 训练日志先验检查
+
+训练完成后先确认隔离边界与数值稳定性：
+
+```bash
+tr '\r' '\n' < "$Q4_OUT/train.log" \
+  | grep -E 'step=(1|50|100|150|200) '
+
+grep -Ei 'nan|inf|error|out of memory' "$Q4_OUT/train.log"
+```
+
+必须满足：
+
+```text
+grad_norm_q_residual > 0
+q_residual_adapter_norm 持续离开 0
+grad_norm_lora = 0
+loss_q_projected_dir 有限
+```
+
+## 独立 val100 验证
+
+中间 checkpoint 没有重复保存冻结 LoRA，所以显式使用 `$Q_BASE/lora`：
+
+```bash
+for STEP in 50 100 150 200; do
+  CKPT="$Q4_CKPT/mm_sft_lora_smoke_step_${STEP}"
+  python scripts/analyze_mm_delta_outputs.py \
+    --config configs/rtx5090_multimodal_smoke.yaml \
+    --data_dir /root/autodl-tmp/data/mm_geom_v3_val100_seed2026 \
+    --model /root/autodl-tmp/huggingface/models/gemma-3-4b-it \
+    --checkpoint "$CKPT" \
+    --lora_checkpoint "$Q_BASE/lora" \
+    --projection_head_type split \
+    --q_projection_mode direction \
+    --q_geometry_mode fixed_residual_xy \
+    --num_samples 100 \
+    --name "q4_val100_step${STEP}" \
+    --output "$Q4_OUT/delta_diag_val100_step${STEP}.json" \
+    2>&1 | tee "$Q4_OUT/delta_diag_val100_step${STEP}.log"
+done
+```
+
+## 决策规则
+
+每个 step 同时检查：
+
+```text
+delta_q_vs_target_3d_cosine_mean
+delta_q_vs_target_xy_cosine_mean
+q_fixed_geometry_vs_target_3d_cosine_mean
+q_fixed_geometry_vs_target_xy_cosine_mean
+delta_q_direction_per_dim_std_mean
+delta_q_target_direction_per_dim_std_mean
+delta_q_mobility_violation_ratio
+warnings
+```
+
+保留 residual 的必要条件：
+
+1. 独立 val100 的 3D cosine 稳定高于 fixed 3D；
+2. XY cosine 不低于 fixed XY 超过现有 0.01 容差；
+3. 方向方差不随训练继续坍缩；
+4. mobility violation 保持 0；
+5. 选择实际验证最优 checkpoint，不默认使用 step 200。
+
+如果 50/100/150/200 均不能同时满足 3D 增益与 XY 守门条件，则停止继续堆步数，Q 主线
+回退到 fixed geometry；residual 只保留为消融。只有完成这一二选一结论后才进入 A。
+
+## 本地验证状态
+
+```text
+python -m py_compile src/training/train_sft_mm.py: PASS
+```
+
+本机 Python 环境没有安装 torch/numpy，相关 17 个单元测试无法在本机导入；服务器拉取后
+仍需在 `uavmllm` 环境执行现有测试集，本次没有通过降低或删除测试绕过该限制。
