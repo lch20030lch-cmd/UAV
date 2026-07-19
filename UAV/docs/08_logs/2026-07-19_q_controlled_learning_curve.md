@@ -1,6 +1,6 @@
 ---
 type: log
-status: q_closed_step150_selected
+status: q_closed_selected_checkpoint_verified
 stage: q_only_controlled_learning_curve
 last_updated: 2026-07-19
 ---
@@ -230,3 +230,20 @@ mobility violation ratio: 0.0
 ```text
 /root/autodl-tmp/outputs/mm_geom_v3_stage_q4_residual_curve200/mm_sft_lora_selected_step150
 ```
+
+## Selected checkpoint 提升与核验
+
+服务器已将 step 150 的 projection/control/processor 文件复制到 selected 目录，并只补充
+一份 Q2 中保持冻结的 LoRA：
+
+```text
+selected checkpoint:
+/root/autodl-tmp/outputs/mm_geom_v3_stage_q4_residual_curve200/mm_sft_lora_selected_step150
+
+projection byte comparison: PASS
+lora/adapter_config.json:    present
+selected directory size:    129M
+```
+
+`cmp` 已确认 selected 的 `projection_head.pt` 与 step 150 完全一致。该目录现在可以作为
+后续 A 阶段的自包含 `--init_checkpoint`。Q 本阶段至此闭环，后续不再继续 Q-only 训练。
