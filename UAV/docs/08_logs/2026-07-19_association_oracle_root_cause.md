@@ -307,6 +307,33 @@ XY change: -0.000896
 本机完成 Python 语法检查与 `git diff --check`。本机默认 Python 缺少 NumPy，相关单元测试
 必须在服务器 `uavmllm` 环境执行后，才能启动 A-only 训练。
 
+## Corrected val20 的 A-only 训练前基线
+
+使用 selected Q checkpoint 和新诊断器得到：
+
+```text
+projected top-1 / top-2:    0.2400 / 0.4975
+raw top-1 / top-2:          0.2400 / 0.4975
+fixed-user majority:        0.3675
+raw oracle probability:     0.250850
+raw top-1 margin:            0.037891
+raw entropy:                 1.378901
+raw prediction histogram:   58 / 48 / 9 / 285
+target histogram:            91 / 107 / 101 / 101
+fixed users / unique mean:   5 / 2.0
+control-state std mean/max:  0.125314 / 2.190320
+```
+
+判定：
+
+1. raw 与 projected 排序指标完全相同，当前失败不是 Sinkhorn 改坏了已有正确排序；
+2. 四分类随机 oracle probability 为 `0.25`，当前 raw 值几乎等于随机；raw entropy 也接近
+   `ln(4)=1.3863`，说明 logits 区分度很弱；
+3. `285/400` 个预测落在 UAV 3，而目标在四架 UAV 间近似均衡，存在明显单类偏置；
+4. 该旧 checkpoint 没有学过 compact corrected prompt。下一步仍是冻结 backbone/LoRA/Q/P，
+   仅用 corrected train20 过拟合 A readout；此实验将判断现有 control states 是否仍包含
+   可供 A 头读取的场景信息。
+
 ## 对现有数据与 Q checkpoint 的影响边界
 
 现有 train500/val100 是旧 solver 生成的，不能直接用于验证修复后的 A 标签质量。
