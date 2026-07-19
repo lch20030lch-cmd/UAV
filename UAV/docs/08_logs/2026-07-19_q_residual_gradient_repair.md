@@ -1,6 +1,6 @@
 ---
 type: log
-status: implementation_complete_server_smoke_pending
+status: smoke_and_independent_validation_passed
 stage: q_residual_gradient_repair
 last_updated: 2026-07-19
 ---
@@ -101,3 +101,44 @@ A/P 与 Q2 基线完全保持（LoRA 和 A/P projection 均冻结）
 
 通过后再做独立 val100 前向，必须看到 projected 3D cosine 相对纯 fixed baseline 有实际
 增益，才允许进入更长预检。
+
+## Q3 50-step smoke 与独立验证结果
+
+训练链路：
+
+```text
+step       adapter grad norm    adapter parameter norm    LoRA grad norm
+1          4.335295             0.003464                  0.0
+10         4.462989             0.011144                  0.0
+25         5.081945             0.023800                  0.0
+50         3.758512             0.032536                  0.0
+```
+
+无 NaN/Inf/OOM。adapter 梯度持续非零、参数范数稳定增长，冻结 LoRA 的隔离路径正确。
+
+独立 val100：
+
+```text
+Q3 projected 3D cosine:       0.615960
+Q2 projected 3D cosine:       0.593601
+fixed geometry 3D cosine:     0.582721
+Q3 projected XY cosine:       0.683122
+fixed geometry XY cosine:     0.693712
+Q3 direction std:             0.442655
+target direction std:         0.556831
+Q norm / violation ratio:     14.999997 / 0.0
+A accuracy:                   0.4360
+P MSE / leakage:              0.007581 / 0.025418
+```
+
+相对旧 Q2，Q3 的独立验证 3D cosine 提升约 0.02236；相对纯 fixed geometry 提升约
+0.03324。XY 相对 fixed 下降约 0.01059，略超过诊断 warning 的 0.01 容差，因此保留
+`delta_q_below_fixed_geometry_baseline` warning，不通过修改阈值掩盖该权衡。
+
+最终判定：
+
+1. Q residual adapter 的 forward/backward/checkpoint/冻结 LoRA/独立验证全部跑通；
+2. 三维方向提升是真实的，旧 sigmoid gate 梯度瓶颈已修复；
+3. 当前 Q3 选择为后续联合 smoke 的 Q checkpoint；
+4. 不继续 Q-only 200-step，不再添加 Q 模式；
+5. 后续联合评估必须同时报告 3D 与 XY，避免只选择有利指标。
