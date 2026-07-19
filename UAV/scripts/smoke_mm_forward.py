@@ -96,6 +96,12 @@ def main():
         default=None,
         help="可选：加载 cue_xy 或 fixed_residual_xy checkpoint 时传入对应模式",
     )
+    parser.add_argument(
+        "--power_assoc_gate_strength",
+        type=float,
+        default=None,
+        help="可选：覆盖 PowerProjection 的软 association log-gate 强度",
+    )
     args = parser.parse_args()
 
     with (PROJECT_ROOT / args.config).open("r", encoding="utf-8") as f:
@@ -118,6 +124,8 @@ def main():
         proj_head_config["q_projection_mode"] = args.q_projection_mode
     if args.q_geometry_mode is not None:
         proj_head_config["q_geometry_mode"] = args.q_geometry_mode
+    if args.power_assoc_gate_strength is not None:
+        proj_head_config["power_assoc_gate_strength"] = args.power_assoc_gate_strength
 
     model = Gemma3MultimodalISAC(
         model_name_or_path=model_name,
@@ -171,6 +179,10 @@ def main():
     print(f"  projection_head_type: {proj_head_config.get('head_type', 'shared')}")
     print(f"  q_projection_mode: {proj_head_config.get('q_projection_mode', 'clip')}")
     print(f"  q_geometry_mode: {proj_head_config.get('q_geometry_mode', 'none')}")
+    print(
+        "  power_assoc_gate_strength: "
+        f"{proj_head_config.get('power_assoc_gate_strength', 0.0)}"
+    )
     print(f"  max_length: {max_length}")
     print(f"  input_ids: {tuple(batch['input_ids'].shape)}")
     print(f"  attention_mask: {tuple(batch['attention_mask'].shape)}")

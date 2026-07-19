@@ -558,6 +558,12 @@ def main():
         default=None,
         help="可选：分析 cue_xy 或 fixed_residual_xy checkpoint 时传入对应模式",
     )
+    parser.add_argument(
+        "--power_assoc_gate_strength",
+        type=float,
+        default=None,
+        help="可选：覆盖 PowerProjection 的软 association log-gate 强度",
+    )
     args = parser.parse_args()
 
     with (PROJECT_ROOT / args.config).open("r", encoding="utf-8") as f:
@@ -580,6 +586,8 @@ def main():
         proj_head_config["q_projection_mode"] = args.q_projection_mode
     if args.q_geometry_mode is not None:
         proj_head_config["q_geometry_mode"] = args.q_geometry_mode
+    if args.power_assoc_gate_strength is not None:
+        proj_head_config["power_assoc_gate_strength"] = args.power_assoc_gate_strength
 
     model = Gemma3MultimodalISAC(
         model_name_or_path=model_name,
@@ -645,6 +653,7 @@ def main():
         "projection_head_type": proj_head_config.get("head_type", "shared"),
         "q_projection_mode": proj_head_config.get("q_projection_mode", "clip"),
         "q_geometry_mode": proj_head_config.get("q_geometry_mode", "none"),
+        "power_assoc_gate_strength": proj_head_config.get("power_assoc_gate_strength", 0.0),
         "loaded_projection": loaded_projection,
         "loaded_control_embeddings": loaded_control_embeddings,
         "lora_checkpoint": lora_checkpoint,
@@ -672,6 +681,10 @@ def main():
     print(f"  loaded_projection: {loaded_projection}")
     print(f"  loaded_control_embeddings: {loaded_control_embeddings}")
     print(f"  loaded_lora_checkpoint: {model.loaded_lora_checkpoint}")
+    print(
+        "  power_assoc_gate_strength: "
+        f"{proj_head_config.get('power_assoc_gate_strength', 0.0)}"
+    )
     for key in (
         "delta_q_per_dim_std_mean",
         "delta_a_per_dim_std_mean",

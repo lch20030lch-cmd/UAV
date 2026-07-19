@@ -80,6 +80,7 @@ model:
     q_fixed_cue_weights: [0.31186843, 0.09240539, 0.59572625]
     q_residual_max_scale: 1.0
     q_residual_gate_init: 0.05
+    power_assoc_gate_strength: 0.0
 
   loss:
     lambda_ctl: 0.5

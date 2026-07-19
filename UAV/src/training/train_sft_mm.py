@@ -148,6 +148,7 @@ def train_mm_sft_smoke(
     projection_head_type: str = None,
     q_projection_mode: str = None,
     q_geometry_mode: str = None,
+    power_assoc_gate_strength: float = None,
     freeze_assoc_branch: bool = False,
     freeze_qp_branch: bool = False,
     freeze_all_except_q: bool = False,
@@ -191,9 +192,12 @@ def train_mm_sft_smoke(
         proj_head_config["q_projection_mode"] = q_projection_mode
     if q_geometry_mode is not None:
         proj_head_config["q_geometry_mode"] = q_geometry_mode
+    if power_assoc_gate_strength is not None:
+        proj_head_config["power_assoc_gate_strength"] = float(power_assoc_gate_strength)
     head_type = proj_head_config.get("head_type", "shared")
     q_mode = proj_head_config.get("q_projection_mode", "clip")
     q_geom_mode = proj_head_config.get("q_geometry_mode", "none")
+    p_assoc_gate_strength = float(proj_head_config.get("power_assoc_gate_strength", 0.0))
     freeze_modes = (
         freeze_assoc_branch,
         freeze_qp_branch,
@@ -362,6 +366,7 @@ def train_mm_sft_smoke(
     print(f"  projection head type:         {head_type}")
     print(f"  q projection mode:            {q_mode}")
     print(f"  q geometry mode:              {q_geom_mode}")
+    print(f"  power association gate:       {p_assoc_gate_strength}")
     print(f"  frozen projection tensors:    {len(frozen_projection_branches)}")
     print(f"  isolated projection branch:  {isolated_projection_branch or 'none'}")
     print(f"  isolated trainable tensors:   {len(trainable_projection_branches)}")
@@ -499,6 +504,7 @@ def train_mm_sft_smoke(
                         "q_geometry_mode": q_geom_mode,
                         "q_fixed_cue_weights": proj_head_config.get("q_fixed_cue_weights"),
                         "q_residual_max_scale": proj_head_config.get("q_residual_max_scale", 1.0),
+                        "power_assoc_gate_strength": p_assoc_gate_strength,
                         "freeze_assoc_branch": freeze_assoc_branch,
                         "freeze_qp_branch": freeze_qp_branch,
                         "freeze_all_except_q": freeze_all_except_q,
@@ -544,6 +550,7 @@ def train_mm_sft_smoke(
             "q_geometry_mode": q_geom_mode,
             "q_fixed_cue_weights": proj_head_config.get("q_fixed_cue_weights"),
             "q_residual_max_scale": proj_head_config.get("q_residual_max_scale", 1.0),
+            "power_assoc_gate_strength": p_assoc_gate_strength,
             "freeze_assoc_branch": freeze_assoc_branch,
             "freeze_qp_branch": freeze_qp_branch,
             "freeze_all_except_q": freeze_all_except_q,
@@ -617,6 +624,12 @@ if __name__ == "__main__":
         default=None,
         help="可选：动态 cue_xy，或 train-only 固定几何先验加受限残差 fixed_residual_xy",
     )
+    parser.add_argument(
+        "--power_assoc_gate_strength",
+        type=float,
+        default=None,
+        help="可选：PowerProjection 的可微 association log-gate 强度；0 表示关闭",
+    )
     parser.add_argument("--freeze_assoc_branch", action="store_true",
                         help="split head 下冻结 association 分支，主要用于 Stage B2 训练 q/p")
     parser.add_argument("--freeze_qp_branch", action="store_true",
@@ -652,6 +665,7 @@ if __name__ == "__main__":
         projection_head_type=args.projection_head_type,
         q_projection_mode=args.q_projection_mode,
         q_geometry_mode=args.q_geometry_mode,
+        power_assoc_gate_strength=args.power_assoc_gate_strength,
         freeze_assoc_branch=args.freeze_assoc_branch,
         freeze_qp_branch=args.freeze_qp_branch,
         freeze_all_except_q=args.freeze_all_except_q,

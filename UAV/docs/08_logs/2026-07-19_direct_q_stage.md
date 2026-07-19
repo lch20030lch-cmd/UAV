@@ -1,6 +1,6 @@
 ---
 type: log
-status: fixed_residual_baseline_passed_preflight200_pending
+status: fixed_residual_preflight_complete_joint_warmstart_selected
 stage: multimodal_direct_q_direction
 last_updated: 2026-07-19
 ---
@@ -264,3 +264,34 @@ direction std:    0.008251 -> 0.467004
 判定：固定几何前向实现正确，场景方向多样性恢复，物理投影正常，A/P 完全保持；
 初始小残差没有破坏 XY，并已给 3D cosine 带来约 0.0105 增益。允许进入 200-step
 小学习率预检，仍不允许直接长训。
+
+## Q2 200-step train500/val100 最终判定
+
+```text
+                                    train500    val100
+projected 3D cosine:                0.603803    0.593601
+fixed geometry 3D cosine:           0.592064    0.582721
+residual gain over fixed:          +0.011739   +0.010880
+projected XY cosine:                0.719447    0.693635
+fixed geometry XY cosine:           0.719435    0.693712
+direction std:                      0.469801    0.466859
+q residual gate:                    0.051953    0.051953
+A accuracy:                         0.4728      0.4360
+P MSE:                              0.007857    0.007581
+P inactive leakage:                 0.025188    0.025418
+mobility violation ratio:           0.0         0.0
+```
+
+残差相对固定基线的 train/val 增益差仅 0.00086，不是训练集记忆；但相对无训练
+val100 的 3D cosine 只从 0.593184 增至 0.593601，200-step 新增收益仅约 0.00042。
+
+最终判定：
+
+1. Q2 作为联合训练 warm-start 通过：固定几何提供稳定水平移动，保守 MLLM 残差在
+   独立环境带来约 0.0109 的三维增益；
+2. Q-only 继续扩步不通过：当前损失/小 gate 下新增训练收益过低，不再单独跑
+   500/1000 step；
+3. canonical checkpoint 为
+   `mm_geom_v3_stage_q2_fixed_residual_lora_preflight200/mm_sft_lora_smoke_final`；
+4. 论文中必须把 fixed geometry 和 learned residual 分开消融，不把固定先验的收益
+   全部表述为 MLLM 学习收益。

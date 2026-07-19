@@ -33,6 +33,46 @@ class PowerProjectionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires association"):
             projection(torch.zeros(1, 1, 3))
 
+    def test_soft_association_gate_suppresses_inactive_power_and_preserves_budget(self):
+        projection = PowerProjection(
+            p_max=1.0,
+            tau=1.0,
+            association_gate_strength=1.0,
+        )
+        logits = torch.zeros(1, 1, 3)
+        association = torch.tensor([[[1.0, 0.0]]])
+
+        power = projection(logits, association=association)
+
+        self.assertLess(float(power[0, 0, 1]), 1e-5)
+        torch.testing.assert_close(power.sum(dim=-1), torch.ones(1, 1))
+        self.assertGreater(float(power[0, 0, 0]), 0.49)
+        self.assertGreater(float(power[0, 0, 2]), 0.49)
+
+    def test_soft_association_gate_is_disabled_by_default(self):
+        logits = torch.zeros(1, 1, 3)
+        association = torch.tensor([[[1.0, 0.0]]])
+
+        default_power = PowerProjection(p_max=1.0, tau=1.0)(
+            logits,
+            association=association,
+        )
+
+        torch.testing.assert_close(default_power, torch.full_like(default_power, 1.0 / 3.0))
+
+    def test_soft_association_gate_strength_is_independent_of_temperature(self):
+        projection = PowerProjection(
+            p_max=1.0,
+            tau=0.5,
+            association_gate_strength=1.0,
+        )
+        logits = torch.zeros(1, 1, 3)
+        association = torch.tensor([[[0.8, 0.2]]])
+
+        power = projection(logits, association=association)
+
+        self.assertAlmostEqual(float(power[0, 0, 0] / power[0, 0, 1]), 4.0, places=5)
+
 
 class PowerLossTest(unittest.TestCase):
     def setUp(self):
@@ -80,7 +120,7 @@ class PowerLossTest(unittest.TestCase):
 
         loss = self.losses.compute_power_raw_kl_loss(raw_logits, self.target)
 
-        self.assertGreater(float(loss), 1.0)
+        self.assertGreater(float(loss.detach()), 1.0)
         loss.backward()
         self.assertTrue(torch.isfinite(raw_logits.grad).all())
         self.assertGreater(float(raw_logits.grad.abs().sum()), 0.1)

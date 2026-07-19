@@ -219,13 +219,26 @@ class PowerProjection(nn.Module):
     可选 ``p_min_ratio > 0`` 时，通信功率下界必须由 association 软门控，
     避免给未关联用户强制分配功率。默认关闭该可选下界，由下游 SCA-FP
     对关联条件下的最小用户功率做最终可行化。
+
+    可选 ``association_gate_strength > 0`` 时，在 softmax 前对通信概率乘以
+    ``association ** strength``。它保持可微且不做硬掩码，适合关联读出尚不够
+    准确时做保守的 P/A 耦合；默认 0 完全保持旧路径。
     """
 
-    def __init__(self, p_max: float = 1.0, tau: float = 0.5, p_min_ratio: float = 0.0):
+    def __init__(
+        self,
+        p_max: float = 1.0,
+        tau: float = 0.5,
+        p_min_ratio: float = 0.0,
+        association_gate_strength: float = 0.0,
+    ):
         super().__init__()
+        if association_gate_strength < 0:
+            raise ValueError("association_gate_strength must be non-negative")
         self.register_buffer("p_max", torch.tensor(p_max))
         self.p_min = p_min_ratio * p_max  # absolute floor
         self.tau = tau
+        self.association_gate_strength = float(association_gate_strength)
 
     def forward(
         self,
@@ -244,8 +257,29 @@ class PowerProjection(nn.Module):
         B, M, D = p_tilde.shape
         K_comm = D - 1  # number of communication users
 
+        power_logits = p_tilde / self.tau
+        if self.association_gate_strength > 0:
+            if association is None:
+                raise ValueError(
+                    "PowerProjection with association_gate_strength > 0 requires association weights."
+                )
+            if association.shape != p_tilde.shape[:-1] + (K_comm,):
+                raise ValueError(
+                    "association must align with communication power entries: "
+                    f"expected {p_tilde.shape[:-1] + (K_comm,)}, got {tuple(association.shape)}"
+                )
+            assoc = association.to(device=p_tilde.device, dtype=p_tilde.dtype).clamp(1e-6, 1.0)
+            gated_comm_logits = (
+                power_logits[..., :K_comm]
+                + self.association_gate_strength * torch.log(assoc)
+            )
+            power_logits = torch.cat(
+                [gated_comm_logits, power_logits[..., K_comm:]],
+                dim=-1,
+            )
+
         # softmax 归一化 (沿最后一维, 即 UAV 内部)
-        p_soft = F.softmax(p_tilde / self.tau, dim=-1)  # (B, M, D)
+        p_soft = F.softmax(power_logits, dim=-1)  # (B, M, D)
 
         # 缩放到功率预算
         p_hat = self.p_max * p_soft
@@ -395,6 +429,7 @@ class ConstraintProjectionHead(nn.Module):
         q_fixed_cue_weights: list = None,
         q_residual_max_scale: float = 1.0,
         q_residual_gate_init: float = 0.05,
+        power_assoc_gate_strength: float = 0.0,
     ):
         super().__init__()
         self.M = M
@@ -468,7 +503,11 @@ class ConstraintProjectionHead(nn.Module):
         # 投影模块
         self.proj_q = DeploymentProjection(area_w, area_h, h_min, h_max, v_max_dt)
         self.proj_a = AssociationProjection(K_max, tau_assoc, sinkhorn_iters)
-        self.proj_p = PowerProjection(p_max, tau_power)
+        self.proj_p = PowerProjection(
+            p_max,
+            tau_power,
+            association_gate_strength=power_assoc_gate_strength,
+        )
 
     def _unflatten(self, delta_flat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """

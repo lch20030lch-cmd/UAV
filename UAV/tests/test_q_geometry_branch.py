@@ -31,7 +31,11 @@ class FixedResidualQGeometryTest(unittest.TestCase):
         composed = head._compose_q_from_geometry_cues(raw, cues, None)
 
         torch.testing.assert_close(composed, torch.tensor([[[15.0, 0.0, 0.0]]]))
-        self.assertAlmostEqual(float(torch.sigmoid(head.q_residual_gate_logit)), 0.05, places=6)
+        self.assertAlmostEqual(
+            float(torch.sigmoid(head.q_residual_gate_logit).detach()),
+            0.05,
+            places=6,
+        )
 
     def test_projected_direction_loss_reaches_residual_and_gate(self):
         head = _make_head(weights=[1.0, 0.0, 0.0])
