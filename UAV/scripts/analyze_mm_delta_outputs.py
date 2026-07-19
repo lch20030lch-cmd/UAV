@@ -150,6 +150,7 @@ def _summarize_q_alignment(
     )
     cosine_xy = (pred_xy_dir * target_xy_dir).sum(axis=-1)
     flat_pred_dir = pred_dir.reshape(pred_dir.shape[0], -1)
+    flat_target_dir = target_dir.reshape(target_dir.shape[0], -1)
 
     result = {
         "delta_q_norm_mean": float(pred_norm.mean()),
@@ -163,6 +164,9 @@ def _summarize_q_alignment(
         "delta_q_vs_target_xy_cosine_std": float(cosine_xy.std()),
         "delta_q_direction_per_dim_std_mean": float(
             flat_pred_dir.std(axis=0).mean()
+        ),
+        "delta_q_target_direction_per_dim_std_mean": float(
+            flat_target_dir.std(axis=0).mean()
         ),
     }
     if q_max_norm is not None:
@@ -622,6 +626,7 @@ def main():
         "delta_q_vs_target_3d_cosine_mean",
         "delta_q_vs_target_xy_cosine_mean",
         "delta_q_direction_per_dim_std_mean",
+        "delta_q_target_direction_per_dim_std_mean",
         "delta_q_raw_dir_cosine_mean",
         "delta_q_raw_dir_mse_mean",
         "q_cue_accuracy",

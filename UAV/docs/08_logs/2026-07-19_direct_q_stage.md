@@ -148,6 +148,7 @@ delta_q_mobility_violation_ratio
 delta_q_vs_target_3d_cosine_mean
 delta_q_vs_target_xy_cosine_mean
 delta_q_direction_per_dim_std_mean
+delta_q_target_direction_per_dim_std_mean
 ```
 
 使用现有 Q1 checkpoint 重跑诊断即可确认，不需要重新训练。
