@@ -1,6 +1,6 @@
 ---
 type: log
-status: corrected_val100_q_closed_association_probe_pending
+status: association_probe_optimization_audit_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -620,3 +620,26 @@ Decision:
    baselines, not evidence against Q closure.
 4. The next stage is the 500/100 cached-state association probe. It is diagnostic
    only and must precede any A projection or A+LoRA training.
+
+## Initial 500/100 cached association probe
+
+```text
+                              train accuracy   val accuracy   train CE
+online-equivalent             0.4454           0.2505         1.213380
+flat linear                   0.4988           0.2565         2.755661
+validation fixed-user majority                 0.2975
+```
+
+Both validation results are below the independent-set majority baseline, so frozen
+states have not demonstrated generalizable corrected-association information.
+However, the reported `FROZEN-STATE BOTTLENECK` conclusion is provisional: the
+flat-linear training CE of `2.755661` is much worse than random four-class CE
+(`ln(4)=1.386294`) despite `0.4988` training accuracy. The current probe trains
+unnormalized 20,480-dimensional states at one learning rate and evaluates only the
+final optimizer iterate. This can indicate an unstable, overconfident final iterate
+rather than an information-theoretic inability to fit the cached states.
+
+Before authorizing A+LoRA, inspect the recorded optimization history. If CE falls
+and later rebounds, add best-iterate selection and lower the learning rate. If it
+never falls, test train-fitted state normalization. No main-model training should
+start until this distinction is resolved.
