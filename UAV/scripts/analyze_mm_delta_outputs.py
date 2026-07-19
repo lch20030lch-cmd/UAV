@@ -77,6 +77,9 @@ def _summarize_association(prefix: str, delta_a: np.ndarray) -> Dict:
 def _summarize_association_alignment(
     delta_a: np.ndarray,
     delta_a_target: np.ndarray,
+    *,
+    prefix: str = "delta_a",
+    logits: bool = False,
 ) -> Dict:
     """对比预测关联与 oracle，并给出固定用户多数选择基线。"""
     if delta_a.shape != delta_a_target.shape:
@@ -100,21 +103,51 @@ def _summarize_association_alignment(
         majority_correct / max(num_samples * num_users, 1)
     )
 
-    probs = np.clip(delta_a.astype(np.float64), 0.0, None)
+    scores = delta_a.astype(np.float64)
+    if logits:
+        scores = scores - scores.max(axis=1, keepdims=True)
+        probs = np.exp(scores)
+    else:
+        probs = np.clip(scores, 0.0, None)
     probs = probs / np.maximum(probs.sum(axis=1, keepdims=True), 1e-12)
     oracle_probs = np.take_along_axis(
         probs,
         target_idx[:, None, :],
         axis=1,
     ).squeeze(1)
+    top_k = min(2, num_uavs)
+    top_indices = np.argpartition(probs, -top_k, axis=1)[:, -top_k:, :]
+    top2_accuracy = float(
+        (top_indices == target_idx[:, None, :]).any(axis=1).mean()
+    )
+    sorted_probs = np.sort(probs, axis=1)
+    if num_uavs >= 2:
+        top1_margin = sorted_probs[:, -1, :] - sorted_probs[:, -2, :]
+    else:
+        top1_margin = sorted_probs[:, -1, :]
+
+    per_user_accuracy = (pred_idx == target_idx).mean(axis=0)
+    pred_counts = np.bincount(pred_idx.reshape(-1), minlength=num_uavs)
+    target_counts = np.bincount(target_idx.reshape(-1), minlength=num_uavs)
     return {
-        "delta_a_argmax_accuracy": accuracy,
-        "delta_a_fixed_user_majority_accuracy": fixed_user_majority_accuracy,
-        "delta_a_accuracy_gain_over_fixed_user_majority": (
+        f"{prefix}_argmax_accuracy": accuracy,
+        f"{prefix}_top2_accuracy": top2_accuracy,
+        f"{prefix}_fixed_user_majority_accuracy": fixed_user_majority_accuracy,
+        f"{prefix}_accuracy_gain_over_fixed_user_majority": (
             accuracy - fixed_user_majority_accuracy
         ),
-        "delta_a_oracle_probability_mean": float(oracle_probs.mean()),
-        "delta_a_oracle_probability_std": float(oracle_probs.std()),
+        f"{prefix}_oracle_probability_mean": float(oracle_probs.mean()),
+        f"{prefix}_oracle_probability_std": float(oracle_probs.std()),
+        f"{prefix}_top1_margin_mean": float(top1_margin.mean()),
+        f"{prefix}_top1_margin_std": float(top1_margin.std()),
+        f"{prefix}_accuracy_per_user_min": float(per_user_accuracy.min()),
+        f"{prefix}_accuracy_per_user_max": float(per_user_accuracy.max()),
+        f"{prefix}_pred_hist": {
+            str(index): int(count) for index, count in enumerate(pred_counts)
+        },
+        f"{prefix}_target_hist": {
+            str(index): int(count) for index, count in enumerate(target_counts)
+        },
     }
 
 
@@ -343,6 +376,15 @@ def _summarize_deltas(
     if delta_a_raw is not None:
         summary.update(_summarize_tensor("delta_a_raw", delta_a_raw))
         summary.update(_summarize_association("delta_a_raw", delta_a_raw))
+        if delta_a_target is not None:
+            summary.update(
+                _summarize_association_alignment(
+                    delta_a_raw,
+                    delta_a_target,
+                    prefix="delta_a_raw",
+                    logits=True,
+                )
+            )
     if delta_p_raw is not None:
         summary.update(_summarize_tensor("delta_p_raw", delta_p_raw))
     if delta_p_target is not None:
@@ -385,6 +427,11 @@ def _summarize_deltas(
         and summary["delta_a_accuracy_gain_over_fixed_user_majority"] <= 0.0
     ):
         warnings.append("delta_a_not_above_fixed_user_majority")
+    if (
+        "delta_a_raw_accuracy_gain_over_fixed_user_majority" in summary
+        and summary["delta_a_raw_accuracy_gain_over_fixed_user_majority"] <= 0.0
+    ):
+        warnings.append("delta_a_raw_not_above_fixed_user_majority")
     summary["warnings"] = warnings
     return summary
 
@@ -703,13 +750,28 @@ def main():
         "delta_a_argmax_unique_per_user_mean",
         "delta_a_argmax_fixed_user_count",
         "delta_a_argmax_accuracy",
+        "delta_a_top2_accuracy",
         "delta_a_fixed_user_majority_accuracy",
         "delta_a_accuracy_gain_over_fixed_user_majority",
         "delta_a_oracle_probability_mean",
+        "delta_a_top1_margin_mean",
+        "delta_a_accuracy_per_user_min",
+        "delta_a_accuracy_per_user_max",
+        "delta_a_pred_hist",
+        "delta_a_target_hist",
         "delta_a_entropy_mean",
         "delta_a_raw_per_dim_std_mean",
         "delta_a_raw_argmax_unique_per_user_mean",
         "delta_a_raw_argmax_fixed_user_count",
+        "delta_a_raw_argmax_accuracy",
+        "delta_a_raw_top2_accuracy",
+        "delta_a_raw_accuracy_gain_over_fixed_user_majority",
+        "delta_a_raw_oracle_probability_mean",
+        "delta_a_raw_top1_margin_mean",
+        "delta_a_raw_accuracy_per_user_min",
+        "delta_a_raw_accuracy_per_user_max",
+        "delta_a_raw_pred_hist",
+        "delta_a_raw_target_hist",
         "delta_a_raw_entropy_mean",
         "control_states_per_dim_std_mean",
         "control_states_per_dim_std_max",

@@ -34,6 +34,31 @@ class AssociationAlignmentDiagnosticTest(unittest.TestCase):
             1.0 / 3.0,
         )
         self.assertAlmostEqual(summary["delta_a_oracle_probability_mean"], 1.0)
+        self.assertAlmostEqual(summary["delta_a_top2_accuracy"], 1.0)
+        self.assertEqual(summary["delta_a_pred_hist"], {"0": 3, "1": 3})
+
+    def test_raw_logits_use_softmax_and_report_ranking_metrics(self):
+        target_idx = np.array([[0, 1], [1, 0]], dtype=np.int64)
+        target = np.eye(2, dtype=np.float32)[target_idx].transpose(0, 2, 1)
+        logits = np.array(
+            [
+                [[-1.0, -3.0], [-4.0, -1.0]],
+                [[-2.0, -1.0], [-1.0, -2.0]],
+            ],
+            dtype=np.float32,
+        )
+
+        summary = _summarize_association_alignment(
+            logits,
+            target,
+            prefix="delta_a_raw",
+            logits=True,
+        )
+
+        self.assertAlmostEqual(summary["delta_a_raw_argmax_accuracy"], 1.0)
+        self.assertAlmostEqual(summary["delta_a_raw_top2_accuracy"], 1.0)
+        self.assertGreater(summary["delta_a_raw_oracle_probability_mean"], 0.7)
+        self.assertGreater(summary["delta_a_raw_top1_margin_mean"], 0.4)
 
     def test_rejects_mismatched_shapes(self):
         with self.assertRaisesRegex(ValueError, "shapes differ"):

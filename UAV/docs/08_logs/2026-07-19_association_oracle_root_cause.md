@@ -288,6 +288,25 @@ XY change: -0.000896
 
 下一步只做 corrected train20 的 A projection-only overfit 预检，Q/P/LoRA 全部冻结。
 
+## A-only 预检前的诊断与冻结补丁
+
+在启动 A 训练前补齐两项必要保护：
+
+1. `analyze_mm_delta_outputs.py` 同时报告投影后 A 与 raw association logits 的
+   top-1 accuracy、top-2 accuracy、oracle probability、top-1 margin、逐用户准确率范围及
+   预测/目标直方图。raw logits 使用稳定 softmax，避免把负 logits 当概率裁剪；
+2. 修复 `--freeze_qp_branch` 未冻结 `q_residual_adapter` 的遗漏。该参数现在会冻结完整 Q
+   （包括 fixed-residual adapter）和 P，只保留 `readout_a/a_mlp` 可训练。
+
+这样 A-only 失败时可以区分：
+
+- raw accuracy 也不上升：control states/A readout 没学到 corrected association；
+- raw accuracy 上升但 projected accuracy 不升：问题位于 A 投影/Sinkhorn；
+- train20 上升但 val20 不升：仅记忆，没有跨环境泛化。
+
+本机完成 Python 语法检查与 `git diff --check`。本机默认 Python 缺少 NumPy，相关单元测试
+必须在服务器 `uavmllm` 环境执行后，才能启动 A-only 训练。
+
 ## 对现有数据与 Q checkpoint 的影响边界
 
 现有 train500/val100 是旧 solver 生成的，不能直接用于验证修复后的 A 标签质量。
