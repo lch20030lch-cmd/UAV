@@ -1,6 +1,6 @@
 ---
 type: log
-status: corrected_compact_500_100_generated_validation_pending
+status: corrected_compact_500_100_validated_a_lora_baseline_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -485,6 +485,51 @@ validation generation time: 1377.3 s
 `wc -l` 总计 `1200` 行，四个 JSONL 文件数量均与预期一致。当前仅确认生成数量完整；
 在 ID 唯一性、prompt type、图像存在性、target 约束、train/val 分布和真实序列长度验收前，
 不得启动 A+LoRA。
+
+## Corrected compact 500/100 数据验收
+
+完整性：
+
+```text
+train SFT/DPO: 500/500, prompt type 500/500 correct
+val SFT/DPO:   100/100, prompt type 100/100 correct
+duplicate/missing IDs: 0
+missing images: 0
+Q/A/P shape or finite-value errors: 0
+association/power/mobility constraint errors: 0
+train association histogram: [2498, 2530, 2465, 2507]
+```
+
+目标分布：
+
+```text
+                                      train500      val100
+Q per-dim std                         8.391584      8.359554
+A per-dim std                         0.432654      0.430576
+P per-dim std                         0.084532      0.078663
+active communication power mean       0.124810      0.123201
+inactive communication power mean     0.0           0.0
+sensing power mean                    0.375950      0.384000
+total power per UAV mean              1.000001      1.000003
+A unique/fixed users                  4.0 / 0       4.0 / 0
+A dominant ratio mean                 0.2673        0.2975
+```
+
+train/val 分布接近；P std 的约 6.9% 差异可由较小验证集和 sensing 比例波动解释，未伴随
+inactive leakage 或预算异常。
+
+control-only 序列长度：
+
+```text
+                    train500    val100
+min/mean/max        2382/2406/2437  2383/2406/2427
+<=2560              500/500         100/100
+<=3072              500/500         100/100
+```
+
+判定：数据集通过训练前验收。后续 `max_length=2560`，不截断任何样本，并相对3072获得
+约 1.4x 的注意力计算加速。启动 A+LoRA 前先用 selected Q checkpoint 在完整
+corrected train500/val100 上记录 Q/A/P 基线。
 
 ## 对现有数据与 Q checkpoint 的影响边界
 
