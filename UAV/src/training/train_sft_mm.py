@@ -83,6 +83,35 @@ def _backward_accumulated_loss(loss: torch.Tensor, accumulation_steps: int):
     (loss / accumulation_steps).backward()
 
 
+def _clip_projection_and_lora_gradients(
+    projection_parameters,
+    lora_parameters,
+    max_norm: float,
+):
+    """Clip projection and LoRA gradients independently.
+
+    The two optimizer groups have different parameter counts and gradient scales.
+    Joint clipping lets a large LoRA norm suppress an otherwise safe projection
+    gradient, preventing the task head from tracking representation updates.
+    """
+    if max_norm <= 0:
+        raise ValueError("max_norm must be positive")
+    projection_parameters = [
+        parameter for parameter in projection_parameters if parameter.grad is not None
+    ]
+    lora_parameters = [
+        parameter for parameter in lora_parameters if parameter.grad is not None
+    ]
+    if projection_parameters:
+        torch.nn.utils.clip_grad_norm_(projection_parameters, max_norm)
+    if lora_parameters:
+        torch.nn.utils.clip_grad_norm_(lora_parameters, max_norm)
+    return (
+        _grad_norm(projection_parameters),
+        _grad_norm(lora_parameters),
+    )
+
+
 def _save_mm_smoke(model, save_dir: Path, metadata: dict, save_lora: bool = False):
     save_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.projection_head.state_dict(), save_dir / "projection_head.pt")
@@ -524,7 +553,7 @@ def train_mm_sft_smoke(
                 for key, value in metric_sums.items()
             }
             metric_sums = {}
-            grad_norm = _grad_norm(model.projection_head.parameters())
+            grad_norm = _grad_norm(proj_params)
             grad_norm_lora = _grad_norm(lora_params) if train_lora else 0.0
             q_residual_adapter = getattr(model.projection_head, "q_residual_adapter", None)
             grad_norm_q_residual = (
@@ -532,8 +561,14 @@ def train_mm_sft_smoke(
                 if q_residual_adapter is not None
                 else 0.0
             )
-            clip_params = list(model.projection_head.parameters()) + lora_params
-            torch.nn.utils.clip_grad_norm_(clip_params, cfg["hardware"].get("max_grad_norm", 1.0))
+            (
+                grad_norm_proj_post_clip,
+                grad_norm_lora_post_clip,
+            ) = _clip_projection_and_lora_gradients(
+                proj_params,
+                lora_params,
+                float(cfg["hardware"].get("max_grad_norm", 1.0)),
+            )
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             q_residual_adapter_norm = (
@@ -562,6 +597,8 @@ def train_mm_sft_smoke(
                 f"delta_p_inactive_leakage={metrics['delta_p_inactive_leakage']:.6f} "
                 f"grad_norm_proj={grad_norm:.6f} "
                 f"grad_norm_lora={grad_norm_lora:.6f} "
+                f"grad_norm_proj_post_clip={grad_norm_proj_post_clip:.6f} "
+                f"grad_norm_lora_post_clip={grad_norm_lora_post_clip:.6f} "
                 f"grad_norm_q_residual={grad_norm_q_residual:.6f} "
                 f"q_residual_adapter_norm={q_residual_adapter_norm:.6f}"
             )
@@ -581,6 +618,8 @@ def train_mm_sft_smoke(
                         "loss_total": metrics["loss_total"],
                         "grad_norm_proj": grad_norm,
                         "grad_norm_lora": grad_norm_lora,
+                        "grad_norm_proj_post_clip": grad_norm_proj_post_clip,
+                        "grad_norm_lora_post_clip": grad_norm_lora_post_clip,
                         "trainable": trainable_label,
                         "train_lora": train_lora,
                         "load_lora": load_lora,

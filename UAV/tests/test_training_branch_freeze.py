@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from src.training.train_sft_mm import (
     _backward_accumulated_loss,
+    _clip_projection_and_lora_gradients,
     _freeze_projection_except,
     _is_accumulation_boundary,
     _resolve_gradient_accumulation_steps,
@@ -87,6 +88,26 @@ class ProjectionBranchFreezeTest(unittest.TestCase):
         self.assertTrue(
             torch.allclose(accumulated.weight.grad, full_batch.weight.grad)
         )
+
+    def test_projection_and_lora_gradients_are_clipped_independently(self):
+        projection = nn.Parameter(torch.zeros(2))
+        lora = nn.Parameter(torch.zeros(2))
+        projection.grad = torch.tensor([0.3, 0.4])
+        lora.grad = torch.tensor([6.0, 8.0])
+
+        projection_post, lora_post = _clip_projection_and_lora_gradients(
+            [projection],
+            [lora],
+            max_norm=1.0,
+        )
+
+        self.assertAlmostEqual(projection_post, 0.5, places=5)
+        self.assertAlmostEqual(lora_post, 1.0, places=5)
+        self.assertTrue(torch.allclose(projection.grad, torch.tensor([0.3, 0.4])))
+
+    def test_independent_gradient_clipping_rejects_nonpositive_limit(self):
+        with self.assertRaisesRegex(ValueError, "positive"):
+            _clip_projection_and_lora_gradients([], [], max_norm=0.0)
 
     def test_direct_q_isolation_only_keeps_q_readout_and_mlp_trainable(self):
         model = _DummyModel()

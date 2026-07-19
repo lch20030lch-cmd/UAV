@@ -1,6 +1,6 @@
 ---
 type: log
-status: association_lora_step25_collapse_audit_pending
+status: independent_gradient_clipping_server_test_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -741,3 +741,31 @@ Q remains effectively unchanged and constraint-safe, while P leakage worsens
 slightly. Do not extend A8. Evaluate the already-saved step25 checkpoint to determine
 whether collapse occurs in the first half or continues from step25 to step50 before
 changing the LoRA learning rate or training schedule.
+
+## A8 code audit: joint gradient-clipping defect
+
+The step25-only timing audit is superseded by a concrete training-loop defect. The
+trainer computed separate pre-clip norms but concatenated projection and LoRA
+parameters into one `clip_grad_norm_` call. At A8 step 1:
+
+```text
+A projection pre-clip norm: 0.249436
+LoRA pre-clip norm:          7.365323
+joint max norm:              1.0
+approximate joint scale:     0.136
+effective A projection norm: about 0.034 instead of 0.249
+```
+
+Thus the oversized LoRA gradient suppressed the already-safe A-head gradient. LoRA
+changed shared control states while the task head could not track the representation,
+which directly matches the observed state/output variance collapse.
+
+The trainer now clips the trainable projection group and LoRA group independently at
+the configured limit. It logs both pre-clip and post-clip norms and stores them in
+intermediate checkpoint metadata. A regression test verifies that a projection norm
+of 0.5 remains 0.5 when a simultaneous LoRA norm of 10 is clipped to 1.0. No model,
+loss, data, or checkpoint format was changed.
+
+Before repeating A8, run the unit test and a two-update clean selected-Q smoke. Its
+first step must show projection post-clip equal to projection pre-clip while LoRA is
+independently limited to 1.0.
