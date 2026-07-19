@@ -1,6 +1,6 @@
 ---
 type: log
-status: nested_vision_lora_end_to_end_weight_audit_pending
+status: vision_frozen_association_controlled_rerun_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -881,3 +881,18 @@ while language-LoRA norms `7.00` and `31.37` are independently clipped to `1.0` 
 the first two updates. Startup and backward-path contracts pass. Before the controlled
 50-update rerun, compare the saved A11 adapter against selected-Q and require an exact
 zero change for every vision LoRA tensor, with nonzero language-LoRA change.
+
+## Vision-LoRA checkpoint closure
+
+Selected-Q versus A11 after two real optimizer updates:
+
+```text
+language LoRA: tensors=272, changed=272, diff_norm=0.204118924
+vision LoRA:   tensors=162, changed=0,   diff_norm=0.000000000
+vision max absolute difference:          0.000000000
+```
+
+The fix now passes the full path from trainable-parameter selection through optimizer
+updates and checkpoint serialization. A controlled 50-update rerun from the same clean
+selected-Q checkpoint is authorized. Relative to A10, the only training-path change is
+that vision LoRA remains frozen; language LoRA and the A projection branch still train.
