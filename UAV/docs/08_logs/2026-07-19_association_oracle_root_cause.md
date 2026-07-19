@@ -1,6 +1,6 @@
 ---
 type: log
-status: independent_gradient_clipping_controlled_rerun_pending
+status: independent_gradient_clipping_output_diagnostics_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -788,3 +788,22 @@ eight environments, so the step2 loss increase alone is not a fixed-batch regres
 measurement. The next controlled test repeats the 50-update A8 configuration from
 the same clean selected-Q checkpoint with the clipping implementation as the only
 changed variable. No learning-rate or architecture change is allowed in that run.
+
+## A10 controlled training-curve result
+
+The 50-update rerun confirms independent clipping throughout, but its association
+loss curve remains effectively unchanged from A8:
+
+```text
+step                 10        20        30        40        50
+A8 raw CE          1.39908   1.38218   1.39722   1.40438   1.39719
+A10 raw CE         1.39645   1.38707   1.39479   1.41007   1.39661
+```
+
+Projection post-clip norms equal their pre-clip norms; LoRA is independently capped
+when needed; Q residual gradients remain zero; and no numerical/runtime errors occur.
+Therefore joint clipping was a real trainer defect but is not sufficient to explain
+or repair the A failure. Do not extend A10. Evaluate its train500/val100 outputs next.
+If A10 reproduces A8's state/output variance collapse, audit the mismatch between
+the normalized full-batch cached probe and the unnormalized minibatch production
+readout before authorizing another training run.
