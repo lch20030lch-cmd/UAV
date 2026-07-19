@@ -1,6 +1,6 @@
 ---
 type: log
-status: nested_vision_lora_freeze_server_test_pending
+status: nested_vision_lora_end_to_end_weight_audit_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -864,3 +864,20 @@ Fix:
 
 Do not reuse A8/A10. First run server tests and a two-update clean selected-Q smoke; the
 startup contract is `trainable vision LoRA: 0` with nonzero language LoRA.
+
+## A11 real-model vision-freeze smoke
+
+```text
+trainable LoRA tensors:       272
+trainable language LoRA:      272
+trainable vision LoRA:        0
+frozen vision parameters:     599
+isolated projection branch:   association
+Q residual gradient:          0.0
+```
+
+Independent gradient clipping also remains correct: projection pre/post norms match,
+while language-LoRA norms `7.00` and `31.37` are independently clipped to `1.0` in
+the first two updates. Startup and backward-path contracts pass. Before the controlled
+50-update rerun, compare the saved A11 adapter against selected-Q and require an exact
+zero change for every vision LoRA tensor, with nonzero language-LoRA change.
