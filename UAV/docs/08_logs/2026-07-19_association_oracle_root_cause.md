@@ -1,6 +1,6 @@
 ---
 type: log
-status: association_lora_preflight_diagnostics_pending
+status: association_lora_step25_collapse_audit_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -716,3 +716,28 @@ still fluctuates around random four-class CE and shows no learning trend, so no
 additional optimizer steps are authorized yet. Evaluate the final checkpoint on
 train500 and val100, compare against the preflight baseline, and audit Q regression
 from the shared LoRA before changing learning rates or extending training.
+
+## A8 final-checkpoint diagnostics
+
+```text
+val100 metric                         preflight input   A8 step50
+A top-1 accuracy                      0.2410            0.2435
+A top-2 accuracy                      0.4820            0.4665
+A oracle probability                  0.24855           0.24906
+A per-dim output std                  0.03680           0.00546
+control-state per-dim std             0.13807           0.07370
+Q 3D cosine                           0.625692          0.625693
+Q XY cosine                           0.702825          0.702823
+P inactive leakage                    0.02762           0.02912
+```
+
+Train500 A top-1 is only `0.2534`, below its fixed-user majority `0.2673`; val100
+remains below `0.2975`. Predicted associations collapse primarily to UAV 0/3, with
+only 2/2000 val predictions assigned to UAV 1. A output variance falls about 85%,
+and control-state variance falls about 47%. The A+LoRA path is numerically stable
+but does not learn in 50 updates and is moving toward a lower-variance representation.
+
+Q remains effectively unchanged and constraint-safe, while P leakage worsens
+slightly. Do not extend A8. Evaluate the already-saved step25 checkpoint to determine
+whether collapse occurs in the first half or continues from step25 to step50 before
+changing the LoRA learning rate or training schedule.
