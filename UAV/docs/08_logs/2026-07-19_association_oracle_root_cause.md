@@ -1,6 +1,6 @@
 ---
 type: log
-status: control_only_forward_passed_corrected_val20_pending
+status: corrected_val20_q_preflight_passed_a_overfit_pending
 stage: association_oracle_root_cause
 last_updated: 2026-07-19
 ---
@@ -255,6 +255,38 @@ loaded projection/control embeddings/LoRA: selected step150
 
 脚本正常输出 `OK`，Q/A/P 无 NaN。序列预算、图像 processor、control token 提取与旧 Q
 checkpoint 加载链路通过。下一步生成独立 seed2026 corrected val20，先复验 Q，不训练 A。
+
+## Corrected val20 上的 Q selected 复验
+
+使用独立 `seed=2026` corrected val20：
+
+```text
+Q selected 3D cosine:      0.570066
+fixed geometry 3D cosine:  0.555483
+Q selected XY cosine:      0.671826
+fixed geometry XY cosine:  0.672722
+direction std / target:    0.416991 / 0.553295
+mobility violation ratio:  0.0
+Q warning:                 none
+```
+
+相对 fixed：
+
+```text
+3D gain:   +0.014582
+XY change: -0.000896
+```
+
+判定：
+
+1. 满足既定的“3D 高于 fixed、XY 下降不超过 0.01、物理违规为 0”门槛；
+2. corrected val20 只作为分布迁移预检，不能替代后续 corrected val100 最终报告；
+3. 现阶段不重训 Q，继续保留 selected step150；
+4. residual 增益从旧 val100 的约 +0.0416 缩小到 +0.0146，后续 v4 val100 必须复查；
+5. A/P 当前输出来自旧标签与旧 prompt 训练参数，不能用本次 `A=0.24` 或 P 指标宣称
+   corrected 分支失败；它们将在对应 corrected-data 阶段重新训练。
+
+下一步只做 corrected train20 的 A projection-only overfit 预检，Q/P/LoRA 全部冻结。
 
 ## 对现有数据与 Q checkpoint 的影响边界
 
