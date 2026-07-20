@@ -31,7 +31,7 @@ import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import set_seed
+from transformers import get_scheduler, set_seed
 
 from src.data.multimodal_dataset import (
     MultimodalSFTDataset,
@@ -43,6 +43,7 @@ from src.data.oracle_contract import (
 )
 from src.model import Gemma3MultimodalISAC, UAVISACLosses, build_proj_head_config
 from src.model.gemma_multimodal_isac import is_vision_parameter_name
+from src.training.runtime_utils import resolve_warmup_steps, rotate_step_checkpoints
 
 
 def _move_batch(batch, device):
@@ -238,6 +239,7 @@ def train_mm_sft_smoke(
     output_dir: str = None,
     checkpoint_dir: str = None,
     save_steps: int = None,
+    save_total_limit: int = None,
     train_lora: bool = False,
     load_lora: bool = False,
     lambda_assoc_ce: float = None,
@@ -286,7 +288,13 @@ def train_mm_sft_smoke(
     sft_path = data_root / data_cfg.get("sft_file", "sft_dataset.jsonl")
     model_name = model_path or model_cfg["backbone"]
     max_seq_length = int(max_length or train_cfg["max_seq_length"])
-    steps_limit = int(max_steps or train_cfg.get("phase1", {}).get("max_steps", 30))
+    steps_limit = int(
+        max_steps
+        if max_steps is not None
+        else train_cfg.get("phase1", {}).get("max_steps", 30)
+    )
+    if steps_limit <= 0:
+        raise ValueError("max_steps must be a positive integer")
     grad_accum_steps = _resolve_gradient_accumulation_steps(
         train_cfg,
         gradient_accumulation_steps,
@@ -305,17 +313,29 @@ def train_mm_sft_smoke(
             "backbone cannot optimize response CE"
         )
     out_root = Path(output_dir or cfg.get("output_dir", "/root/autodl-tmp/outputs/mm_smoke"))
-    ckpt_root = Path(
-        checkpoint_dir
-        or cfg.get("checkpoint_dir", "/root/autodl-tmp/checkpoints/mm_smoke")
-    )
+    if checkpoint_dir is not None:
+        ckpt_root = Path(checkpoint_dir)
+    elif output_dir is not None:
+        ckpt_root = out_root / "checkpoints"
+    else:
+        ckpt_root = Path(
+            cfg.get("checkpoint_dir", "/root/autodl-tmp/checkpoints/mm_smoke")
+        )
     checkpoint_interval = int(
         save_steps if save_steps is not None else train_cfg.get("save_steps", 10)
     )
     if checkpoint_interval <= 0:
         raise ValueError("save_steps must be a positive integer")
+    checkpoint_limit = int(
+        save_total_limit
+        if save_total_limit is not None
+        else train_cfg.get("save_total_limit", 2)
+    )
+    if checkpoint_limit <= 0:
+        raise ValueError("save_total_limit must be a positive integer")
     ckpt_root.mkdir(parents=True, exist_ok=True)
     lora_enabled = bool(train_lora or load_lora)
+    checkpoint_prefix = f"mm_sft_{'lora_' if lora_enabled else ''}smoke_step_"
     init_lora_checkpoint = _resolve_lora_checkpoint(init_checkpoint, lora_enabled)
     if load_lora and init_lora_checkpoint is None:
         raise FileNotFoundError(
@@ -335,7 +355,10 @@ def train_mm_sft_smoke(
         "  effective batch size: "
         f"{int(train_cfg['per_device_batch_size']) * grad_accum_steps}"
     )
-    print(f"  checkpoints:{ckpt_root} (every {checkpoint_interval} steps)")
+    print(
+        f"  checkpoints:{ckpt_root} "
+        f"(every {checkpoint_interval} steps, keep {checkpoint_limit})"
+    )
     print(
         "  input mode: prompt + image + control tokens"
         + (" + response" if include_response_tokens else " (response omitted)")
@@ -557,6 +580,15 @@ def train_mm_sft_smoke(
         param_groups,
         weight_decay=train_cfg.get("weight_decay", 0.01),
     )
+    scheduler_name = str(train_cfg.get("lr_scheduler", "constant")).lower()
+    warmup_ratio = float(train_cfg.get("warmup_ratio", 0.0))
+    warmup_steps = resolve_warmup_steps(steps_limit, warmup_ratio)
+    scheduler = get_scheduler(
+        scheduler_name,
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=steps_limit,
+    )
     print(f"  trainable projection tensors: {len(proj_params)}")
     print(f"  trainable LoRA tensors:       {len(lora_params)}")
     print(f"  trainable language LoRA:      {len(trainable_language_lora_names)}")
@@ -567,6 +599,8 @@ def train_mm_sft_smoke(
     )
     print(f"  projection lr:                {proj_lr}")
     print(f"  LoRA lr:                      {lora_lr if train_lora else 0.0}")
+    print(f"  lr scheduler:                 {scheduler_name}")
+    print(f"  warmup steps:                 {warmup_steps}")
     print(f"  projection head type:         {head_type}")
     print(f"  q projection mode:            {q_mode}")
     print(f"  q geometry mode:              {q_geom_mode}")
@@ -712,7 +746,14 @@ def train_mm_sft_smoke(
                 lora_params,
                 float(cfg["hardware"].get("max_grad_norm", 1.0)),
             )
+            step_proj_lr = float(optimizer.param_groups[0]["lr"])
+            step_lora_lr = (
+                float(optimizer.param_groups[1]["lr"])
+                if train_lora and lora_params
+                else 0.0
+            )
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             q_residual_adapter_norm = (
                 _parameter_norm(q_residual_adapter.parameters())
@@ -743,6 +784,8 @@ def train_mm_sft_smoke(
                 f"grad_norm_lora={grad_norm_lora:.6f} "
                 f"grad_norm_proj_post_clip={grad_norm_proj_post_clip:.6f} "
                 f"grad_norm_lora_post_clip={grad_norm_lora_post_clip:.6f} "
+                f"lr_proj={step_proj_lr:.9g} "
+                f"lr_lora={step_lora_lr:.9g} "
                 f"grad_norm_q_residual={grad_norm_q_residual:.6f} "
                 f"q_residual_adapter_norm={q_residual_adapter_norm:.6f}"
             )
@@ -750,7 +793,7 @@ def train_mm_sft_smoke(
             if global_step % checkpoint_interval == 0:
                 _save_mm_smoke(
                     model,
-                    ckpt_root / f"mm_sft_{'lora_' if lora_enabled else ''}smoke_step_{global_step}",
+                    ckpt_root / f"{checkpoint_prefix}{global_step}",
                     {
                         "global_step": global_step,
                         "micro_step": micro_step,
@@ -774,6 +817,10 @@ def train_mm_sft_smoke(
                         ),
                         "init_lora_checkpoint": init_lora_checkpoint,
                         "checkpoint_interval": checkpoint_interval,
+                        "save_total_limit": checkpoint_limit,
+                        "lr_scheduler": scheduler_name,
+                        "warmup_ratio": warmup_ratio,
+                        "warmup_steps": warmup_steps,
                         "include_response_tokens": include_response_tokens,
                         "use_chat_template": include_response_tokens,
                         "lambda_lm_ce": lambda_lm_ce_value,
@@ -813,6 +860,13 @@ def train_mm_sft_smoke(
                     # Do not duplicate it in every projection-only checkpoint.
                     save_lora=train_lora,
                 )
+                removed_checkpoints = rotate_step_checkpoints(
+                    ckpt_root,
+                    prefix=checkpoint_prefix,
+                    save_total_limit=checkpoint_limit,
+                )
+                for removed_checkpoint in removed_checkpoints:
+                    pbar.write(f"removed_old_checkpoint={removed_checkpoint}")
 
     pbar.close()
 
@@ -839,6 +893,10 @@ def train_mm_sft_smoke(
             ),
             "init_lora_checkpoint": init_lora_checkpoint,
             "checkpoint_interval": checkpoint_interval,
+            "save_total_limit": checkpoint_limit,
+            "lr_scheduler": scheduler_name,
+            "warmup_ratio": warmup_ratio,
+            "warmup_steps": warmup_steps,
             "include_response_tokens": include_response_tokens,
             "use_chat_template": include_response_tokens,
             "lambda_lm_ce": lambda_lm_ce_value,
@@ -900,6 +958,12 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="可选：中间 checkpoint 保存间隔；默认读取配置文件",
+    )
+    parser.add_argument(
+        "--save_total_limit",
+        type=int,
+        default=None,
+        help="maximum number of matching intermediate step checkpoints to retain",
     )
     parser.add_argument("--train_lora", action="store_true")
     parser.add_argument(
@@ -996,6 +1060,7 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         checkpoint_dir=args.checkpoint_dir,
         save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit,
         train_lora=args.train_lora,
         load_lora=args.load_lora,
         lambda_assoc_ce=args.lambda_assoc_ce,

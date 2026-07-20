@@ -25,7 +25,7 @@ import yaml
 from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import get_cosine_schedule_with_warmup, set_seed
+from transformers import get_scheduler, set_seed
 
 from src.data.multimodal_dataset import (
     MultimodalDPODataset,
@@ -37,6 +37,11 @@ from src.data.oracle_contract import (
 )
 from src.model import Gemma3MultimodalISAC, UAVISACLosses, build_proj_head_config
 from src.model.gemma_multimodal_isac import is_vision_parameter_name
+from src.training.runtime_utils import (
+    resolve_optimizer_steps,
+    resolve_warmup_steps,
+    rotate_step_checkpoints,
+)
 
 
 def _gather_log_probs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -215,6 +220,33 @@ def train_multimodal_dpo(args):
         pin_memory=True,
     )
 
+    accumulation = int(
+        args.gradient_accumulation_steps
+        if args.gradient_accumulation_steps is not None
+        else train_cfg.get("gradient_accumulation_steps", 1)
+    )
+    epochs = int(train_cfg.get("epochs", 1))
+    max_steps = resolve_optimizer_steps(
+        num_batches=len(dataloader),
+        gradient_accumulation_steps=accumulation,
+        epochs=epochs,
+        max_steps_override=args.max_steps,
+    )
+    # With an explicit step override, repeat the dataloader until the requested
+    # number of full accumulation windows completes. Otherwise consume exactly
+    # the configured epoch count and use a correctly scaled final short window.
+    max_micro_steps = None if args.max_steps is not None else len(dataloader) * epochs
+
+    learning_rate = float(
+        args.learning_rate
+        if args.learning_rate is not None
+        else train_cfg.get("learning_rate", 5e-5)
+    )
+    projection_lr = float(args.projection_lr)
+    beta = float(args.beta if args.beta is not None else train_cfg.get("beta", 0.1))
+    sft_anchor = float(args.sft_anchor)
+    control_anchor = float(args.control_anchor)
+
     lora_parameters = [
         parameter
         for name, parameter in policy.base_model.named_parameters()
@@ -230,20 +262,39 @@ def train_multimodal_dpo(args):
         raise RuntimeError("no trainable language LoRA parameters found")
     optimizer = torch.optim.AdamW(
         [
-            {"params": lora_parameters, "lr": float(args.learning_rate)},
-            {"params": projection_parameters, "lr": float(args.projection_lr)},
+            {"params": lora_parameters, "lr": learning_rate},
+            {"params": projection_parameters, "lr": projection_lr},
         ],
         weight_decay=float(train_cfg.get("weight_decay", 0.01)),
     )
-    accumulation = int(
-        args.gradient_accumulation_steps
-        or train_cfg.get("gradient_accumulation_steps", 1)
+    scheduler_name = str(train_cfg.get("lr_scheduler", "constant")).lower()
+    warmup_ratio = float(train_cfg.get("warmup_ratio", 0.0))
+    warmup_steps = resolve_warmup_steps(max_steps, warmup_ratio)
+    scheduler = get_scheduler(
+        scheduler_name,
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=max_steps,
     )
-    max_steps = int(args.max_steps)
-    warmup_steps = int(max_steps * float(train_cfg.get("warmup_ratio", 0.03)))
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, warmup_steps, max_steps
+
+    output_dir = Path(args.output_dir)
+    checkpoint_root = Path(args.checkpoint_dir or (output_dir / "checkpoints"))
+    checkpoint_interval = int(
+        args.save_steps
+        if args.save_steps is not None
+        else train_cfg.get("save_steps", 10)
     )
+    checkpoint_limit = int(
+        args.save_total_limit
+        if args.save_total_limit is not None
+        else train_cfg.get("save_total_limit", 2)
+    )
+    if checkpoint_interval <= 0:
+        raise ValueError("save_steps must be a positive integer")
+    if checkpoint_limit <= 0:
+        raise ValueError("save_total_limit must be a positive integer")
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+    checkpoint_prefix = "mm_dpo_step_"
     loss_helper = UAVISACLosses(
         lambda_ctl=1.0,
         lambda_q=cfg["model"]["loss"]["lambda_q"],
@@ -256,9 +307,26 @@ def train_multimodal_dpo(args):
     optimizer.zero_grad(set_to_none=True)
     global_step = 0
     micro_step = 0
+    metric_sums = {"loss": 0.0, "loss_dpo": 0.0, "loss_sft": 0.0, "loss_ctl": 0.0}
+    metric_count = 0
+    print("=" * 60)
+    print("BEV-image multimodal DPO")
+    print("=" * 60)
+    print(f"  data:                  {data_root}")
+    print(f"  optimizer steps:       {max_steps}")
+    print(f"  configured epochs:     {epochs}")
+    print(f"  gradient accumulation: {accumulation}")
+    print(f"  lr scheduler:          {scheduler_name}")
+    print(f"  warmup steps:          {warmup_steps}")
+    print(
+        f"  checkpoints:           {checkpoint_root} "
+        f"(every {checkpoint_interval} steps, keep {checkpoint_limit})"
+    )
     progress = tqdm(total=max_steps, desc="MM DPO")
     while global_step < max_steps:
         for raw_batch in dataloader:
+            if max_micro_steps is not None and micro_step >= max_micro_steps:
+                break
             batch = _move_batch(raw_batch, device)
             chosen_positions = _response_logit_positions(batch, "chosen")
             rejected_positions = _response_logit_positions(batch, "rejected")
@@ -290,7 +358,7 @@ def train_multimodal_dpo(args):
                 )
                 del ref_rejected
 
-            preference_logit = float(args.beta) * (
+            preference_logit = beta * (
                 (chosen_logp - rejected_logp)
                 - (ref_chosen_logp - ref_rejected_logp)
             )
@@ -315,14 +383,28 @@ def train_multimodal_dpo(args):
             )
             loss = (
                 loss_dpo
-                + float(args.sft_anchor) * loss_sft
-                + float(args.control_anchor) * loss_ctl
+                + sft_anchor * loss_sft
+                + control_anchor * loss_ctl
             )
             if not torch.isfinite(loss):
                 raise RuntimeError("non-finite multimodal DPO loss")
-            (loss / accumulation).backward()
+            if max_micro_steps is None:
+                window_size = accumulation
+            else:
+                window_start = (micro_step // accumulation) * accumulation
+                window_size = min(accumulation, max_micro_steps - window_start)
+            (loss / window_size).backward()
+            metric_sums["loss"] += float(loss.detach().item())
+            metric_sums["loss_dpo"] += float(loss_dpo.detach().item())
+            metric_sums["loss_sft"] += float(loss_sft.detach().item())
+            metric_sums["loss_ctl"] += float(loss_ctl.detach().item())
+            metric_count += 1
             micro_step += 1
-            if micro_step % accumulation:
+            is_full_window = micro_step % accumulation == 0
+            is_final_short_window = (
+                max_micro_steps is not None and micro_step == max_micro_steps
+            )
+            if not (is_full_window or is_final_short_window):
                 continue
 
             torch.nn.utils.clip_grad_norm_(
@@ -332,20 +414,71 @@ def train_multimodal_dpo(args):
                 projection_parameters,
                 float(cfg["hardware"].get("max_grad_norm", 1.0)),
             )
+            step_lora_lr = float(optimizer.param_groups[0]["lr"])
+            step_projection_lr = float(optimizer.param_groups[1]["lr"])
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
+            window_metrics = {
+                key: value / metric_count for key, value in metric_sums.items()
+            }
+            metric_sums = {
+                "loss": 0.0,
+                "loss_dpo": 0.0,
+                "loss_sft": 0.0,
+                "loss_ctl": 0.0,
+            }
+            metric_count = 0
             progress.update(1)
             progress.write(
-                f"step={global_step} loss={loss.item():.6f} "
-                f"loss_dpo={loss_dpo.item():.6f} loss_sft={loss_sft.item():.6f} "
-                f"loss_ctl={loss_ctl.item():.6f}"
+                f"step={global_step} micro_step={micro_step} "
+                f"loss={window_metrics['loss']:.6f} "
+                f"loss_dpo={window_metrics['loss_dpo']:.6f} "
+                f"loss_sft={window_metrics['loss_sft']:.6f} "
+                f"loss_ctl={window_metrics['loss_ctl']:.6f} "
+                f"lr_lora={step_lora_lr:.9g} "
+                f"lr_projection={step_projection_lr:.9g}"
             )
+            if global_step % checkpoint_interval == 0:
+                checkpoint_metadata = {
+                    **stage1_metadata,
+                    "stage": "multimodal_dpo",
+                    "global_step": global_step,
+                    "micro_step": micro_step,
+                    "stage1_checkpoint": str(checkpoint_dir),
+                    "max_steps": max_steps,
+                    "epochs": epochs,
+                    "gradient_accumulation_steps": accumulation,
+                    "max_seq_length": max_length,
+                    "learning_rate": learning_rate,
+                    "projection_lr": projection_lr,
+                    "lr_scheduler": scheduler_name,
+                    "warmup_ratio": warmup_ratio,
+                    "warmup_steps": warmup_steps,
+                    "checkpoint_interval": checkpoint_interval,
+                    "save_total_limit": checkpoint_limit,
+                    "beta": beta,
+                    "sft_anchor": sft_anchor,
+                    "control_anchor": control_anchor,
+                    "use_chat_template": True,
+                    **checkpoint_dataset_fields(dataset_metadata),
+                }
+                _save(
+                    policy,
+                    checkpoint_root / f"{checkpoint_prefix}{global_step}",
+                    checkpoint_metadata,
+                )
+                removed_checkpoints = rotate_step_checkpoints(
+                    checkpoint_root,
+                    prefix=checkpoint_prefix,
+                    save_total_limit=checkpoint_limit,
+                )
+                for removed_checkpoint in removed_checkpoints:
+                    progress.write(f"removed_old_checkpoint={removed_checkpoint}")
             if global_step >= max_steps:
                 break
     progress.close()
-    output_dir = Path(args.output_dir)
     _save(
         policy,
         output_dir,
@@ -354,10 +487,19 @@ def train_multimodal_dpo(args):
             "stage": "multimodal_dpo",
             "stage1_checkpoint": str(checkpoint_dir),
             "max_steps": max_steps,
+            "epochs": epochs,
+            "gradient_accumulation_steps": accumulation,
             "max_seq_length": max_length,
-            "beta": float(args.beta),
-            "sft_anchor": float(args.sft_anchor),
-            "control_anchor": float(args.control_anchor),
+            "learning_rate": learning_rate,
+            "projection_lr": projection_lr,
+            "lr_scheduler": scheduler_name,
+            "warmup_ratio": warmup_ratio,
+            "warmup_steps": warmup_steps,
+            "checkpoint_interval": checkpoint_interval,
+            "save_total_limit": checkpoint_limit,
+            "beta": beta,
+            "sft_anchor": sft_anchor,
+            "control_anchor": control_anchor,
             "use_chat_template": True,
             **checkpoint_dataset_fields(dataset_metadata),
         },
@@ -371,14 +513,22 @@ def main():
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--stage1_checkpoint", required=True)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--max_steps", type=int, default=50)
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=None,
+        help="optimizer-step override; by default derive updates from configured epochs",
+    )
     parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=None)
-    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--projection_lr", type=float, default=1e-4)
-    parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--beta", type=float, default=None)
     parser.add_argument("--sft_anchor", type=float, default=0.05)
     parser.add_argument("--control_anchor", type=float, default=0.1)
+    parser.add_argument("--checkpoint_dir", default=None)
+    parser.add_argument("--save_steps", type=int, default=None)
+    parser.add_argument("--save_total_limit", type=int, default=None)
     train_multimodal_dpo(parser.parse_args())
 
 
