@@ -37,6 +37,10 @@ from src.data.multimodal_dataset import (
     MultimodalSFTDataset,
     validate_multimodal_oracle_contract,
 )
+from src.data.oracle_contract import (
+    checkpoint_dataset_fields,
+    validate_checkpoint_dataset_compatibility,
+)
 from src.model import Gemma3MultimodalISAC, UAVISACLosses, build_proj_head_config
 from src.model.gemma_multimodal_isac import is_vision_parameter_name
 
@@ -141,7 +145,9 @@ def _load_mm_smoke_checkpoint(
     init_checkpoint: str,
     *,
     expected_projection_config: dict,
+    expected_dataset_metadata: dict = None,
     allow_partial_projection_load: bool = False,
+    allow_checkpoint_dataset_mismatch: bool = False,
 ) -> dict:
     if not init_checkpoint:
         return {}
@@ -151,6 +157,7 @@ def _load_mm_smoke_checkpoint(
 
     loaded = {"init_checkpoint": str(ckpt_dir)}
     metadata_path = ckpt_dir / "metadata.json"
+    metadata = {}
     if metadata_path.exists():
         with metadata_path.open("r", encoding="utf-8") as handle:
             metadata = json.load(handle)
@@ -172,6 +179,13 @@ def _load_mm_smoke_checkpoint(
                 f"{mismatches}. Use --allow_partial_projection_load only for an "
                 "intentional architecture migration."
             )
+    if expected_dataset_metadata:
+        validate_checkpoint_dataset_compatibility(
+            metadata,
+            expected_dataset_metadata,
+            allow_mismatch=allow_checkpoint_dataset_mismatch,
+            require_same_seed=True,
+        )
     proj_path = ckpt_dir / "projection_head.pt"
     if proj_path.exists():
         state = torch.load(proj_path, map_location="cpu")
@@ -250,6 +264,7 @@ def train_mm_sft_smoke(
     lambda_lm_ce: float = None,
     allow_partial_projection_load: bool = False,
     allow_legacy_oracle_data: bool = False,
+    allow_checkpoint_dataset_mismatch: bool = False,
 ):
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -263,8 +278,11 @@ def train_mm_sft_smoke(
 
     data_root = Path(data_dir or data_cfg["output_dir"])
     dataset_metadata = validate_multimodal_oracle_contract(
-        data_root, allow_legacy=allow_legacy_oracle_data
+        data_root,
+        allow_legacy=allow_legacy_oracle_data,
+        expected_simulation=sim_cfg,
     )
+    checkpoint_provenance = checkpoint_dataset_fields(dataset_metadata)
     sft_path = data_root / data_cfg.get("sft_file", "sft_dataset.jsonl")
     model_name = model_path or model_cfg["backbone"]
     max_seq_length = int(max_length or train_cfg["max_seq_length"])
@@ -331,7 +349,15 @@ def train_mm_sft_smoke(
     print(f"  trainable:  {trainable_label}")
     print()
 
-    proj_head_config = build_proj_head_config(model_cfg, sim_cfg)
+    init_metadata = {}
+    if init_checkpoint:
+        init_metadata_path = Path(init_checkpoint) / "metadata.json"
+        if init_metadata_path.exists():
+            with init_metadata_path.open("r", encoding="utf-8") as handle:
+                init_metadata = json.load(handle)
+    proj_head_config = build_proj_head_config(
+        model_cfg, sim_cfg, checkpoint_metadata=init_metadata
+    )
     if projection_head_type is not None:
         proj_head_config["head_type"] = projection_head_type
     if q_projection_mode is not None:
@@ -375,7 +401,9 @@ def train_mm_sft_smoke(
             "q_projection_mode": q_mode,
             "q_geometry_mode": q_geom_mode,
         },
+        expected_dataset_metadata=dataset_metadata,
         allow_partial_projection_load=allow_partial_projection_load,
+        allow_checkpoint_dataset_mismatch=allow_checkpoint_dataset_mismatch,
     )
     if loaded_init:
         print(f"  init_checkpoint: {loaded_init}")
@@ -779,6 +807,7 @@ def train_mm_sft_smoke(
                         "lambda_assoc_ce": assoc_ce_weight,
                         "lambda_assoc_raw_ce": assoc_raw_ce_weight,
                         "loaded_init": loaded_init,
+                        **checkpoint_provenance,
                     },
                     # A frozen LoRA is unchanged and already stored in init_checkpoint.
                     # Do not duplicate it in every projection-only checkpoint.
@@ -843,6 +872,7 @@ def train_mm_sft_smoke(
             "lambda_assoc_ce": assoc_ce_weight,
             "lambda_assoc_raw_ce": assoc_raw_ce_weight,
             "loaded_init": loaded_init,
+            **checkpoint_provenance,
         },
         save_lora=lora_enabled,
     )
@@ -920,6 +950,14 @@ if __name__ == "__main__":
         action="store_true",
         help="diagnostic override only; permits pre-v5 Oracle data",
     )
+    parser.add_argument(
+        "--allow_checkpoint_dataset_mismatch",
+        action="store_true",
+        help=(
+            "diagnostic/migration override only; permits an init checkpoint "
+            "whose Oracle dataset provenance differs from the current data"
+        ),
+    )
     parser.add_argument("--projection_head_type", type=str, choices=["shared", "split"], default=None,
                         help="可选 projection head 类型；默认使用配置文件，split 用于 q/a/p 分支解耦实验")
     parser.add_argument("--q_projection_mode", type=str, choices=["clip", "direction"], default=None,
@@ -984,4 +1022,5 @@ if __name__ == "__main__":
         lambda_lm_ce=args.lambda_lm_ce,
         allow_partial_projection_load=args.allow_partial_projection_load,
         allow_legacy_oracle_data=args.allow_legacy_oracle_data,
+        allow_checkpoint_dataset_mismatch=args.allow_checkpoint_dataset_mismatch,
     )

@@ -29,6 +29,12 @@ import numpy as np
 import yaml
 
 from src.data.oracle_generator import OracleDataGenerator
+from src.data.oracle_contract import (
+    PROMPT_TYPE,
+    assert_resume_compatible,
+    build_dataset_metadata,
+    paired_record_state,
+)
 from src.data.prompt_builder import build_multimodal_prompt, format_oracle_response
 from src.env import ISACScenarioGenerator, render_bev_sample
 from src.solver.sca_fp import SCAFPConfig, SCAFPOptimizer
@@ -46,13 +52,6 @@ def _on_interrupt(sig, frame):
 def _append_jsonl(path: Path, record: dict) -> None:
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-def _count_existing(path: Path) -> int:
-    if not path.exists():
-        return 0
-    with path.open("r", encoding="utf-8") as f:
-        return sum(1 for line in f if line.strip())
 
 
 def _build_solver(sim_cfg: dict) -> SCAFPOptimizer:
@@ -88,6 +87,8 @@ def _build_solver(sim_cfg: dict) -> SCAFPOptimizer:
         N_t=sim_cfg["num_antennas_tx"],
         N_r=sim_cfg.get("num_antennas_rx", sim_cfg["num_antennas_tx"]),
         carrier_freq_ghz=sim_cfg["carrier_freq_ghz"],
+        bandwidth_mhz=sim_cfg["bandwidth_mhz"],
+        noise_figure_db=sim_cfg["noise_figure_db"],
         area_size=tuple(sim_cfg["area_size"]),
         altitude_range=(sim_cfg["altitude_min_m"], sim_cfg["altitude_max_m"]),
         p_max=10 ** ((sim_cfg["p_max_dbm"] - 30) / 10),
@@ -133,7 +134,7 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
 
     common = {
         "bev_image_path": env_sample.bev_image_path,
-        "prompt_type": "multimodal_bev_image_v5_constraint_aware",
+        "prompt_type": PROMPT_TYPE,
         "bev_grid_text": env_sample.bev_grid_text,
         "q_current": q_current.tolist(),
         "delta_q": delta_q.tolist(),
@@ -221,6 +222,16 @@ def main():
     ckpt_path = output_dir / "checkpoint.txt"
     metadata_path = output_dir / "dataset_metadata.json"
 
+    expected_metadata = build_dataset_metadata(
+        sim_cfg,
+        seed=args.seed,
+        num_environments_requested=num_samples,
+        num_restarts=int(data_cfg["num_restarts"]),
+        image_size=image_size,
+        sft_file=sft_path.name,
+        dpo_file=dpo_path.name,
+    )
+
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "images").mkdir(parents=True, exist_ok=True)
 
@@ -236,32 +247,27 @@ def main():
                 "output directory or pass --overwrite"
             )
         existing_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if (
-            existing_metadata.get("solver_algorithm")
-            != "constraint_aware_alternating_optimization"
-            or int(existing_metadata.get("seed", -1)) != int(args.seed)
-        ):
-            raise RuntimeError(
-                "dataset metadata does not match the current solver/seed; "
-                "refusing unsafe resume"
-            )
+        assert_resume_compatible(existing_metadata, expected_metadata)
 
     # Resume from the attempted environment id, not the SFT line count.  An
     # infeasible/failed environment may intentionally produce no SFT row, so
     # line-count resume can otherwise duplicate later sample ids.
-    start_id = 0
+    checkpoint_next_id = 0
     if ckpt_path.exists():
         try:
-            start_id = int(ckpt_path.read_text(encoding="utf-8").strip())
+            checkpoint_next_id = int(
+                ckpt_path.read_text(encoding="utf-8").strip()
+            )
         except ValueError as exc:
             raise ValueError(f"invalid generation checkpoint: {ckpt_path}") from exc
-    existing_sft = _count_existing(sft_path)
-    existing_dpo = _count_existing(dpo_path)
-    if existing_sft != existing_dpo:
-        raise RuntimeError(
-            "v5 generation requires paired SFT/DPO counts, got "
-            f"{existing_sft}/{existing_dpo}"
-        )
+    record_state = paired_record_state(
+        output_dir, sft_path.name, dpo_path.name
+    )
+    existing_sft = record_state["num_sft_records"]
+    existing_dpo = record_state["num_dpo_records"]
+    # A hard interruption can occur after both JSONL rows are appended but
+    # before checkpoint.txt is advanced.  Never reuse an ID already present.
+    start_id = max(checkpoint_next_id, record_state["next_environment_id"])
     if existing_sft >= num_samples and existing_dpo >= num_samples:
         print(f"All {num_samples} samples already exist at {output_dir}")
         return
@@ -275,7 +281,11 @@ def main():
         carrier_freq_ghz=sim_cfg["carrier_freq_ghz"],
         bandwidth_mhz=sim_cfg["bandwidth_mhz"],
         num_antennas=sim_cfg["num_antennas_tx"],
+        num_antennas_rx=sim_cfg.get(
+            "num_antennas_rx", sim_cfg["num_antennas_tx"]
+        ),
         p_max_dbm=sim_cfg["p_max_dbm"],
+        noise_figure_db=sim_cfg["noise_figure_db"],
         seed=args.seed,
     )
     solver = _build_solver(sim_cfg)
@@ -286,17 +296,7 @@ def main():
         sim_config=sim_cfg,
     )
 
-    dataset_metadata = {
-        "schema_version": 5,
-        "prompt_type": "multimodal_bev_image_v5_constraint_aware",
-        "seed": args.seed,
-        "num_environments_requested": num_samples,
-        "num_restarts": generator.num_restarts,
-        "solver_algorithm": "constraint_aware_alternating_optimization",
-        "channel_model": "elevation_los_3gpp_pathloss_v2",
-        "requires_oracle_feasible": True,
-        "generation_complete": False,
-    }
+    dataset_metadata = expected_metadata
     with metadata_path.open("w", encoding="utf-8") as handle:
         json.dump(dataset_metadata, handle, indent=2)
 

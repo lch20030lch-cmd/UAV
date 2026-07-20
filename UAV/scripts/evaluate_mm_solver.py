@@ -20,9 +20,10 @@ from src.data.multimodal_dataset import (
     MultimodalSFTDataset,
     validate_multimodal_oracle_contract,
 )
+from src.data.oracle_contract import validate_checkpoint_dataset_compatibility
 from src.env import ISACScenarioGenerator
 from src.solver import SCAFPConfig, SCAFPOptimizer
-from src.training.train_dpo_mm import _load_model
+from src.training.train_dpo_mm import _checkpoint_metadata, _load_model
 
 
 def _move_batch(batch, device):
@@ -47,7 +48,7 @@ def _solution_metrics(solver, solution, env):
     )
     active = solution.A > 0.5
     sum_rate_mbps = float(
-        20e6 * np.log2(1.0 + comm_sinr[active]).sum() / 1e6
+        solver.channel.B * np.log2(1.0 + comm_sinr[active]).sum() / 1e6
     )
     sensing_sinr = (
         solution.W_s_power[:, None]
@@ -122,11 +123,18 @@ def main():
     if args.model is not None:
         cfg["model"]["backbone"] = args.model
     checkpoint_dir = Path(args.checkpoint)
-    model, metadata = _load_model(cfg, checkpoint_dir, trainable=False)
     data_root = Path(args.data_dir)
-    validate_multimodal_oracle_contract(
-        data_root, allow_legacy=args.allow_legacy_dataset
+    dataset_metadata = validate_multimodal_oracle_contract(
+        data_root,
+        allow_legacy=args.allow_legacy_dataset,
+        expected_simulation=cfg["simulation"],
+        expected_seed=args.data_seed,
     )
+    if not args.allow_legacy_dataset:
+        validate_checkpoint_dataset_compatibility(
+            _checkpoint_metadata(checkpoint_dir), dataset_metadata
+        )
+    model, metadata = _load_model(cfg, checkpoint_dir, trainable=False)
     data_path = data_root / cfg["data"].get("sft_file", "sft_dataset.jsonl")
     use_chat_template = bool(metadata.get("use_chat_template", False))
     dataset = MultimodalSFTDataset(
@@ -149,7 +157,9 @@ def main():
         carrier_freq_ghz=sim["carrier_freq_ghz"],
         bandwidth_mhz=sim["bandwidth_mhz"],
         num_antennas=sim["num_antennas_tx"],
+        num_antennas_rx=sim.get("num_antennas_rx", sim["num_antennas_tx"]),
         p_max_dbm=sim["p_max_dbm"],
+        noise_figure_db=sim["noise_figure_db"],
         seed=args.data_seed,
     )
     solver = SCAFPOptimizer(
@@ -166,6 +176,8 @@ def main():
         N_t=sim["num_antennas_tx"],
         N_r=sim.get("num_antennas_rx", sim["num_antennas_tx"]),
         carrier_freq_ghz=sim["carrier_freq_ghz"],
+        bandwidth_mhz=sim["bandwidth_mhz"],
+        noise_figure_db=sim["noise_figure_db"],
         area_size=tuple(sim["area_size"]),
         altitude_range=(sim["altitude_min_m"], sim["altitude_max_m"]),
         p_max=10 ** ((sim["p_max_dbm"] - 30) / 10),

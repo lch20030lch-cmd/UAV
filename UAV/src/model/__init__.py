@@ -3,14 +3,27 @@ from .gemma_multimodal_isac import Gemma3MultimodalISAC
 from .projection_head import ConstraintProjectionHead
 from .losses import UAVISACLosses
 
+__all__ = [
+    "Gemma3ISAC",
+    "Gemma3MultimodalISAC",
+    "ConstraintProjectionHead",
+    "UAVISACLosses",
+    "ensure_gc_and_freeze_lm_head",
+    "build_proj_head_config",
+]
 
-def build_proj_head_config(model_cfg: dict, sim_cfg: dict) -> dict:
+
+def build_proj_head_config(
+    model_cfg: dict,
+    sim_cfg: dict,
+    checkpoint_metadata: dict = None,
+) -> dict:
     """从 YAML 配置构造 ConstraintProjectionHead 参数字典
 
     原先在 train_sft.py / train_dpo.py / evaluate.py 中有 3-4 处
     重复的 15 行字典构造代码, 现提取为此工厂函数。
     """
-    return {
+    result = {
         "hidden_dim": model_cfg["control_token"]["hidden_dim"],
         "num_control_tokens": model_cfg["control_token"]["num_tokens"],
         "mlp_hidden": model_cfg["projection_head"]["mlp_hidden"],
@@ -33,3 +46,15 @@ def build_proj_head_config(model_cfg: dict, sim_cfg: dict) -> dict:
         "q_fixed_cue_weights": model_cfg["projection_head"].get("q_fixed_cue_weights"),
         "q_residual_max_scale": model_cfg["projection_head"].get("q_residual_max_scale", 0.5),
     }
+    metadata_to_config = {
+        "projection_head_type": "head_type",
+        "q_projection_mode": "q_projection_mode",
+        "q_geometry_mode": "q_geometry_mode",
+        "q_fixed_cue_weights": "q_fixed_cue_weights",
+        "q_residual_max_scale": "q_residual_max_scale",
+    }
+    for metadata_key, config_key in metadata_to_config.items():
+        value = (checkpoint_metadata or {}).get(metadata_key)
+        if value is not None:
+            result[config_key] = value
+    return result

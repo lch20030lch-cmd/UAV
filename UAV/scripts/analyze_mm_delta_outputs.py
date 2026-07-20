@@ -626,8 +626,10 @@ def main():
     model_name = args.model or model_cfg["backbone"]
     max_length = args.max_length or train_cfg["max_seq_length"]
     lora_checkpoint = _resolve_lora_checkpoint(args.checkpoint, args.lora_checkpoint)
-    proj_head_config = build_proj_head_config(model_cfg, sim_cfg)
     checkpoint_metadata = _read_checkpoint_metadata(args.checkpoint)
+    proj_head_config = build_proj_head_config(
+        model_cfg, sim_cfg, checkpoint_metadata=checkpoint_metadata
+    )
     mode_fields = {
         "projection_head_type": ("head_type", args.projection_head_type),
         "q_projection_mode": ("q_projection_mode", args.q_projection_mode),

@@ -6,7 +6,7 @@ from src.model.losses import UAVISACLosses
 from src.model.projection_head import ConstraintProjectionHead
 
 
-def _make_head(mode="fixed_residual_xy", weights=None):
+def _make_head(mode="fixed_residual_xy", weights=(1.0, 0.0, 0.0)):
     return ConstraintProjectionHead(
         hidden_dim=4,
         num_control_tokens=2,
@@ -81,6 +81,10 @@ class FixedResidualQGeometryTest(unittest.TestCase):
         head = _make_head()
         with self.assertRaisesRegex(ValueError, "q_geometry_cues are required"):
             head._compose_q_from_geometry_cues(torch.zeros(1, 1, 3), None, None)
+
+    def test_fixed_geometry_requires_dataset_calibrated_weights(self):
+        with self.assertRaisesRegex(ValueError, "explicit q_fixed_cue_weights"):
+            _make_head(weights=None)
 
     def test_old_mode_does_not_add_checkpoint_parameters(self):
         head = _make_head(mode="none")

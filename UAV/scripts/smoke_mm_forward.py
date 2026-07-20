@@ -8,6 +8,7 @@
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -55,6 +56,18 @@ def _load_control_token_embeddings(model: Gemma3MultimodalISAC, checkpoint: str)
     ckpt_path = Path(checkpoint)
     ckpt_root = ckpt_path if ckpt_path.is_dir() else ckpt_path.parent
     return model.load_control_token_embeddings(ckpt_root)
+
+
+def _read_checkpoint_metadata(checkpoint: str) -> dict:
+    if not checkpoint:
+        return {}
+    checkpoint_path = Path(checkpoint)
+    root = checkpoint_path if checkpoint_path.is_dir() else checkpoint_path.parent
+    metadata_path = root / "metadata.json"
+    if not metadata_path.exists():
+        return {}
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def _move_batch(batch, device):
@@ -105,13 +118,24 @@ def main():
     data_path = data_dir / data_cfg.get("sft_file", "sft_dataset.jsonl")
     max_length = args.max_length or train_cfg["max_seq_length"]
     lora_checkpoint = _resolve_lora_checkpoint(args.checkpoint, args.lora_checkpoint)
-    proj_head_config = build_proj_head_config(model_cfg, sim_cfg)
-    if args.projection_head_type is not None:
-        proj_head_config["head_type"] = args.projection_head_type
-    if args.q_projection_mode is not None:
-        proj_head_config["q_projection_mode"] = args.q_projection_mode
-    if args.q_geometry_mode is not None:
-        proj_head_config["q_geometry_mode"] = args.q_geometry_mode
+    checkpoint_metadata = _read_checkpoint_metadata(args.checkpoint)
+    proj_head_config = build_proj_head_config(
+        model_cfg, sim_cfg, checkpoint_metadata=checkpoint_metadata
+    )
+    mode_fields = {
+        "projection_head_type": ("head_type", args.projection_head_type),
+        "q_projection_mode": ("q_projection_mode", args.q_projection_mode),
+        "q_geometry_mode": ("q_geometry_mode", args.q_geometry_mode),
+    }
+    for metadata_key, (config_key, cli_value) in mode_fields.items():
+        saved_value = checkpoint_metadata.get(metadata_key)
+        if cli_value is not None and saved_value is not None and cli_value != saved_value:
+            raise ValueError(
+                f"{metadata_key} CLI/checkpoint mismatch: "
+                f"{cli_value!r} != {saved_value!r}"
+            )
+        if cli_value is not None:
+            proj_head_config[config_key] = cli_value
 
     model = Gemma3MultimodalISAC(
         model_name_or_path=model_name,

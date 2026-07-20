@@ -412,11 +412,12 @@ class ConstraintProjectionHead(nn.Module):
         self.q_geometry_mode = q_geometry_mode
         self.q_residual_max_scale = float(q_residual_max_scale)
 
-        fixed_weights = q_fixed_cue_weights or [
-            0.31186842918395996,
-            0.09240538626909256,
-            0.5957262516021729,
-        ]
+        if q_geometry_mode == "fixed_residual_xy" and q_fixed_cue_weights is None:
+            raise ValueError(
+                "fixed_residual_xy requires explicit q_fixed_cue_weights "
+                "calibrated on the current training dataset"
+            )
+        fixed_weights = q_fixed_cue_weights or [1.0, 1.0, 1.0]
         if len(fixed_weights) != 3 or any(float(weight) < 0 for weight in fixed_weights):
             raise ValueError("q_fixed_cue_weights must contain three non-negative values")
         fixed_weights_tensor = torch.tensor(fixed_weights, dtype=torch.float32)

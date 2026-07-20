@@ -3,6 +3,8 @@ import unittest
 import numpy as np
 
 from src.env.uav_channel import ISACChannel
+from src.env.isac_scenario import ISACScenarioGenerator
+from src.solver.sca_fp import SCAFPConfig, SCAFPOptimizer
 
 
 class ChannelModelTest(unittest.TestCase):
@@ -31,6 +33,39 @@ class ChannelModelTest(unittest.TestCase):
         far = channel.expected_channel_gain(np.array([500.0, 0.0, 100.0]), user)
 
         self.assertGreater(near, far)
+
+    def test_scenario_propagates_bandwidth_rx_antennas_and_noise_figure(self):
+        scenario = ISACScenarioGenerator(
+            bandwidth_mhz=10.0,
+            num_antennas=4,
+            num_antennas_rx=6,
+            noise_figure_db=7.0,
+        )
+
+        self.assertEqual(scenario.channel.B, 10e6)
+        self.assertEqual(scenario.channel.N_t, 4)
+        self.assertEqual(scenario.channel.N_r, 6)
+        self.assertEqual(scenario.channel.NF, 7.0)
+
+    def test_solver_channel_matches_physical_configuration(self):
+        solver = SCAFPOptimizer(
+            SCAFPConfig(),
+            M=1,
+            K=1,
+            T=1,
+            N_t=4,
+            N_r=6,
+            bandwidth_mhz=10.0,
+            noise_figure_db=7.0,
+            load_cap=1,
+            p_max=0.5,
+        )
+
+        self.assertEqual(solver.channel.B, 10e6)
+        self.assertEqual(solver.channel.N_t, 4)
+        self.assertEqual(solver.channel.N_r, 6)
+        self.assertEqual(solver.channel.NF, 7.0)
+        self.assertAlmostEqual(solver.channel.P_max, 0.5)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,10 @@ from src.data.multimodal_dataset import (
     MultimodalDPODataset,
     validate_multimodal_oracle_contract,
 )
+from src.data.oracle_contract import (
+    checkpoint_dataset_fields,
+    validate_checkpoint_dataset_compatibility,
+)
 from src.model import Gemma3MultimodalISAC, UAVISACLosses, build_proj_head_config
 from src.model.gemma_multimodal_isac import is_vision_parameter_name
 
@@ -71,18 +75,9 @@ def _checkpoint_metadata(checkpoint_dir: Path) -> dict:
 
 
 def _projection_config(cfg: dict, metadata: dict) -> dict:
-    result = build_proj_head_config(cfg["model"], cfg["simulation"])
-    saved_to_config = {
-        "projection_head_type": "head_type",
-        "q_projection_mode": "q_projection_mode",
-        "q_geometry_mode": "q_geometry_mode",
-        "q_fixed_cue_weights": "q_fixed_cue_weights",
-        "q_residual_max_scale": "q_residual_max_scale",
-    }
-    for saved_key, config_key in saved_to_config.items():
-        if metadata.get(saved_key) is not None:
-            result[config_key] = metadata[saved_key]
-    return result
+    return build_proj_head_config(
+        cfg["model"], cfg["simulation"], checkpoint_metadata=metadata
+    )
 
 
 def _resolve_lora(checkpoint_dir: Path) -> str:
@@ -187,21 +182,23 @@ def train_multimodal_dpo(args):
         cfg = yaml.safe_load(handle)
     set_seed(cfg["training"]["seed"])
     checkpoint_dir = Path(args.stage1_checkpoint)
+    train_cfg = cfg["training"]["dpo"]
+    data_cfg = cfg["data"]
+    data_root = Path(args.data_dir or data_cfg["output_dir"])
+    dataset_metadata = validate_multimodal_oracle_contract(
+        data_root,
+        expected_simulation=cfg["simulation"],
+    )
+    stage1_metadata = _checkpoint_metadata(checkpoint_dir)
+    validate_checkpoint_dataset_compatibility(
+        stage1_metadata, dataset_metadata, require_same_seed=True
+    )
     policy, stage1_metadata = _load_model(cfg, checkpoint_dir, trainable=True)
     reference, _ = _load_model(cfg, checkpoint_dir, trainable=False)
     policy.base_model.train()
     policy.projection_head.train()
 
-    train_cfg = cfg["training"]["dpo"]
-    data_cfg = cfg["data"]
-    data_root = Path(args.data_dir or data_cfg["output_dir"])
-    validate_multimodal_oracle_contract(data_root)
     max_length = int(args.max_length or train_cfg["max_seq_length"])
-    if max_length < 3584:
-        raise ValueError(
-            "multimodal DPO includes the JSON response; use --max_length >=3584 "
-            "for the current compact-v4 sequence distribution"
-        )
     dataset = MultimodalDPODataset(
         data_path=str(data_root / data_cfg.get("dpo_file", "dpo_dataset.jsonl")),
         data_dir=str(data_root),
@@ -362,6 +359,7 @@ def train_multimodal_dpo(args):
             "sft_anchor": float(args.sft_anchor),
             "control_anchor": float(args.control_anchor),
             "use_chat_template": True,
+            **checkpoint_dataset_fields(dataset_metadata),
         },
     )
     print(f"OK: multimodal DPO complete\n  final_checkpoint: {output_dir}")
@@ -374,7 +372,7 @@ def main():
     parser.add_argument("--stage1_checkpoint", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--max_steps", type=int, default=50)
-    parser.add_argument("--max_length", type=int, default=4096)
+    parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--projection_lr", type=float, default=1e-4)

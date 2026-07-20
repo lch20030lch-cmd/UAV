@@ -65,7 +65,9 @@ class ISACScenarioGenerator:
         carrier_freq_ghz: float = 5.8,
         bandwidth_mhz: float = 20.0,
         num_antennas: int = 8,
+        num_antennas_rx: Optional[int] = None,
         p_max_dbm: float = 30.0,
+        noise_figure_db: float = 9.0,
         seed: Optional[int] = None,
     ):
         self.M = num_uavs
@@ -77,8 +79,13 @@ class ISACScenarioGenerator:
             carrier_freq_ghz=carrier_freq_ghz,
             bandwidth_mhz=bandwidth_mhz,
             num_antennas_tx=num_antennas,
-            num_antennas_rx=num_antennas,
+            num_antennas_rx=(
+                num_antennas
+                if num_antennas_rx is None
+                else num_antennas_rx
+            ),
             p_max_dbm=p_max_dbm,
+            noise_figure_db=noise_figure_db,
         )
 
         self.base_seed = seed if seed is not None else 0
@@ -194,7 +201,7 @@ class ISACScenarioGenerator:
             summary["per_user_sinr_db"].append(float(sinr_db))
 
             # 速率压力
-            rate_achievable = 20e6 * np.log2(1 + sinr)  # B=20MHz
+            rate_achievable = self.channel.B * np.log2(1 + sinr)
             rate_req = network.users[k].rate_requirement_bps
             summary["rate_pressure"].append(float(rate_req / max(rate_achievable, 1)))
 

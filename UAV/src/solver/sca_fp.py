@@ -78,6 +78,8 @@ class SCAFPOptimizer:
         N_t: int = 8,
         N_r: Optional[int] = None,
         carrier_freq_ghz: float = 5.8,
+        bandwidth_mhz: float = 20.0,
+        noise_figure_db: float = 9.0,
         area_size: Tuple[float, float] = (1000.0, 1000.0),
         altitude_range: Tuple[float, float] = (50.0, 300.0),
         p_max: float = 1.0,
@@ -102,7 +104,15 @@ class SCAFPOptimizer:
         self.slot_duration = float(slot_duration)
         self.max_displacement = self.v_max * self.slot_duration
         self.min_separation_m = float(config.min_separation_m)
-        self.channel = ISACChannel(carrier_freq_ghz=self.carrier_freq_ghz)
+        p_max_dbm = 10.0 * np.log10(max(self.P_max, 1e-30)) + 30.0
+        self.channel = ISACChannel(
+            carrier_freq_ghz=self.carrier_freq_ghz,
+            bandwidth_mhz=bandwidth_mhz,
+            num_antennas_tx=self.N_t,
+            num_antennas_rx=self.N_r,
+            p_max_dbm=p_max_dbm,
+            noise_figure_db=noise_figure_db,
+        )
         self.wavelength = self.channel.wavelength
         self.rng = np.random.RandomState()
 
