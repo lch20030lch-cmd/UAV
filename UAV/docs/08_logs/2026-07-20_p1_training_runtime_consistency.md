@@ -99,3 +99,32 @@ python -m unittest \
 - 修复方式不是事后批量删除，而是把 BEV 渲染延后到有效 SFT/DPO pair 已确认之后；
   失败尝试从源头不再产生图片。该修复不改变 Solver、Oracle target 或 prompt 内容。
 - 新增 `tests.test_multimodal_generation`，用无有效候选的环境验证渲染函数不会被调用。
+
+## v5 2-step SFT runtime smoke
+
+- 数据：2 条 v5 SFT/DPO 配对记录和 2 张有效 BEV 图片。
+- 架构：`split + direction + q_geometry_mode=none`，从基础 Gemma checkpoint 初始化，
+  不加载任何 v3/v4 projection 或 LoRA。
+- 训练参数：2 optimizer steps、累积 1、projection LR `3e-4`、language LoRA LR
+  `1e-5`、cosine、保存间隔 1、保留上限 1。
+- 验收结果：
+  - projection 58 个可训练 tensor；语言 LoRA 272；视觉 LoRA 0；
+  - step 1/2 实际 projection LR 为 `3e-4/1.5e-4`，LoRA LR 为
+    `1e-5/5e-6`；
+  - 两组裁剪后梯度范数均为 1，未出现 NaN/Inf；
+  - 中间目录只保留 `mm_sft_lora_smoke_step_2`；
+  - 最终 metadata 的 schema=5、prompt type、架构模式、scheduler、步数与
+    checkpoint 策略全部通过断言。
+- `loss_ctl=97.26/135.46` 和很大的裁剪前梯度来自全新随机 split projection 只训练
+  两条样本，不能作为质量指标。这个 checkpoint 仅用于 DPO runtime smoke，不作为
+  正式 Stage-I checkpoint，也不据此判断 Q/A/P 收敛。
+
+## DPO final metadata 进度污染修复
+
+- 首次 2-step DPO 的最终 metadata 显示 `global_step=2`，但审查代码发现该字段来自
+  展开的 Stage-I SFT metadata；SFT 与 DPO 本次恰好同为 2 步，所以形成了假通过。
+- 新增统一 `_dpo_checkpoint_metadata` 构造器，中间与最终 checkpoint 共用同一份
+  runtime metadata，并在最后强制用当前 DPO 的 `stage/global_step/micro_step` 覆盖
+  Stage-I 字段，避免重复字典再次分叉。
+- 新增回归：Stage-I 为 200/1600 步、DPO 为 17/136 步时，保存结果必须为 DPO 的
+  17/136，同时保留数据 schema provenance。

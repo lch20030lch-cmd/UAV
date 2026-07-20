@@ -182,6 +182,23 @@ def _save(model, output_dir: Path, metadata: dict):
         json.dump(metadata, handle, indent=2)
 
 
+def _dpo_checkpoint_metadata(
+    stage1_metadata: dict,
+    runtime_metadata: dict,
+    *,
+    global_step: int,
+    micro_step: int,
+) -> dict:
+    """Build DPO metadata without leaking Stage-I progress counters."""
+    return {
+        **stage1_metadata,
+        **runtime_metadata,
+        "stage": "multimodal_dpo",
+        "global_step": int(global_step),
+        "micro_step": int(micro_step),
+    }
+
+
 def train_multimodal_dpo(args):
     with open(args.config, "r", encoding="utf-8") as handle:
         cfg = yaml.safe_load(handle)
@@ -295,6 +312,25 @@ def train_multimodal_dpo(args):
         raise ValueError("save_total_limit must be a positive integer")
     checkpoint_root.mkdir(parents=True, exist_ok=True)
     checkpoint_prefix = "mm_dpo_step_"
+    runtime_metadata = {
+        "stage1_checkpoint": str(checkpoint_dir),
+        "max_steps": max_steps,
+        "epochs": epochs,
+        "gradient_accumulation_steps": accumulation,
+        "max_seq_length": max_length,
+        "learning_rate": learning_rate,
+        "projection_lr": projection_lr,
+        "lr_scheduler": scheduler_name,
+        "warmup_ratio": warmup_ratio,
+        "warmup_steps": warmup_steps,
+        "checkpoint_interval": checkpoint_interval,
+        "save_total_limit": checkpoint_limit,
+        "beta": beta,
+        "sft_anchor": sft_anchor,
+        "control_anchor": control_anchor,
+        "use_chat_template": True,
+        **checkpoint_dataset_fields(dataset_metadata),
+    }
     loss_helper = UAVISACLosses(
         lambda_ctl=1.0,
         lambda_q=cfg["model"]["loss"]["lambda_q"],
@@ -441,29 +477,12 @@ def train_multimodal_dpo(args):
                 f"lr_projection={step_projection_lr:.9g}"
             )
             if global_step % checkpoint_interval == 0:
-                checkpoint_metadata = {
-                    **stage1_metadata,
-                    "stage": "multimodal_dpo",
-                    "global_step": global_step,
-                    "micro_step": micro_step,
-                    "stage1_checkpoint": str(checkpoint_dir),
-                    "max_steps": max_steps,
-                    "epochs": epochs,
-                    "gradient_accumulation_steps": accumulation,
-                    "max_seq_length": max_length,
-                    "learning_rate": learning_rate,
-                    "projection_lr": projection_lr,
-                    "lr_scheduler": scheduler_name,
-                    "warmup_ratio": warmup_ratio,
-                    "warmup_steps": warmup_steps,
-                    "checkpoint_interval": checkpoint_interval,
-                    "save_total_limit": checkpoint_limit,
-                    "beta": beta,
-                    "sft_anchor": sft_anchor,
-                    "control_anchor": control_anchor,
-                    "use_chat_template": True,
-                    **checkpoint_dataset_fields(dataset_metadata),
-                }
+                checkpoint_metadata = _dpo_checkpoint_metadata(
+                    stage1_metadata,
+                    runtime_metadata,
+                    global_step=global_step,
+                    micro_step=micro_step,
+                )
                 _save(
                     policy,
                     checkpoint_root / f"{checkpoint_prefix}{global_step}",
@@ -482,27 +501,12 @@ def train_multimodal_dpo(args):
     _save(
         policy,
         output_dir,
-        {
-            **stage1_metadata,
-            "stage": "multimodal_dpo",
-            "stage1_checkpoint": str(checkpoint_dir),
-            "max_steps": max_steps,
-            "epochs": epochs,
-            "gradient_accumulation_steps": accumulation,
-            "max_seq_length": max_length,
-            "learning_rate": learning_rate,
-            "projection_lr": projection_lr,
-            "lr_scheduler": scheduler_name,
-            "warmup_ratio": warmup_ratio,
-            "warmup_steps": warmup_steps,
-            "checkpoint_interval": checkpoint_interval,
-            "save_total_limit": checkpoint_limit,
-            "beta": beta,
-            "sft_anchor": sft_anchor,
-            "control_anchor": control_anchor,
-            "use_chat_template": True,
-            **checkpoint_dataset_fields(dataset_metadata),
-        },
+        _dpo_checkpoint_metadata(
+            stage1_metadata,
+            runtime_metadata,
+            global_step=global_step,
+            micro_step=micro_step,
+        ),
     )
     print(f"OK: multimodal DPO complete\n  final_checkpoint: {output_dir}")
 

@@ -3,12 +3,32 @@ import unittest
 import torch
 
 from src.training.train_dpo_mm import (
+    _dpo_checkpoint_metadata,
     _response_logit_positions,
     _sequence_log_prob,
 )
 
 
 class MultimodalDPOLogProbTest(unittest.TestCase):
+    def test_dpo_progress_overrides_stage1_metadata(self):
+        metadata = _dpo_checkpoint_metadata(
+            {
+                "stage": "multimodal_sft",
+                "global_step": 200,
+                "micro_step": 1600,
+                "dataset_schema_version": 5,
+            },
+            {"max_steps": 50},
+            global_step=17,
+            micro_step=136,
+        )
+
+        self.assertEqual(metadata["stage"], "multimodal_dpo")
+        self.assertEqual(metadata["global_step"], 17)
+        self.assertEqual(metadata["micro_step"], 136)
+        self.assertEqual(metadata["max_steps"], 50)
+        self.assertEqual(metadata["dataset_schema_version"], 5)
+
     def test_only_response_prediction_positions_are_requested(self):
         batch = {
             "label_mask_chosen": torch.tensor(
