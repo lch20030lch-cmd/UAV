@@ -59,6 +59,11 @@ def load_model(checkpoint_path: str, config_path: str) -> Gemma3ISAC:
 
     sim_cfg = cfg["simulation"]
     model_cfg = cfg["model"]
+    if model_cfg.get("use_multimodal", False):
+        raise RuntimeError(
+            "eval_generation.py is a legacy text-only generation evaluator. "
+            "Use scripts/evaluate_mm_solver.py for BEV-image checkpoints."
+        )
 
     print(f"Loading checkpoint: {checkpoint_path}")
     model = Gemma3ISAC.from_pretrained(
@@ -347,10 +352,11 @@ def run_generation_eval(model, cfg, n_samples: int = 5, n_scafp: int = 100):
     )
 
     solver_cfg = SCAFPConfig(
-        max_outer_iters=30, max_inner_iters=50, tol=1e-4,
+        max_outer_iters=30, max_inner_iters=5, tol=1e-4,
         lambda_sensing=0.5, lambda_idle_penalty=5.0,
         sinr_c_min=10 ** (sim_cfg["sinr_c_min_db"] / 10),
         sinr_s_min=10 ** (sim_cfg["sinr_s_min_db"] / 10),
+        min_separation_m=sim_cfg.get("uav_min_separation_m", 10.0),
         verbose=False,
     )
 

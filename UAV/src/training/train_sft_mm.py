@@ -16,7 +16,6 @@ BEV-image Gemma3 多模态 SFT 烟雾测试。
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -28,12 +27,16 @@ from src.training.env_setup import setup_env
 setup_env()
 
 import torch
+import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import set_seed
 
-from src.data.multimodal_dataset import MultimodalSFTDataset
+from src.data.multimodal_dataset import (
+    MultimodalSFTDataset,
+    validate_multimodal_oracle_contract,
+)
 from src.model import Gemma3MultimodalISAC, UAVISACLosses, build_proj_head_config
 from src.model.gemma_multimodal_isac import is_vision_parameter_name
 
@@ -133,7 +136,13 @@ def _resolve_lora_checkpoint(init_checkpoint: str, enable_lora: bool):
     return None
 
 
-def _load_mm_smoke_checkpoint(model, init_checkpoint: str) -> dict:
+def _load_mm_smoke_checkpoint(
+    model,
+    init_checkpoint: str,
+    *,
+    expected_projection_config: dict,
+    allow_partial_projection_load: bool = False,
+) -> dict:
     if not init_checkpoint:
         return {}
     ckpt_dir = Path(init_checkpoint)
@@ -141,10 +150,34 @@ def _load_mm_smoke_checkpoint(model, init_checkpoint: str) -> dict:
         raise FileNotFoundError(f"init checkpoint not found: {ckpt_dir}")
 
     loaded = {"init_checkpoint": str(ckpt_dir)}
+    metadata_path = ckpt_dir / "metadata.json"
+    if metadata_path.exists():
+        with metadata_path.open("r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+        loaded["metadata"] = str(metadata_path)
+        checkpoint_modes = {
+            "projection_head_type": metadata.get("projection_head_type"),
+            "q_projection_mode": metadata.get("q_projection_mode"),
+            "q_geometry_mode": metadata.get("q_geometry_mode"),
+        }
+        mismatches = {
+            key: (checkpoint_modes[key], expected_projection_config[key])
+            for key in checkpoint_modes
+            if checkpoint_modes[key] is not None
+            and checkpoint_modes[key] != expected_projection_config[key]
+        }
+        if mismatches and not allow_partial_projection_load:
+            raise ValueError(
+                "checkpoint projection metadata does not match requested model: "
+                f"{mismatches}. Use --allow_partial_projection_load only for an "
+                "intentional architecture migration."
+            )
     proj_path = ckpt_dir / "projection_head.pt"
     if proj_path.exists():
         state = torch.load(proj_path, map_location="cpu")
-        load_result = model.projection_head.load_state_dict(state, strict=False)
+        load_result = model.projection_head.load_state_dict(
+            state, strict=not allow_partial_projection_load
+        )
         loaded["projection_head"] = str(proj_path)
         loaded["projection_missing_keys"] = list(load_result.missing_keys)
         loaded["projection_unexpected_keys"] = list(load_result.unexpected_keys)
@@ -214,6 +247,9 @@ def train_mm_sft_smoke(
     freeze_all_except_q_cue: bool = False,
     freeze_all_except_p: bool = False,
     gradient_accumulation_steps: int = None,
+    lambda_lm_ce: float = None,
+    allow_partial_projection_load: bool = False,
+    allow_legacy_oracle_data: bool = False,
 ):
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -226,6 +262,9 @@ def train_mm_sft_smoke(
     data_cfg = cfg["data"]
 
     data_root = Path(data_dir or data_cfg["output_dir"])
+    dataset_metadata = validate_multimodal_oracle_contract(
+        data_root, allow_legacy=allow_legacy_oracle_data
+    )
     sft_path = data_root / data_cfg.get("sft_file", "sft_dataset.jsonl")
     model_name = model_path or model_cfg["backbone"]
     max_seq_length = int(max_length or train_cfg["max_seq_length"])
@@ -234,6 +273,19 @@ def train_mm_sft_smoke(
         train_cfg,
         gradient_accumulation_steps,
     )
+    lambda_lm_ce_value = float(
+        lambda_lm_ce
+        if lambda_lm_ce is not None
+        else train_cfg.get("phase1", {}).get("lambda_lm_ce", 0.0)
+    )
+    if lambda_lm_ce_value < 0.0:
+        raise ValueError("lambda_lm_ce must be non-negative")
+    include_response_tokens = lambda_lm_ce_value > 0.0
+    if include_response_tokens and not train_lora:
+        raise ValueError(
+            "token-level multimodal SFT requires --train_lora; a frozen "
+            "backbone cannot optimize response CE"
+        )
     out_root = Path(output_dir or cfg.get("output_dir", "/root/autodl-tmp/outputs/mm_smoke"))
     ckpt_root = Path(
         checkpoint_dir
@@ -256,6 +308,7 @@ def train_mm_sft_smoke(
     print("BEV-image multimodal SFT smoke")
     print("=" * 60)
     print(f"  data:       {sft_path}")
+    print(f"  data contract: {dataset_metadata or 'legacy override'}")
     print(f"  model:      {model_name}")
     print(f"  max_length: {max_seq_length}")
     print(f"  optimizer steps: {steps_limit}")
@@ -265,7 +318,10 @@ def train_mm_sft_smoke(
         f"{int(train_cfg['per_device_batch_size']) * grad_accum_steps}"
     )
     print(f"  checkpoints:{ckpt_root} (every {checkpoint_interval} steps)")
-    print("  input mode: prompt + image + control tokens (response omitted)")
+    print(
+        "  input mode: prompt + image + control tokens"
+        + (" + response" if include_response_tokens else " (response omitted)")
+    )
     if train_lora:
         trainable_label = "projection_head + LoRA"
     elif load_lora:
@@ -311,7 +367,16 @@ def train_mm_sft_smoke(
         lora_target_modules=model_cfg["lora"]["target_modules"],
         lora_checkpoint=init_lora_checkpoint,
     )
-    loaded_init = _load_mm_smoke_checkpoint(model, init_checkpoint)
+    loaded_init = _load_mm_smoke_checkpoint(
+        model,
+        init_checkpoint,
+        expected_projection_config={
+            "projection_head_type": head_type,
+            "q_projection_mode": q_mode,
+            "q_geometry_mode": q_geom_mode,
+        },
+        allow_partial_projection_load=allow_partial_projection_load,
+    )
     if loaded_init:
         print(f"  init_checkpoint: {loaded_init}")
 
@@ -365,7 +430,8 @@ def train_mm_sft_smoke(
         processor=model.processor,
         max_length=max_seq_length,
         num_control_tokens=model_cfg["control_token"]["num_tokens"],
-        include_response=False,
+        include_response=include_response_tokens,
+        use_chat_template=include_response_tokens,
     )
     dataloader = DataLoader(
         dataset,
@@ -486,6 +552,7 @@ def train_mm_sft_smoke(
     print(f"  power raw KL weight:          {lambda_p_raw_kl_value}")
     print(f"  association CE weight:        {assoc_ce_weight}")
     print(f"  association raw CE weight:    {assoc_raw_ce_weight}")
+    print(f"  language-model CE weight:     {lambda_lm_ce_value}")
 
     device = model.device
     global_step = 0
@@ -514,6 +581,15 @@ def train_mm_sft_smoke(
                     "q_geometry_mask",
                 }
             }
+            forward_keys["compute_full_logits"] = include_response_tokens
+            response_logit_positions = None
+            if include_response_tokens:
+                response_logit_positions = (
+                    batch["label_mask"][:, 1:].bool().any(dim=0).nonzero(as_tuple=True)[0]
+                )
+                if response_logit_positions.numel() == 0:
+                    raise RuntimeError("response SFT batch contains no supervised tokens")
+                forward_keys["logits_to_keep"] = response_logit_positions
 
             # 多模态 smoke 阶段只算控制损失，先确认 delta_q/a/p 的可训练闭环。
             outputs = model(**forward_keys)
@@ -544,6 +620,24 @@ def train_mm_sft_smoke(
                 delta_target=delta_target,
                 phase1_lambda_ctl=train_cfg.get("phase1", {}).get("lambda_ctl", 1.0),
             )
+            loss_lm_ce = total_loss.new_zeros(())
+            if include_response_tokens:
+                logits = outputs.get("logits")
+                if logits is None or logits.shape[1] != response_logit_positions.numel():
+                    raise RuntimeError(
+                        "selected response logits are required for multimodal response SFT"
+                    )
+                selected_labels = batch["labels"][:, 1:][
+                    :, response_logit_positions
+                ]
+                loss_lm_ce = F.cross_entropy(
+                    logits.float().reshape(-1, logits.shape[-1]),
+                    selected_labels.reshape(-1),
+                    ignore_index=-100,
+                )
+                total_loss = total_loss + lambda_lm_ce_value * loss_lm_ce
+            metrics["loss_lm_ce"] = float(loss_lm_ce.detach().item())
+            metrics["loss_total"] = float(total_loss.detach().item())
 
             with torch.no_grad():
                 p_prob = outputs["delta_p"].float().clamp_min(1e-12)
@@ -604,6 +698,7 @@ def train_mm_sft_smoke(
                 f"step={global_step} micro_step={micro_step} epoch={epoch} "
                 f"loss_ctl={metrics['loss_ctl']:.6f} "
                 f"loss_total={metrics['loss_total']:.6f} "
+                f"loss_lm_ce={metrics['loss_lm_ce']:.6f} "
                 f"loss_a_ce={metrics['loss_a_ce']:.6f} "
                 f"loss_a_raw_ce={metrics['loss_a_raw_ce']:.6f} "
                 f"loss_q_dir={metrics['loss_q_dir']:.6f} "
@@ -651,7 +746,9 @@ def train_mm_sft_smoke(
                         ),
                         "init_lora_checkpoint": init_lora_checkpoint,
                         "checkpoint_interval": checkpoint_interval,
-                        "include_response_tokens": False,
+                        "include_response_tokens": include_response_tokens,
+                        "use_chat_template": include_response_tokens,
+                        "lambda_lm_ce": lambda_lm_ce_value,
                         "projection_lr": proj_lr,
                         "lora_lr": lora_lr if train_lora else 0.0,
                         "lora_rank": model_cfg["lora"]["rank"] if lora_enabled else 0,
@@ -713,7 +810,9 @@ def train_mm_sft_smoke(
             ),
             "init_lora_checkpoint": init_lora_checkpoint,
             "checkpoint_interval": checkpoint_interval,
-            "include_response_tokens": False,
+            "include_response_tokens": include_response_tokens,
+            "use_chat_template": include_response_tokens,
+            "lambda_lm_ce": lambda_lm_ce_value,
             "projection_lr": proj_lr,
             "lora_lr": lora_lr if train_lora else 0.0,
             "lora_rank": model_cfg["lora"]["rank"] if lora_enabled else 0,
@@ -796,12 +895,31 @@ if __name__ == "__main__":
                         help="可选：q 几何候选方向分类损失权重，用于 cue_xy 几何蒸馏")
     parser.add_argument("--lambda_p_raw_kl", type=float, default=None,
                         help="可选：PowerProjection 前 raw logits 的 soft-target KL 权重")
+    parser.add_argument(
+        "--lambda_lm_ce",
+        type=float,
+        default=None,
+        help=(
+            "multimodal response token CE weight; values >0 include the JSON "
+            "response and require --train_lora"
+        ),
+    )
     parser.add_argument("--projection_lr", type=float, default=None,
                         help="可选 projection head 学习率覆盖值")
     parser.add_argument("--lora_lr", type=float, default=None,
                         help="可选 LoRA 学习率覆盖值")
     parser.add_argument("--init_checkpoint", type=str, default=None,
                         help="可选：从已有 mm smoke checkpoint 加载 projection head / control token / LoRA")
+    parser.add_argument(
+        "--allow_partial_projection_load",
+        action="store_true",
+        help="explicitly allow missing/unexpected projection keys for architecture migration",
+    )
+    parser.add_argument(
+        "--allow_legacy_oracle_data",
+        action="store_true",
+        help="diagnostic override only; permits pre-v5 Oracle data",
+    )
     parser.add_argument("--projection_head_type", type=str, choices=["shared", "split"], default=None,
                         help="可选 projection head 类型；默认使用配置文件，split 用于 q/a/p 分支解耦实验")
     parser.add_argument("--q_projection_mode", type=str, choices=["clip", "direction"], default=None,
@@ -863,4 +981,7 @@ if __name__ == "__main__":
         freeze_all_except_q_cue=args.freeze_all_except_q_cue,
         freeze_all_except_p=args.freeze_all_except_p,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        lambda_lm_ce=args.lambda_lm_ce,
+        allow_partial_projection_load=args.allow_partial_projection_load,
+        allow_legacy_oracle_data=args.allow_legacy_oracle_data,
     )

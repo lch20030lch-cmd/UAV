@@ -57,14 +57,14 @@ def _count_existing(path: Path) -> int:
 
 def _build_solver(sim_cfg: dict) -> SCAFPOptimizer:
     solver_config = SCAFPConfig(
-        max_iters=100,
         max_outer_iters=30,
-        max_inner_iters=50,
+        max_inner_iters=5,
         tol=1e-4,
         lambda_sensing=0.5,
         lambda_idle_penalty=0.0,
         sinr_c_min=10 ** (sim_cfg["sinr_c_min_db"] / 10),
         sinr_s_min=10 ** (sim_cfg["sinr_s_min_db"] / 10),
+        min_separation_m=sim_cfg.get("uav_min_separation_m", 10.0),
         ground_clutter_db=6.0,
         lambda_repel=0.01,
         verbose=False,
@@ -133,12 +133,15 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
 
     common = {
         "bev_image_path": env_sample.bev_image_path,
-        "prompt_type": "multimodal_bev_image_v4_compact_indexed_association",
+        "prompt_type": "multimodal_bev_image_v5_constraint_aware",
         "bev_grid_text": env_sample.bev_grid_text,
         "q_current": q_current.tolist(),
         "delta_q": delta_q.tolist(),
         "delta_a": delta_a.tolist(),
         "delta_p": delta_p.tolist(),
+        "solver_algorithm": chosen_sol.algorithm,
+        "oracle_feasible": bool(chosen_sol.feasible),
+        "constraint_violations": chosen_sol.constraint_violations,
     }
 
     sft_sample = {
@@ -152,6 +155,9 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
     rejected_delta_q, rejected_util = generator._construct_rejected(
         env_dict, solutions, q_current, sample_id
     )
+    rejected_util = float(generator.evaluate_prior(
+        env_dict, rejected_delta_q, delta_a, delta_p
+    )["utility"])
     dpo_samples = []
     if not np.allclose(rejected_delta_q, delta_q, atol=1e-3):
         rejected_response = generator._format_rejected_response(
@@ -173,6 +179,10 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
                 **common,
             })
 
+    # Keep the two mainline datasets aligned one-to-one.  Environments without
+    # a valid positive-gap preference pair are retried with a new sample id.
+    if not dpo_samples:
+        return None, []
     return sft_sample, dpo_samples
 
 
@@ -209,18 +219,50 @@ def main():
     sft_path = output_dir / data_cfg.get("sft_file", "sft_dataset.jsonl")
     dpo_path = output_dir / data_cfg.get("dpo_file", "dpo_dataset.jsonl")
     ckpt_path = output_dir / "checkpoint.txt"
+    metadata_path = output_dir / "dataset_metadata.json"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "images").mkdir(parents=True, exist_ok=True)
 
     if args.overwrite:
-        for path in [sft_path, dpo_path, ckpt_path]:
+        for path in [sft_path, dpo_path, ckpt_path, metadata_path]:
             if path.exists():
                 path.unlink()
 
-    # 烟雾测试数据可能在服务器上被中断；按已写入的 SFT 行数断点续跑。
-    start_id = _count_existing(sft_path)
-    if start_id >= num_samples:
+    if not args.overwrite and (sft_path.exists() or dpo_path.exists()):
+        if not metadata_path.exists():
+            raise RuntimeError(
+                "refusing to resume a pre-v5 dataset in place; choose a new "
+                "output directory or pass --overwrite"
+            )
+        existing_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if (
+            existing_metadata.get("solver_algorithm")
+            != "constraint_aware_alternating_optimization"
+            or int(existing_metadata.get("seed", -1)) != int(args.seed)
+        ):
+            raise RuntimeError(
+                "dataset metadata does not match the current solver/seed; "
+                "refusing unsafe resume"
+            )
+
+    # Resume from the attempted environment id, not the SFT line count.  An
+    # infeasible/failed environment may intentionally produce no SFT row, so
+    # line-count resume can otherwise duplicate later sample ids.
+    start_id = 0
+    if ckpt_path.exists():
+        try:
+            start_id = int(ckpt_path.read_text(encoding="utf-8").strip())
+        except ValueError as exc:
+            raise ValueError(f"invalid generation checkpoint: {ckpt_path}") from exc
+    existing_sft = _count_existing(sft_path)
+    existing_dpo = _count_existing(dpo_path)
+    if existing_sft != existing_dpo:
+        raise RuntimeError(
+            "v5 generation requires paired SFT/DPO counts, got "
+            f"{existing_sft}/{existing_dpo}"
+        )
+    if existing_sft >= num_samples and existing_dpo >= num_samples:
         print(f"All {num_samples} samples already exist at {output_dir}")
         return
 
@@ -244,25 +286,50 @@ def main():
         sim_config=sim_cfg,
     )
 
+    dataset_metadata = {
+        "schema_version": 5,
+        "prompt_type": "multimodal_bev_image_v5_constraint_aware",
+        "seed": args.seed,
+        "num_environments_requested": num_samples,
+        "num_restarts": generator.num_restarts,
+        "solver_algorithm": "constraint_aware_alternating_optimization",
+        "channel_model": "elevation_los_3gpp_pathloss_v2",
+        "requires_oracle_feasible": True,
+        "generation_complete": False,
+    }
+    with metadata_path.open("w", encoding="utf-8") as handle:
+        json.dump(dataset_metadata, handle, indent=2)
+
     signal.signal(signal.SIGINT, _on_interrupt)
     signal.signal(signal.SIGTERM, _on_interrupt)
 
     print("=" * 60)
     print("UAV-ISAC MLLM: BEV-image smoke data generator")
     print("=" * 60)
-    print(f"  Samples:      {num_samples} ({start_id} already done)")
+    print(
+        f"  Samples:      {num_samples} target records "
+        f"({existing_sft} existing, next env id {start_id})"
+    )
     print(f"  Restarts/env: {generator.num_restarts}")
     print(f"  Image size:   {image_size}")
     print(f"  Output:       {output_dir}")
     print()
 
     t0 = time.time()
-    n_sft = _count_existing(sft_path)
-    n_dpo = _count_existing(dpo_path)
+    n_sft = existing_sft
+    n_dpo = existing_dpo
+    sample_id = start_id
+    attempts = 0
+    max_attempts = max(num_samples * 10, num_samples + 100)
 
-    for sample_id in range(start_id, num_samples):
+    while n_sft < num_samples:
         if _stop_requested:
             break
+        if attempts >= max_attempts:
+            raise RuntimeError(
+                f"only generated {n_sft}/{num_samples} paired feasible records "
+                f"after {attempts} attempts"
+            )
         try:
             sft_sample, dpo_samples = _process_one(
                 sample_id, generator, sim_cfg, output_dir, image_size
@@ -280,16 +347,25 @@ def main():
             f.write(f"{sample_id + 1}\n")
 
         elapsed = time.time() - t0
-        done = sample_id - start_id + 1
-        rate = elapsed / max(done, 1)
-        remaining = (num_samples - sample_id - 1) * rate
+        attempts += 1
+        rate = elapsed / max(attempts, 1)
+        remaining = max(num_samples - n_sft, 0) * rate
         print(
-            f"  [{sample_id + 1}/{num_samples}] {n_sft} SFT, {n_dpo} DPO | "
+            f"  [env {sample_id}] {n_sft}/{num_samples} paired SFT/DPO | "
             f"{elapsed:.0f}s elapsed, ~{remaining / 60:.1f}min remaining",
             flush=True,
         )
+        sample_id += 1
 
     elapsed = time.time() - t0
+    dataset_metadata.update({
+        "generation_complete": n_sft == num_samples and n_dpo == num_samples,
+        "num_sft_records": n_sft,
+        "num_dpo_records": n_dpo,
+        "next_environment_id": sample_id,
+    })
+    with metadata_path.open("w", encoding="utf-8") as handle:
+        json.dump(dataset_metadata, handle, indent=2)
     print("\nDone")
     print(f"  SFT:   {n_sft} -> {sft_path}")
     print(f"  DPO:   {n_dpo} -> {dpo_path}")

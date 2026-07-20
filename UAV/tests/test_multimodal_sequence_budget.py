@@ -5,6 +5,7 @@ import torch
 from src.data.multimodal_dataset import (
     _compute_prompt_budget,
     _encode_text_image,
+    format_multimodal_user_prompt,
 )
 
 
@@ -16,6 +17,13 @@ class _FakeProcessor:
         return {
             "input_ids": torch.ones((1, self.encoded_length), dtype=torch.long),
         }
+
+    image_token = "<image>"
+
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+        self.messages = messages
+        self.add_generation_prompt = add_generation_prompt
+        return "<image>CHAT_PROMPT"
 
 
 class MultimodalSequenceBudgetTest(unittest.TestCase):
@@ -44,6 +52,17 @@ class MultimodalSequenceBudgetTest(unittest.TestCase):
         )
 
         self.assertEqual(tuple(encoded["input_ids"].shape), (1, 10))
+
+    def test_response_training_can_use_multimodal_chat_template(self):
+        processor = _FakeProcessor(encoded_length=1)
+
+        formatted = format_multimodal_user_prompt(
+            processor, "hello", use_chat_template=True
+        )
+
+        self.assertEqual(formatted, "<image>CHAT_PROMPT")
+        self.assertTrue(processor.add_generation_prompt)
+        self.assertEqual(processor.messages[0]["role"], "user")
 
 
 if __name__ == "__main__":

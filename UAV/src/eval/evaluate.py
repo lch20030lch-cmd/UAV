@@ -56,6 +56,7 @@ def _worker_solve_and_metric(
         lambda_idle_penalty=sp["lambda_idle_penalty"],
         sinr_c_min=sp["sinr_c_min"],
         sinr_s_min=sp["sinr_s_min"],
+        min_separation_m=sp["min_separation_m"],
         verbose=False,
     )
 
@@ -83,14 +84,14 @@ def _worker_solve_and_metric(
     sol_cold = solver.solve(env_dict, warm_start=None, seed=sample_id)
     speedup = sol_cold.iterations / max(sol_warm.iterations, 1)
 
-    # ---- Metrics (uses env_dict keys, not env_sample attributes) ----
+    # ---- Metrics: use the exact same channel/constraint model as the solver ----
     sol = sol_warm
-    channel_gains = env_dict["channel_gains"]        # shape [M, K]
-    target_positions = env_dict["target_positions"]  # shape [T, 2]
-
+    evaluated = solver.evaluate_solution(
+        sol.Q, sol.A, sol.W_c_power, sol.W_s_power, env_dict
+    )
+    channel_gains = evaluated["communication_gains"]
+    sensing_gains = evaluated["sensing_gains"]
     bw_hz = sim_params["bandwidth_mhz"] * 1e6
-    fc_hz = sim_params["carrier_freq_ghz"] * 1e9
-    wavelength = 3e8 / fc_hz
 
     # Sum rate
     sum_rate = 0.0
@@ -100,52 +101,40 @@ def _worker_solve_and_metric(
                 sinr = channel_gains[m, k] * sol.W_c_power[m, k] / (solver.N0 + 1e-12)
                 sum_rate += bw_hz * np.log2(1 + sinr)
 
-    # Sensing SINR
-    sensing_sinrs = []
-    for t in range(solver.T):
-        for m in range(solver.M):
-            dist_2d = np.linalg.norm(sol.Q[m, :2] - target_positions[t])
-            dist_3d = np.sqrt(dist_2d ** 2 + sol.Q[m, 2] ** 2)
-            pl_db = 20 * np.log10((4 * np.pi * dist_3d) / wavelength) + 20
-            pl = 10 ** (-pl_db / 10)
-            sinr_s = sol.W_s_power[m] * pl * solver.N_t * solver.N_r / solver.N0
-            sensing_sinrs.append(10 * np.log10(sinr_s + 1e-12))
+    sensing_sinr = (
+        sol.W_s_power[:, None]
+        * sensing_gains
+        * solver.N_t
+        * solver.N_r
+        / solver.N0
+    )
+    best_uav = np.argmax(sensing_sinr, axis=0)
+    best_sensing_sinr = sensing_sinr[best_uav, np.arange(solver.T)]
+    mean_sinr_db = float(np.mean(10 * np.log10(best_sensing_sinr + 1e-12)))
+    crbs = [
+        solver.channel.compute_crb(
+            sol.Q[best_uav[t]],
+            env_dict["target_positions"][t],
+            best_sensing_sinr[t],
+        )
+        for t in range(solver.T)
+    ]
 
-    mean_sinr_db = float(np.mean(sensing_sinrs)) if sensing_sinrs else 0.0
-
-    # Joint satisfaction
-    num_satisfied_comm = 0
-    for m in range(solver.M):
-        for k in range(solver.K):
-            if sol.A[m, k] > 0.5:
-                sinr = channel_gains[m, k] * sol.W_c_power[m, k] / solver.N0
-                if 10 * np.log10(sinr + 1e-12) >= sim_params["sinr_c_min_db"]:
-                    num_satisfied_comm += 1
-
-    comm_sat = num_satisfied_comm / max(solver.K, 1)
-
-    num_satisfied_sense = 0
-    for t in range(solver.T):
-        best_sinr_db = -np.inf
-        for m in range(solver.M):
-            dist_2d = np.linalg.norm(sol.Q[m, :2] - target_positions[t])
-            dist_3d = np.sqrt(dist_2d ** 2 + sol.Q[m, 2] ** 2)
-            pl_db = 20 * np.log10((4 * np.pi * dist_3d) / wavelength) + 20
-            pl = 10 ** (-pl_db / 10)
-            sinr_s = sol.W_s_power[m] * pl * solver.N_t * solver.N_r / solver.N0
-            sinr_s_db = 10 * np.log10(sinr_s + 1e-12)
-            if sinr_s_db > best_sinr_db:
-                best_sinr_db = sinr_s_db
-        if best_sinr_db >= sim_params["sinr_s_min_db"]:
-            num_satisfied_sense += 1
-
-    sense_sat = num_satisfied_sense / max(solver.T, 1)
-    joint_sat = (comm_sat + sense_sat) / 2
+    active_sinr = channel_gains * sol.W_c_power / solver.N0
+    comm_sat = float(
+        np.mean(active_sinr[sol.A > 0.5] >= solver.cfg.sinr_c_min)
+    )
+    sense_sat = float(np.mean(best_sensing_sinr >= solver.cfg.sinr_s_min))
+    # Joint satisfaction is an actual all-constraints indicator for this
+    # environment, not the arithmetic mean of two unrelated fractions.
+    joint_sat = float(evaluated["feasible"])
 
     return {
         "sum_rate": float(sum_rate / 1e6),
         "mean_sensing_sinr_db": float(mean_sinr_db),
-        "mean_crb": 0.0,
+        "mean_crb": float(np.mean(crbs)),
+        "communication_satisfaction": comm_sat,
+        "sensing_satisfaction": sense_sat,
         "joint_satisfaction": float(joint_sat),
         "sca_fp_iterations_warm": float(sol_warm.iterations),
         "sca_fp_iterations_cold": float(sol_cold.iterations),
@@ -177,6 +166,12 @@ def run_evaluation(
     eval_cfg = cfg["eval"]
     model_cfg = cfg["model"]
 
+    if model_path and model_cfg.get("use_multimodal", False):
+        raise RuntimeError(
+            "src/eval/evaluate.py is the legacy text-only evaluator and cannot "
+            "evaluate a multimodal checkpoint. Use scripts/evaluate_mm_solver.py."
+        )
+
     num_test = eval_cfg.get("num_test_environments", 200)
 
     # Resolve n_workers
@@ -195,18 +190,19 @@ def run_evaluation(
         bandwidth_mhz=sim_cfg["bandwidth_mhz"],
         num_antennas=sim_cfg["num_antennas_tx"],
         p_max_dbm=sim_cfg["p_max_dbm"],
-        seed=42,
+        seed=eval_cfg.get("seed", 2026),
     )
 
     # ---- Solver params (pack for workers) ----
     solver_params = {
         "max_outer_iters": 30,
-        "max_inner_iters": 50,
+        "max_inner_iters": 5,
         "tol": 1e-4,
         "lambda_sensing": 0.5,
         "lambda_idle_penalty": 5.0,
         "sinr_c_min": 10 ** (sim_cfg["sinr_c_min_db"] / 10),
         "sinr_s_min": 10 ** (sim_cfg["sinr_s_min_db"] / 10),
+        "min_separation_m": sim_cfg.get("uav_min_separation_m", 10.0),
         "M": sim_cfg["num_uavs"],
         "K": sim_cfg["num_users"],
         "T": sim_cfg["num_targets"],
@@ -294,12 +290,14 @@ def run_evaluation(
     if n_workers > 1:
         print(f"\nPhase 2: SCA-FP solving with {n_workers} workers (CPU)...")
     else:
-        print(f"\nPhase 2: SCA-FP solving (serial)...")
+        print("\nPhase 2: constraint-aware solver (serial)...")
 
     results = {
         "sum_rate": [],
         "mean_sensing_sinr_db": [],
         "mean_crb": [],
+        "communication_satisfaction": [],
+        "sensing_satisfaction": [],
         "joint_satisfaction": [],
         "sca_fp_iterations_warm": [],
         "sca_fp_iterations_cold": [],

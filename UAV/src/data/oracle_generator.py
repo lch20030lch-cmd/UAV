@@ -21,10 +21,9 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 from tqdm import tqdm
-import time
 
 from ..env import ISACScenarioGenerator, EnvironmentSample
-from ..solver.sca_fp import SCAFPOptimizer, SCAFPConfig, SCAFPSolution
+from ..solver.sca_fp import SCAFPOptimizer, SCAFPSolution
 from .prompt_builder import build_full_prompt, format_oracle_response
 
 
@@ -146,17 +145,26 @@ class OracleDataGenerator:
 
         # Step 4: 选 Chosen (15m 墙下 snapback 无区分度 → 直取效用最高)
         chosen_sol = candidates[0]
+        # Extract the exact chosen tuple before constructing/evaluating the
+        # rejected Q-only preference sample.
+        delta_q_chosen, delta_a_chosen, delta_p_chosen = self._extract_prior(
+            chosen_sol, env_sample,
+        )
 
         # Step 5: 构造 Rejected
         rejected_delta_q, rejected_util = self._construct_rejected(
             env_dict, solutions, q_current, sample_id,
         )
+        rejected_eval = self.evaluate_prior(
+            env_dict,
+            rejected_delta_q,
+            delta_a_chosen,
+            delta_p_chosen,
+        )
+        rejected_util = float(rejected_eval["utility"])
 
         # Step 6: 构造输出
         # SFT 样本 — Chosen 的 prior
-        delta_q_chosen, delta_a_chosen, delta_p_chosen = self._extract_prior(
-            chosen_sol, env_sample,
-        )
         response_chosen = format_oracle_response(
             sample_id, delta_q_chosen, delta_a_chosen, delta_p_chosen,
         )
@@ -170,6 +178,9 @@ class OracleDataGenerator:
             "delta_q": delta_q_chosen.tolist(),
             "delta_a": delta_a_chosen.tolist(),
             "delta_p": delta_p_chosen.tolist(),
+            "solver_algorithm": chosen_sol.algorithm,
+            "oracle_feasible": bool(chosen_sol.feasible),
+            "constraint_violations": chosen_sol.constraint_violations,
         }
 
         # DPO 样本 — 单个对: Chosen vs Rejected
@@ -220,6 +231,19 @@ class OracleDataGenerator:
         """
         if not solutions:
             return []
+
+        # Never train on a target that violates the constraints advertised in
+        # the prompt.  Previously every finite heuristic result could become an
+        # Oracle label even when SINR/separation constraints were not met.
+        solutions = [
+            solution
+            for solution in solutions
+            if solution.feasible and np.isfinite(solution.utility)
+        ]
+        if not solutions:
+            return []
+
+        solutions.sort(key=lambda solution: solution.utility, reverse=True)
 
         max_util = solutions[0].utility
         # 用绝对值计算阈值, 完美兼容正负数 utility
@@ -410,6 +434,26 @@ class OracleDataGenerator:
         return (np.round(delta_q, 4),
                 np.round(delta_a, 4),
                 np.round(delta_p, 4))
+
+    def evaluate_prior(
+        self,
+        env_dict: Dict,
+        delta_q: np.ndarray,
+        delta_a: np.ndarray,
+        delta_p: np.ndarray,
+    ) -> Dict:
+        """Evaluate the exact Q/A/P tuple serialized into a data record."""
+        Q, A, P_comm, P_sense = self.solver._warmstart_to_init(
+            {
+                "delta_q": delta_q,
+                "delta_a": delta_a,
+                "delta_p": delta_p,
+            },
+            self.solver._validate_environment(env_dict),
+        )
+        return self.solver.evaluate_solution(
+            Q, A, P_comm, P_sense, env_dict
+        )
 
     def _env_sample_to_dict(self, env_sample: EnvironmentSample) -> Dict:
         """将 EnvironmentSample 转换为 solver 期望的 dict 格式"""

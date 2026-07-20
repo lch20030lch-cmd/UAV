@@ -72,14 +72,13 @@ class ISACChannel:
         elevation_rad = np.arctan(uav_altitude / horizontal_dist)
         elevation_deg = np.degrees(elevation_rad)
 
-        # 3GPP TR 36.777 参数 (简化)
-        if elevation_deg <= 15:
-            a, b = -0.5, 15.0
-        else:
-            a, b = -0.2, 10.0
-
-        p_los = 1 / (1 + a * np.exp(-b * (elevation_deg - a)))
-        return float(np.clip(p_los, 0.01, 0.99))
+        # Urban air-to-ground elevation model.  The previous negative ``a``
+        # values made the denominator smaller than one and consequently
+        # clamped almost every link to P(LoS)=0.99.  Positive environment
+        # parameters preserve the intended elevation dependence.
+        a, b = 9.61, 0.16
+        p_los = 1.0 / (1.0 + a * np.exp(-b * (elevation_deg - a)))
+        return float(np.clip(p_los, 0.0, 1.0))
 
     def path_loss_db(
         self, uav_altitude: float, distance_3d: float, horizontal_dist: float
@@ -96,14 +95,45 @@ class ISACChannel:
             (pl_los_db, pl_nlos_db)
         """
         f_c_ghz = self.f_c / 1e9
-        # Free-space path loss at 1m reference
-        pl_fs_1m = 20 * np.log10(4 * np.pi / self.wavelength)
+        distance_3d = max(float(distance_3d), 1.0)
 
-        pl_los = pl_fs_1m + 22 * np.log10(max(distance_3d, 1.0)) + 20 * np.log10(f_c_ghz)
-        # NLoS 额外损耗 ~20dB
-        pl_nlos = pl_fs_1m + 30 * np.log10(max(distance_3d, 1.0)) + 20 * np.log10(f_c_ghz) + 20
+        # 3GPP-style UMa laws with d in metres and f_c in GHz.  Do not add
+        # free-space loss at 1 m here: its frequency term is already included
+        # in the constants/formula below.  The old implementation counted the
+        # carrier-frequency contribution twice.
+        pl_los = 28.0 + 22.0 * np.log10(distance_3d) + 20.0 * np.log10(f_c_ghz)
+        pl_nlos = 32.4 + 30.0 * np.log10(distance_3d) + 20.0 * np.log10(f_c_ghz)
 
         return pl_los, pl_nlos
+
+    def expected_channel_gain(
+        self, uav_pos_3d: np.ndarray, ground_pos_2d: np.ndarray
+    ) -> float:
+        """Return deterministic large-scale channel gain for a link.
+
+        This is the common geometry-dependent gain used by the downstream
+        optimizer.  ``channel_gain`` additionally applies reproducible Rician
+        small-scale fading when scenarios are sampled.
+        """
+        diff_2d = np.asarray(uav_pos_3d[:2]) - np.asarray(ground_pos_2d)
+        horizontal_dist = float(np.linalg.norm(diff_2d))
+        altitude = float(uav_pos_3d[2])
+        distance_3d = float(np.hypot(horizontal_dist, altitude))
+        p_los = self.los_probability(altitude, horizontal_dist)
+        pl_los_db, pl_nlos_db = self.path_loss_db(
+            altitude, distance_3d, horizontal_dist
+        )
+        mean_path_loss_db = p_los * pl_los_db + (1.0 - p_los) * pl_nlos_db
+        return float(10.0 ** (-mean_path_loss_db / 10.0))
+
+    def sensing_path_gain(
+        self, uav_pos_3d: np.ndarray, target_pos_2d: np.ndarray
+    ) -> float:
+        """Return the deterministic sensing-link power gain."""
+        diff_2d = np.asarray(uav_pos_3d[:2]) - np.asarray(target_pos_2d)
+        distance = max(float(np.hypot(np.linalg.norm(diff_2d), uav_pos_3d[2])), 1.0)
+        pl_db = 20.0 * np.log10((4.0 * np.pi * distance) / self.wavelength) + 20.0
+        return float(10.0 ** (-pl_db / 10.0))
 
     def channel_gain(
         self, uav_pos_3d: np.ndarray, ground_pos_2d: np.ndarray,
@@ -123,14 +153,7 @@ class ISACChannel:
         """
         diff_2d = uav_pos_3d[:2] - ground_pos_2d
         horizontal_dist = np.linalg.norm(diff_2d)
-        altitude = uav_pos_3d[2]
-        distance_3d = np.sqrt(horizontal_dist ** 2 + altitude ** 2)
-
-        p_los = self.los_probability(altitude, horizontal_dist)
-        pl_los_db, pl_nlos_db = self.path_loss_db(altitude, distance_3d, horizontal_dist)
-
-        # 概率加权路径损耗
-        pl_db = p_los * pl_los_db + (1 - p_los) * pl_nlos_db
+        path_loss_linear = self.expected_channel_gain(uav_pos_3d, ground_pos_2d)
 
         # 小尺度衰落 (Rician, K-factor 依赖仰角)
         k_factor = 10 ** ((10 - horizontal_dist / 100) / 10)  # dB → linear
@@ -146,7 +169,6 @@ class ISACChannel:
             ) / np.sqrt(2)
         ) ** 2
 
-        path_loss_linear = 10 ** (-pl_db / 10)
         return float(path_loss_linear * small_scale)
 
     def compute_communication_sinr(
@@ -165,7 +187,6 @@ class ISACChannel:
 
         其中 I_sense 是感知波束干扰
         """
-        uav_pos = uav_positions[uav_idx]
         # 这里 user_idx 需要从外部获取 user 位置
         # 简化: 直接传入已计算的增益
         # 完整版本由 ISACScenario 整合
@@ -197,12 +218,7 @@ class ISACChannel:
         感知 SINR ∝ (sensing_power * |α|^2 * N_t * N_r) /
                      (clutter + noise)
         """
-        diff_2d = uav_pos_3d[:2] - target_pos_2d
-        distance = np.sqrt(np.sum(diff_2d ** 2) + uav_pos_3d[2] ** 2)
-
-        # 路径损耗 (双程 — round-trip)
-        pl_db = 20 * np.log10((4 * np.pi * distance) / self.wavelength) + 20
-        path_loss = 10 ** (-pl_db / 10)
+        path_loss = self.sensing_path_gain(uav_pos_3d, target_pos_2d)
 
         # 阵列增益
         array_gain_tx = self.N_t

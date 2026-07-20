@@ -455,14 +455,20 @@ def _load_projection_head(model: Gemma3MultimodalISAC, checkpoint: str):
     if not ckpt_path.exists():
         raise FileNotFoundError(f"projection_head checkpoint not found: {ckpt_path}")
     state = torch.load(ckpt_path, map_location="cpu")
-    load_result = model.projection_head.load_state_dict(state, strict=False)
-    if load_result.missing_keys or load_result.unexpected_keys:
-        print(
-            "Projection head loaded with non-strict key match: "
-            f"missing={list(load_result.missing_keys)}, "
-            f"unexpected={list(load_result.unexpected_keys)}"
-        )
+    model.projection_head.load_state_dict(state, strict=True)
     return str(ckpt_path)
+
+
+def _read_checkpoint_metadata(checkpoint: str) -> Dict:
+    if not checkpoint:
+        return {}
+    checkpoint_path = Path(checkpoint)
+    root = checkpoint_path if checkpoint_path.is_dir() else checkpoint_path.parent
+    metadata_path = root / "metadata.json"
+    if not metadata_path.exists():
+        return {}
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def _load_control_token_embeddings(model: Gemma3MultimodalISAC, checkpoint: str):
@@ -621,12 +627,22 @@ def main():
     max_length = args.max_length or train_cfg["max_seq_length"]
     lora_checkpoint = _resolve_lora_checkpoint(args.checkpoint, args.lora_checkpoint)
     proj_head_config = build_proj_head_config(model_cfg, sim_cfg)
-    if args.projection_head_type is not None:
-        proj_head_config["head_type"] = args.projection_head_type
-    if args.q_projection_mode is not None:
-        proj_head_config["q_projection_mode"] = args.q_projection_mode
-    if args.q_geometry_mode is not None:
-        proj_head_config["q_geometry_mode"] = args.q_geometry_mode
+    checkpoint_metadata = _read_checkpoint_metadata(args.checkpoint)
+    mode_fields = {
+        "projection_head_type": ("head_type", args.projection_head_type),
+        "q_projection_mode": ("q_projection_mode", args.q_projection_mode),
+        "q_geometry_mode": ("q_geometry_mode", args.q_geometry_mode),
+    }
+    for metadata_key, (config_key, cli_value) in mode_fields.items():
+        saved_value = checkpoint_metadata.get(metadata_key)
+        if cli_value is not None and saved_value is not None and cli_value != saved_value:
+            raise ValueError(
+                f"{metadata_key} CLI/checkpoint mismatch: {cli_value!r} != {saved_value!r}"
+            )
+        if cli_value is not None:
+            proj_head_config[config_key] = cli_value
+        elif saved_value is not None:
+            proj_head_config[config_key] = saved_value
 
     model = Gemma3MultimodalISAC(
         model_name_or_path=model_name,

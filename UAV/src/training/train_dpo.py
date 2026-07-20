@@ -117,6 +117,12 @@ def train_stage2(
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
 
+    if cfg.get("model", {}).get("use_multimodal", False):
+        raise RuntimeError(
+            "train_dpo.py is text-only and must not consume multimodal data. "
+            "Use src/training/train_dpo_mm.py."
+        )
+
     model_cfg = cfg["model"]
     train_cfg = cfg["training"]["dpo"]
     sim_cfg = cfg["simulation"]

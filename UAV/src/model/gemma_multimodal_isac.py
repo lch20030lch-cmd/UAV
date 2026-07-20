@@ -243,6 +243,8 @@ class Gemma3MultimodalISAC(nn.Module):
         q_geometry_cues: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
+        compute_full_logits: bool = False,
+        logits_to_keep: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         model_inputs = {
@@ -251,9 +253,13 @@ class Gemma3MultimodalISAC(nn.Module):
             "output_hidden_states": True,
             "use_cache": False,
             "return_dict": True,
-            # 烟雾测试阶段不使用 token-level CE，尽量少保留 logits 以降低显存峰值。
-            "logits_to_keep": 1,
         }
+        if logits_to_keep is not None:
+            model_inputs["logits_to_keep"] = logits_to_keep
+        elif not compute_full_logits:
+            # Control-only stages do not need token-level CE.  Keeping one
+            # position materially reduces the vocabulary-logit memory peak.
+            model_inputs["logits_to_keep"] = 1
         if token_type_ids is not None:
             model_inputs["token_type_ids"] = token_type_ids
         if pixel_values is not None:

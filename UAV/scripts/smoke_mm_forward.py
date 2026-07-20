@@ -45,13 +45,7 @@ def _load_projection_head(model: Gemma3MultimodalISAC, checkpoint: str):
     if not ckpt_path.exists():
         raise FileNotFoundError(f"projection_head checkpoint not found: {ckpt_path}")
     state = torch.load(ckpt_path, map_location="cpu")
-    load_result = model.projection_head.load_state_dict(state, strict=False)
-    if load_result.missing_keys or load_result.unexpected_keys:
-        print(
-            "Projection head loaded with non-strict key match: "
-            f"missing={list(load_result.missing_keys)}, "
-            f"unexpected={list(load_result.unexpected_keys)}"
-        )
+    model.projection_head.load_state_dict(state, strict=True)
     return str(ckpt_path)
 
 
