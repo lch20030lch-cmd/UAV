@@ -128,3 +128,29 @@ python -m unittest \
   Stage-I 字段，避免重复字典再次分叉。
 - 新增回归：Stage-I 为 200/1600 步、DPO 为 17/136 步时，保存结果必须为 DPO 的
   17/136，同时保留数据 schema provenance。
+
+## v5 DPO runtime 最终验收
+
+- metadata 修复单测与 runtime 工具测试共 8/8 PASS。
+- 使用 2-step v5 SFT checkpoint 运行独立 3-step DPO，以保证 Stage-I 与 DPO 步数
+  不同并暴露任何残余字段继承。
+- DPO 三步总 loss 为 `1.2375 -> 1.1362 -> 1.0443`，DPO loss 有限；未出现
+  NaN、Inf、OOM 或运行时错误。这里只验证运行稳定性，不将三点下降解释为泛化证据。
+- cosine 实际 LoRA LR 为 `1e-5 -> 7.5e-6 -> 2.5e-6`，projection LR 为
+  `1e-4 -> 7.5e-5 -> 2.5e-5`。
+- `save_steps=1/save_total_limit=1` 正常删除 step 1/2，最终只保留
+  `mm_dpo_step_3`。
+- 最终 metadata 明确记录 `stage=multimodal_dpo`、`global_step=3`、
+  `micro_step=3`、`max_steps=3`、schema=5，并保留正确 Stage-I checkpoint 路径；
+  DPO 进度不再继承 SFT 的 2/2。
+
+## P1 关闭结论
+
+v5 数据生成、数据契约、无孤儿图片、control-only multimodal SFT、response-conditioned
+multimodal DPO、学习率调度、梯度累积、checkpoint 轮转和 checkpoint provenance 已形成
+最小完整闭环。P1 状态为 `complete`。本节产生的 2 条数据、2-step SFT 与 3-step DPO
+checkpoint 均为 runtime artifact，不是论文结果或正式训练初始化。
+
+下一步按 P0 closure 的既定门禁生成相互独立的 v5 train20/val20，只做数据分布、长度、
+solver feasibility 和小规模训练质量预检；这些门禁通过前不生成 train500/val100，
+更不启动正式联合训练。
