@@ -80,3 +80,22 @@ python -m unittest \
 在上述回归通过前，不启动新的正式 SFT/DPO 训练。回归通过后先做 2-step SFT 和
 2-step DPO runtime smoke，检查日志中的学习率、micro-step、checkpoint metadata 与
 轮转结果，再进入下一优先级。
+
+## 服务器验收结果
+
+- 环境：AutoDL `uavmllm`。
+- 结果：57/57 PASS，耗时 0.197 秒。
+- 新增的 5 项训练运行测试与原有 52 项数据契约、Solver、Channel、Q/A/P、梯度累积
+  和诊断回归全部通过。
+- P1 训练运行代码测试门已关闭；下一步只生成全新 v5 极小数据并执行 2-step
+  SFT/DPO runtime smoke，不使用任何 v3/v4 数据或 checkpoint。
+
+## v5 极小数据预检发现与修复
+
+- 首次生成 2 条有效配对记录时依次尝试了 `env_0/env_1/env_2`；其中 `env_1` 没有
+  形成正 utility-gap DPO pair，因此有效 SFT/DPO ID 为 `env_0/env_2`，这是预期行为。
+- 数据契约、有效记录配对和 4096-token 预算均通过，但目录中有 3 张图片：生成器在
+  判断 DPO pair 是否有效之前就渲染了 BEV，给失败的 `env_1` 留下了孤儿图。
+- 修复方式不是事后批量删除，而是把 BEV 渲染延后到有效 SFT/DPO pair 已确认之后；
+  失败尝试从源头不再产生图片。该修复不改变 Solver、Oracle target 或 prompt 内容。
+- 新增 `tests.test_multimodal_generation`，用无有效候选的环境验证渲染函数不会被调用。

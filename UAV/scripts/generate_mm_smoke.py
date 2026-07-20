@@ -105,13 +105,6 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
 
     rel_image_path = Path("images") / f"env_{sample_id:06d}.png"
     image_path = output_dir / rel_image_path
-    render_bev_sample(
-        env_sample,
-        save_path=str(image_path),
-        area_size=tuple(sim_cfg["area_size"]),
-        image_size=image_size,
-        movement_radius=sim_cfg.get("uav_max_speed_ms", 15.0) * sim_cfg.get("slot_duration_s", 1.0),
-    )
     env_sample.bev_image_path = rel_image_path.as_posix()
 
     prompt = build_multimodal_prompt(env_sample, sim_cfg)
@@ -184,6 +177,19 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
     # a valid positive-gap preference pair are retried with a new sample id.
     if not dpo_samples:
         return None, []
+
+    # Rendering is intentionally delayed until the environment has a valid
+    # one-to-one SFT/DPO pair. Failed attempts must not leave orphan BEV files.
+    render_bev_sample(
+        env_sample,
+        save_path=str(image_path),
+        area_size=tuple(sim_cfg["area_size"]),
+        image_size=image_size,
+        movement_radius=(
+            sim_cfg.get("uav_max_speed_ms", 15.0)
+            * sim_cfg.get("slot_duration_s", 1.0)
+        ),
+    )
     return sft_sample, dpo_samples
 
 
