@@ -35,6 +35,7 @@ from transformers import get_scheduler, set_seed
 
 from src.data.multimodal_dataset import (
     MultimodalSFTDataset,
+    resolve_multimodal_chat_template,
     validate_multimodal_oracle_contract,
 )
 from src.data.oracle_contract import (
@@ -264,6 +265,7 @@ def train_mm_sft_smoke(
     freeze_all_except_p: bool = False,
     gradient_accumulation_steps: int = None,
     lambda_lm_ce: float = None,
+    use_chat_template: bool = None,
     allow_partial_projection_load: bool = False,
     allow_legacy_oracle_data: bool = False,
     allow_checkpoint_dataset_mismatch: bool = False,
@@ -342,6 +344,19 @@ def train_mm_sft_smoke(
             "--load_lora requires --init_checkpoint containing lora/adapter_config.json"
         )
 
+    init_metadata = {}
+    if init_checkpoint:
+        init_metadata_path = Path(init_checkpoint) / "metadata.json"
+        if init_metadata_path.exists():
+            with init_metadata_path.open("r", encoding="utf-8") as handle:
+                init_metadata = json.load(handle)
+    use_chat_template_value = resolve_multimodal_chat_template(
+        dataset_metadata=dataset_metadata,
+        checkpoint_metadata=init_metadata,
+        configured_value=train_cfg.get("use_chat_template"),
+        override=use_chat_template,
+    )
+
     print("=" * 60)
     print("BEV-image multimodal SFT smoke")
     print("=" * 60)
@@ -363,6 +378,7 @@ def train_mm_sft_smoke(
         "  input mode: prompt + image + control tokens"
         + (" + response" if include_response_tokens else " (response omitted)")
     )
+    print(f"  chat template: {use_chat_template_value}")
     if train_lora:
         trainable_label = "projection_head + LoRA"
     elif load_lora:
@@ -372,12 +388,6 @@ def train_mm_sft_smoke(
     print(f"  trainable:  {trainable_label}")
     print()
 
-    init_metadata = {}
-    if init_checkpoint:
-        init_metadata_path = Path(init_checkpoint) / "metadata.json"
-        if init_metadata_path.exists():
-            with init_metadata_path.open("r", encoding="utf-8") as handle:
-                init_metadata = json.load(handle)
     proj_head_config = build_proj_head_config(
         model_cfg, sim_cfg, checkpoint_metadata=init_metadata
     )
@@ -482,7 +492,7 @@ def train_mm_sft_smoke(
         max_length=max_seq_length,
         num_control_tokens=model_cfg["control_token"]["num_tokens"],
         include_response=include_response_tokens,
-        use_chat_template=include_response_tokens,
+        use_chat_template=use_chat_template_value,
     )
     dataloader = DataLoader(
         dataset,
@@ -822,7 +832,7 @@ def train_mm_sft_smoke(
                         "warmup_ratio": warmup_ratio,
                         "warmup_steps": warmup_steps,
                         "include_response_tokens": include_response_tokens,
-                        "use_chat_template": include_response_tokens,
+                        "use_chat_template": use_chat_template_value,
                         "lambda_lm_ce": lambda_lm_ce_value,
                         "projection_lr": proj_lr,
                         "lora_lr": lora_lr if train_lora else 0.0,
@@ -898,7 +908,7 @@ def train_mm_sft_smoke(
             "warmup_ratio": warmup_ratio,
             "warmup_steps": warmup_steps,
             "include_response_tokens": include_response_tokens,
-            "use_chat_template": include_response_tokens,
+            "use_chat_template": use_chat_template_value,
             "lambda_lm_ce": lambda_lm_ce_value,
             "projection_lr": proj_lr,
             "lora_lr": lora_lr if train_lora else 0.0,
@@ -998,6 +1008,16 @@ if __name__ == "__main__":
             "response and require --train_lora"
         ),
     )
+    parser.add_argument(
+        "--use_chat_template",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "override multimodal prompt formatting; schema-v5 fresh runs "
+            "default to the Gemma chat template, while resumes preserve "
+            "checkpoint metadata"
+        ),
+    )
     parser.add_argument("--projection_lr", type=float, default=None,
                         help="可选 projection head 学习率覆盖值")
     parser.add_argument("--lora_lr", type=float, default=None,
@@ -1085,6 +1105,7 @@ if __name__ == "__main__":
         freeze_all_except_p=args.freeze_all_except_p,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         lambda_lm_ce=args.lambda_lm_ce,
+        use_chat_template=args.use_chat_template,
         allow_partial_projection_load=args.allow_partial_projection_load,
         allow_legacy_oracle_data=args.allow_legacy_oracle_data,
         allow_checkpoint_dataset_mismatch=args.allow_checkpoint_dataset_mismatch,

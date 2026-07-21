@@ -19,7 +19,11 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
-from src.data.multimodal_dataset import MultimodalSFTDataset
+from src.data.multimodal_dataset import (
+    MultimodalSFTDataset,
+    resolve_multimodal_chat_template,
+    validate_multimodal_oracle_contract,
+)
 from src.model import Gemma3MultimodalISAC, build_proj_head_config
 
 
@@ -91,6 +95,12 @@ def main():
     parser.add_argument("--lora_checkpoint", type=str, default=None,
                         help="LoRA adapter 目录；不填时会尝试从 --checkpoint/lora 自动发现")
     parser.add_argument("--max_length", type=int, default=None)
+    parser.add_argument(
+        "--use_chat_template",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="diagnostic override; otherwise use checkpoint metadata or v5 default",
+    )
     parser.add_argument("--no_4bit", action="store_true")
     parser.add_argument("--projection_head_type", type=str, choices=["shared", "split"], default=None,
                         help="可选 projection head 类型；加载 split checkpoint 时需要传 split")
@@ -115,10 +125,21 @@ def main():
 
     model_name = args.model or model_cfg["backbone"]
     data_dir = Path(args.data_dir or data_cfg["output_dir"])
+    dataset_metadata = validate_multimodal_oracle_contract(
+        data_dir,
+        allow_legacy=True,
+        expected_simulation=sim_cfg,
+    )
     data_path = data_dir / data_cfg.get("sft_file", "sft_dataset.jsonl")
     max_length = args.max_length or train_cfg["max_seq_length"]
     lora_checkpoint = _resolve_lora_checkpoint(args.checkpoint, args.lora_checkpoint)
     checkpoint_metadata = _read_checkpoint_metadata(args.checkpoint)
+    use_chat_template = resolve_multimodal_chat_template(
+        dataset_metadata=dataset_metadata,
+        checkpoint_metadata=checkpoint_metadata,
+        configured_value=train_cfg.get("use_chat_template"),
+        override=args.use_chat_template,
+    )
     proj_head_config = build_proj_head_config(
         model_cfg, sim_cfg, checkpoint_metadata=checkpoint_metadata
     )
@@ -161,6 +182,7 @@ def main():
         max_length=max_length,
         num_control_tokens=model_cfg["control_token"]["num_tokens"],
         include_response=False,
+        use_chat_template=use_chat_template,
     )
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
     batch = next(iter(dataloader))
@@ -191,6 +213,7 @@ def main():
     print(f"  q_projection_mode: {proj_head_config.get('q_projection_mode', 'clip')}")
     print(f"  q_geometry_mode: {proj_head_config.get('q_geometry_mode', 'none')}")
     print(f"  max_length: {max_length}")
+    print(f"  use_chat_template: {use_chat_template}")
     print(f"  input_ids: {tuple(batch['input_ids'].shape)}")
     print(f"  attention_mask: {tuple(batch['attention_mask'].shape)}")
     if "pixel_values" in batch:

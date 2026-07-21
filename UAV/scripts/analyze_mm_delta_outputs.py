@@ -22,7 +22,11 @@ import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.data.multimodal_dataset import MultimodalSFTDataset
+from src.data.multimodal_dataset import (
+    MultimodalSFTDataset,
+    resolve_multimodal_chat_template,
+    validate_multimodal_oracle_contract,
+)
 from src.model import Gemma3MultimodalISAC, build_proj_head_config
 
 
@@ -55,6 +59,62 @@ def _summarize_tensor(name: str, values: np.ndarray) -> Dict:
         f"{name}_min": float(flat.min()),
         f"{name}_max": float(flat.max()),
     }
+
+
+def _summarize_control_states(values: np.ndarray) -> Dict:
+    """Measure whether different environments produce distinguishable states."""
+    summary = _summarize_tensor("control_states", values)
+    flat = np.asarray(values, dtype=np.float64).reshape(values.shape[0], -1)
+    sample_count = flat.shape[0]
+    if sample_count < 2:
+        summary.update(
+            {
+                "control_states_nearest_cosine_mean": None,
+                "control_states_nearest_cosine_max": None,
+                "control_states_centered_nearest_cosine_mean": None,
+                "control_states_centered_nearest_cosine_max": None,
+                "control_states_near_duplicate_pair_count": 0,
+                "control_states_centered_effective_rank": 0.0,
+            }
+        )
+        return summary
+
+    norms = np.linalg.norm(flat, axis=1, keepdims=True)
+    normalized = flat / np.maximum(norms, 1e-12)
+    cosine = normalized @ normalized.T
+    np.fill_diagonal(cosine, -np.inf)
+    nearest = cosine.max(axis=1)
+    upper = cosine[np.triu_indices(sample_count, k=1)]
+
+    centered = flat - flat.mean(axis=0, keepdims=True)
+    centered_norms = np.linalg.norm(centered, axis=1, keepdims=True)
+    centered_normalized = centered / np.maximum(centered_norms, 1e-12)
+    centered_cosine = centered_normalized @ centered_normalized.T
+    np.fill_diagonal(centered_cosine, -np.inf)
+    centered_nearest = centered_cosine.max(axis=1)
+    singular_values = np.linalg.svd(centered, compute_uv=False)
+    energy = singular_values ** 2
+    energy_sum = float(energy.sum())
+    effective_rank = (
+        float(energy_sum ** 2 / np.maximum((energy ** 2).sum(), 1e-24))
+        if energy_sum > 1e-24
+        else 0.0
+    )
+    summary.update(
+        {
+            "control_states_nearest_cosine_mean": float(nearest.mean()),
+            "control_states_nearest_cosine_max": float(nearest.max()),
+            "control_states_centered_nearest_cosine_mean": float(
+                centered_nearest.mean()
+            ),
+            "control_states_centered_nearest_cosine_max": float(
+                centered_nearest.max()
+            ),
+            "control_states_near_duplicate_pair_count": int((upper >= 0.9999).sum()),
+            "control_states_centered_effective_rank": effective_rank,
+        }
+    )
+    return summary
 
 
 def _summarize_association(prefix: str, delta_a: np.ndarray) -> Dict:
@@ -392,7 +452,7 @@ def _summarize_deltas(
     if delta_p_target is not None and delta_a_target is not None:
         summary.update(_summarize_power_alignment(delta_p, delta_p_target, delta_a_target))
     if control_states is not None:
-        summary.update(_summarize_tensor("control_states", control_states))
+        summary.update(_summarize_control_states(control_states))
     if delta_raw is not None:
         summary.update(_summarize_tensor("delta_raw", delta_raw))
 
@@ -422,6 +482,17 @@ def _summarize_deltas(
         warnings.append("delta_p_inactive_power_leakage")
     if summary["delta_a_argmax_unique_per_user_mean"] <= 1.2:
         warnings.append("delta_a_argmax_nearly_constant")
+    if (
+        summary.get("control_states_nearest_cosine_mean", -1.0) >= 0.999
+        and summary.get("control_states_centered_effective_rank", float("inf")) < 4.0
+    ):
+        warnings.append("control_states_nearly_indistinguishable")
+    if (
+        control_states is not None
+        and control_states.shape[0] >= 8
+        and summary.get("control_states_centered_effective_rank", float("inf")) < 4.0
+    ):
+        warnings.append("control_states_low_effective_rank")
     if (
         "delta_a_accuracy_gain_over_fixed_user_majority" in summary
         and summary["delta_a_accuracy_gain_over_fixed_user_majority"] <= 0.0
@@ -600,6 +671,12 @@ def main():
     parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--save_raw", action="store_true")
+    parser.add_argument(
+        "--use_chat_template",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="diagnostic override; otherwise use checkpoint metadata or v5 default",
+    )
     parser.add_argument("--projection_head_type", type=str, choices=["shared", "split"], default=None,
                         help="可选 projection head 类型；分析 split checkpoint 时需要传 split")
     parser.add_argument("--q_projection_mode", type=str, choices=["clip", "direction"], default=None,
@@ -622,11 +699,22 @@ def main():
     data_cfg = cfg["data"]
 
     data_dir = Path(args.data_dir or data_cfg["output_dir"])
+    dataset_metadata = validate_multimodal_oracle_contract(
+        data_dir,
+        allow_legacy=True,
+        expected_simulation=sim_cfg,
+    )
     data_path = data_dir / data_cfg.get("sft_file", "sft_dataset.jsonl")
     model_name = args.model or model_cfg["backbone"]
     max_length = args.max_length or train_cfg["max_seq_length"]
     lora_checkpoint = _resolve_lora_checkpoint(args.checkpoint, args.lora_checkpoint)
     checkpoint_metadata = _read_checkpoint_metadata(args.checkpoint)
+    use_chat_template = resolve_multimodal_chat_template(
+        dataset_metadata=dataset_metadata,
+        checkpoint_metadata=checkpoint_metadata,
+        configured_value=train_cfg.get("use_chat_template"),
+        override=args.use_chat_template,
+    )
     proj_head_config = build_proj_head_config(
         model_cfg, sim_cfg, checkpoint_metadata=checkpoint_metadata
     )
@@ -670,6 +758,7 @@ def main():
         max_length=max_length,
         num_control_tokens=model_cfg["control_token"]["num_tokens"],
         include_response=False,
+        use_chat_template=use_chat_template,
     )
 
     num_samples = min(args.num_samples, len(dataset))
@@ -710,6 +799,7 @@ def main():
         "loaded_lora_checkpoint": model.loaded_lora_checkpoint,
         "num_samples": num_samples,
         "max_length": max_length,
+        "use_chat_template": use_chat_template,
         "summary": summary,
     }
 
@@ -731,6 +821,7 @@ def main():
     print(f"  loaded_projection: {loaded_projection}")
     print(f"  loaded_control_embeddings: {loaded_control_embeddings}")
     print(f"  loaded_lora_checkpoint: {model.loaded_lora_checkpoint}")
+    print(f"  use_chat_template: {use_chat_template}")
     for key in (
         "delta_q_per_dim_std_mean",
         "delta_a_per_dim_std_mean",
@@ -793,6 +884,12 @@ def main():
         "delta_a_raw_entropy_mean",
         "control_states_per_dim_std_mean",
         "control_states_per_dim_std_max",
+        "control_states_nearest_cosine_mean",
+        "control_states_nearest_cosine_max",
+        "control_states_centered_nearest_cosine_mean",
+        "control_states_centered_nearest_cosine_max",
+        "control_states_near_duplicate_pair_count",
+        "control_states_centered_effective_rank",
         "delta_raw_per_dim_std_mean",
         "delta_raw_per_dim_std_max",
         "delta_p_entropy_mean",

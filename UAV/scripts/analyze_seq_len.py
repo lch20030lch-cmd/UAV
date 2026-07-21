@@ -32,7 +32,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.multimodal_dataset import (
     _encode_text_image,
-    ensure_one_image_token,
+    format_multimodal_user_prompt,
+    resolve_multimodal_chat_template,
 )
 
 
@@ -42,6 +43,7 @@ def analyze(
     control_only: bool = False,
     num_control_tokens: int = 8,
     current_max_length: int = 4096,
+    use_chat_template: bool = None,
 ):
     # ---- 加载数据 ----
     print(f"Loading dataset from {data_path}...")
@@ -77,6 +79,18 @@ def analyze(
     response_lengths = []
 
     data_root = Path(data_path).resolve().parent
+    metadata_path = data_root / "dataset_metadata.json"
+    dataset_metadata = (
+        json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata_path.exists()
+        else {}
+    )
+    use_chat_template_value = resolve_multimodal_chat_template(
+        dataset_metadata=dataset_metadata,
+        override=use_chat_template,
+    )
+    if use_multimodal_processor:
+        print(f"Chat template: {use_chat_template_value}")
     for s in samples:
         # prompt: instruction + control part
         prompt_text = s.get("prompt", "")
@@ -90,7 +104,11 @@ def analyze(
             image_path = data_root / s["bev_image_path"]
             with Image.open(image_path) as image_handle:
                 image = image_handle.convert("RGB")
-                prompt = ensure_one_image_token(processor, prompt_text)
+                prompt = format_multimodal_user_prompt(
+                    processor,
+                    prompt_text,
+                    use_chat_template=use_chat_template_value,
+                )
                 encoded = _encode_text_image(
                     processor,
                     prompt,
@@ -188,6 +206,12 @@ if __name__ == "__main__":
                         help="按当前 multimodal control-loss 管线统计 prompt + control tokens")
     parser.add_argument("--num-control-tokens", type=int, default=8)
     parser.add_argument("--current-max-length", type=int, default=4096)
+    parser.add_argument(
+        "--use-chat-template",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="override formatting; schema-v5 data defaults to the Gemma chat template",
+    )
     args = parser.parse_args()
 
     data_path = os.path.join(args.data_dir, "sft_dataset.jsonl")
@@ -201,4 +225,5 @@ if __name__ == "__main__":
         control_only=args.control_only,
         num_control_tokens=args.num_control_tokens,
         current_max_length=args.current_max_length,
+        use_chat_template=args.use_chat_template,
     )

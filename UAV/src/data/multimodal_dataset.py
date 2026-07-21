@@ -79,9 +79,9 @@ def format_multimodal_user_prompt(
 ) -> str:
     """Format one image/text user turn for an instruction-tuned checkpoint.
 
-    Legacy control-only checkpoints were trained from raw prompt text, so the
-    behavior remains opt-in.  New response-SFT and DPO stages must enable the
-    chat template to match Gemma instruction-tuning semantics.
+    This low-level formatter keeps both layouts because legacy control-only
+    checkpoints used raw prompt text.  Entry points must choose the layout via
+    ``resolve_multimodal_chat_template`` so training and evaluation agree.
     """
     if not use_chat_template:
         return ensure_one_image_token(processor, prompt)
@@ -106,6 +106,36 @@ def format_multimodal_user_prompt(
         add_generation_prompt=True,
     )
     return ensure_one_image_token(processor, str(formatted))
+
+
+def resolve_multimodal_chat_template(
+    *,
+    dataset_metadata: Dict = None,
+    checkpoint_metadata: Dict = None,
+    configured_value: bool = None,
+    override: bool = None,
+) -> bool:
+    """Resolve one input format for training and every evaluation entry point.
+
+    Schema-v5 data targets an instruction-tuned Gemma checkpoint, so a fresh
+    run uses the multimodal chat template.  Existing checkpoints retain the
+    format recorded in their metadata to prevent a silent token-layout change
+    during resume or evaluation.  An explicit CLI override is reserved for
+    controlled A/B diagnostics.
+    """
+    if override is not None:
+        return bool(override)
+    checkpoint_metadata = checkpoint_metadata or {}
+    if "use_chat_template" in checkpoint_metadata:
+        return bool(checkpoint_metadata["use_chat_template"])
+    if configured_value is not None:
+        return bool(configured_value)
+    dataset_metadata = dataset_metadata or {}
+    try:
+        schema_version = int(dataset_metadata.get("schema_version", 0))
+    except (TypeError, ValueError):
+        schema_version = 0
+    return schema_version >= 5
 
 
 def _encode_text_image(

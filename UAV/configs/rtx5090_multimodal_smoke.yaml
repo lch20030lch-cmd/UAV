@@ -23,6 +23,9 @@ training:
     warmup_ratio: 0.03
     weight_decay: 0.01
     max_seq_length: 4096
+    # Gemma-3-4b-it expects the same multimodal chat layout in control-only
+    # SFT, response SFT, diagnostics, and DPO.
+    use_chat_template: true
     save_steps: 10
     save_total_limit: 2
     logging_steps: 1

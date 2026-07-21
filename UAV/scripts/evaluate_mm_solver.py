@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 from src.data.multimodal_dataset import (
     MultimodalSFTDataset,
+    resolve_multimodal_chat_template,
     validate_multimodal_oracle_contract,
 )
 from src.data.oracle_contract import validate_checkpoint_dataset_compatibility
@@ -136,7 +137,11 @@ def main():
         )
     model, metadata = _load_model(cfg, checkpoint_dir, trainable=False)
     data_path = data_root / cfg["data"].get("sft_file", "sft_dataset.jsonl")
-    use_chat_template = bool(metadata.get("use_chat_template", False))
+    use_chat_template = resolve_multimodal_chat_template(
+        dataset_metadata=dataset_metadata,
+        checkpoint_metadata=metadata,
+        configured_value=cfg["training"]["sft"].get("use_chat_template"),
+    )
     dataset = MultimodalSFTDataset(
         data_path=str(data_path),
         data_dir=str(data_root),

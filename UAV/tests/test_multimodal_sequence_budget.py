@@ -6,6 +6,7 @@ from src.data.multimodal_dataset import (
     _compute_prompt_budget,
     _encode_text_image,
     format_multimodal_user_prompt,
+    resolve_multimodal_chat_template,
 )
 
 
@@ -27,6 +28,29 @@ class _FakeProcessor:
 
 
 class MultimodalSequenceBudgetTest(unittest.TestCase):
+    def test_v5_fresh_run_defaults_to_chat_template(self):
+        self.assertTrue(
+            resolve_multimodal_chat_template(
+                dataset_metadata={"schema_version": 5}
+            )
+        )
+
+    def test_checkpoint_preserves_legacy_input_format(self):
+        self.assertFalse(
+            resolve_multimodal_chat_template(
+                dataset_metadata={"schema_version": 5},
+                checkpoint_metadata={"use_chat_template": False},
+            )
+        )
+
+    def test_explicit_diagnostic_override_has_highest_priority(self):
+        self.assertTrue(
+            resolve_multimodal_chat_template(
+                checkpoint_metadata={"use_chat_template": False},
+                override=True,
+            )
+        )
+
     def test_control_only_reserves_every_control_token(self):
         self.assertEqual(_compute_prompt_budget(3072, 8, 0), 3064)
 

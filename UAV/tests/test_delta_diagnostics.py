@@ -6,7 +6,34 @@ from scripts.analyze_mm_delta_outputs import (
     _summarize_association_alignment,
     _summarize_fixed_q_geometry,
     _summarize_q_alignment,
+    _summarize_control_states,
 )
+
+
+class ControlStateDiagnosticTest(unittest.TestCase):
+    def test_identical_states_are_reported_as_collapsed(self):
+        states = np.ones((4, 2, 3), dtype=np.float32)
+
+        summary = _summarize_control_states(states)
+
+        self.assertAlmostEqual(summary["control_states_nearest_cosine_mean"], 1.0)
+        self.assertEqual(summary["control_states_near_duplicate_pair_count"], 6)
+        self.assertAlmostEqual(summary["control_states_centered_effective_rank"], 0.0)
+        self.assertAlmostEqual(
+            summary["control_states_centered_nearest_cosine_mean"], 0.0
+        )
+
+    def test_distinct_states_have_nontrivial_effective_rank(self):
+        states = np.eye(4, dtype=np.float32).reshape(4, 1, 4)
+
+        summary = _summarize_control_states(states)
+
+        self.assertAlmostEqual(summary["control_states_nearest_cosine_mean"], 0.0)
+        self.assertGreater(summary["control_states_centered_effective_rank"], 2.9)
+        self.assertAlmostEqual(
+            summary["control_states_centered_nearest_cosine_mean"],
+            -1.0 / 3.0,
+        )
 
 
 class AssociationAlignmentDiagnosticTest(unittest.TestCase):
