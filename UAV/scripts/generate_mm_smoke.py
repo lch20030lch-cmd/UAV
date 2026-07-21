@@ -33,6 +33,7 @@ from src.data.oracle_contract import (
     PROMPT_TYPE,
     assert_resume_compatible,
     build_dataset_metadata,
+    dataset_content_fingerprint,
     paired_record_state,
 )
 from src.data.prompt_builder import build_multimodal_prompt, format_oracle_response
@@ -52,6 +53,53 @@ def _on_interrupt(sig, frame):
 def _append_jsonl(path: Path, record: dict) -> None:
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _finalize_dataset_metadata(
+    metadata: dict,
+    *,
+    output_dir: Path,
+    sft_path: Path,
+    dpo_path: Path,
+    num_sft_records: int,
+    num_dpo_records: int,
+    next_environment_id: int,
+    generation_complete: bool,
+) -> dict:
+    """Return count-consistent metadata and seal complete dataset content."""
+    result = dict(metadata)
+    result.update({
+        "generation_complete": bool(generation_complete),
+        "num_sft_records": int(num_sft_records),
+        "num_dpo_records": int(num_dpo_records),
+        "next_environment_id": int(next_environment_id),
+    })
+    if not generation_complete:
+        result.pop("content_fingerprint", None)
+        return result
+    if num_sft_records != num_dpo_records:
+        raise ValueError(
+            "cannot finalize an unpaired Oracle dataset: "
+            f"SFT={num_sft_records}, DPO={num_dpo_records}"
+        )
+
+    actual_fingerprint = dataset_content_fingerprint(
+        output_dir,
+        sft_path.name,
+        dpo_path.name,
+    )
+    stored_fingerprint = metadata.get("content_fingerprint")
+    if (
+        stored_fingerprint is not None
+        and stored_fingerprint != actual_fingerprint
+    ):
+        raise ValueError(
+            "refusing to replace a mismatched Oracle dataset content "
+            "fingerprint: "
+            f"metadata={stored_fingerprint}, actual={actual_fingerprint}"
+        )
+    result["content_fingerprint"] = actual_fingerprint
+    return result
 
 
 def _build_solver(sim_cfg: dict) -> SCAFPOptimizer:
@@ -222,6 +270,13 @@ def main():
     output_dir = Path(data_cfg["output_dir"])
     image_size = int(data_cfg.get("image_size", 224))
     num_samples = int(data_cfg["num_environments"])
+    num_restarts = int(data_cfg["num_restarts"])
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive")
+    if num_restarts <= 0:
+        raise ValueError("num_restarts must be positive")
+    if image_size <= 0:
+        raise ValueError("image_size must be positive")
 
     sft_path = output_dir / data_cfg.get("sft_file", "sft_dataset.jsonl")
     dpo_path = output_dir / data_cfg.get("dpo_file", "dpo_dataset.jsonl")
@@ -232,7 +287,7 @@ def main():
         sim_cfg,
         seed=args.seed,
         num_environments_requested=num_samples,
-        num_restarts=int(data_cfg["num_restarts"]),
+        num_restarts=num_restarts,
         image_size=image_size,
         sft_file=sft_path.name,
         dpo_file=dpo_path.name,
@@ -241,10 +296,13 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "images").mkdir(parents=True, exist_ok=True)
 
+    existing_metadata = None
     if args.overwrite:
         for path in [sft_path, dpo_path, ckpt_path, metadata_path]:
             if path.exists():
                 path.unlink()
+        for image_path in (output_dir / "images").glob("env_*.png"):
+            image_path.unlink()
 
     if not args.overwrite and (sft_path.exists() or dpo_path.exists()):
         if not metadata_path.exists():
@@ -275,7 +333,23 @@ def main():
     # before checkpoint.txt is advanced.  Never reuse an ID already present.
     start_id = max(checkpoint_next_id, record_state["next_environment_id"])
     if existing_sft >= num_samples and existing_dpo >= num_samples:
+        dataset_metadata = _finalize_dataset_metadata(
+            existing_metadata or expected_metadata,
+            output_dir=output_dir,
+            sft_path=sft_path,
+            dpo_path=dpo_path,
+            num_sft_records=existing_sft,
+            num_dpo_records=existing_dpo,
+            next_environment_id=start_id,
+            generation_complete=True,
+        )
+        with metadata_path.open("w", encoding="utf-8") as handle:
+            json.dump(dataset_metadata, handle, indent=2)
         print(f"All {num_samples} samples already exist at {output_dir}")
+        print(
+            "  content_fingerprint: "
+            f"{dataset_metadata['content_fingerprint']}"
+        )
         return
 
     # 复用 text-grid baseline 的场景生成器与 SCA-FP solver，保证两条路线可对照。
@@ -364,12 +438,18 @@ def main():
         sample_id += 1
 
     elapsed = time.time() - t0
-    dataset_metadata.update({
-        "generation_complete": n_sft == num_samples and n_dpo == num_samples,
-        "num_sft_records": n_sft,
-        "num_dpo_records": n_dpo,
-        "next_environment_id": sample_id,
-    })
+    dataset_metadata = _finalize_dataset_metadata(
+        dataset_metadata,
+        output_dir=output_dir,
+        sft_path=sft_path,
+        dpo_path=dpo_path,
+        num_sft_records=n_sft,
+        num_dpo_records=n_dpo,
+        next_environment_id=sample_id,
+        generation_complete=(
+            n_sft == num_samples and n_dpo == num_samples
+        ),
+    )
     with metadata_path.open("w", encoding="utf-8") as handle:
         json.dump(dataset_metadata, handle, indent=2)
     print("\nDone")

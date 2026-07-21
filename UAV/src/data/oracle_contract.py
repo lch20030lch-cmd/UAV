@@ -82,6 +82,64 @@ def simulation_fingerprint(simulation: Mapping) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def dataset_content_fingerprint(
+    data_dir: Path,
+    sft_file: str = "sft_dataset.jsonl",
+    dpo_file: str = "dpo_dataset.jsonl",
+) -> str:
+    """Hash the exact paired records and every referenced BEV image."""
+    data_root = Path(data_dir).resolve()
+    digest = hashlib.sha256()
+    for label, filename in (("sft", sft_file), ("dpo", dpo_file)):
+        path = data_root / filename
+        if not path.is_file():
+            raise FileNotFoundError(f"missing Oracle dataset file: {path}")
+        digest.update(label.encode("ascii"))
+        digest.update(b"\0")
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+
+    # Image bytes are part of both multimodal stages. Hash every referenced
+    # image in record order, while ignoring unrelated files in images/.
+    for record_label, filename in (("sft", sft_file), ("dpo", dpo_file)):
+        record_path = data_root / filename
+        with record_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                relative_image = record.get("bev_image_path")
+                if relative_image is None:
+                    continue
+                image_path = (data_root / str(relative_image)).resolve()
+                try:
+                    image_path.relative_to(data_root)
+                except ValueError as exc:
+                    raise ValueError(
+                        "Oracle BEV image path escapes the dataset directory "
+                        f"at {record_path}:{line_number}: "
+                        f"{relative_image!r}"
+                    ) from exc
+                if not image_path.is_file():
+                    raise FileNotFoundError(
+                        "missing Oracle BEV image referenced at "
+                        f"{record_path}:{line_number}: {image_path}"
+                    )
+                digest.update(f"{record_label}_image".encode("ascii"))
+                digest.update(b"\0")
+                digest.update(str(relative_image).encode("utf-8"))
+                digest.update(b"\0")
+                with image_path.open("rb") as image_handle:
+                    for chunk in iter(
+                        lambda: image_handle.read(1024 * 1024), b""
+                    ):
+                        digest.update(chunk)
+                digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def build_dataset_metadata(
     simulation: Mapping,
     *,
@@ -219,12 +277,28 @@ def validate_dataset_metadata(
                 f"actual={actual_sft}/{actual_dpo}, "
                 f"metadata={expected_sft}/{expected_dpo}"
             )
+        actual_content_fingerprint = dataset_content_fingerprint(
+            data_dir,
+            sft_file,
+            dpo_file,
+        )
+        stored_content_fingerprint = metadata.get("content_fingerprint")
+        if (
+            stored_content_fingerprint is not None
+            and stored_content_fingerprint != actual_content_fingerprint
+        ):
+            raise ValueError(
+                "Oracle dataset content fingerprint does not match its files: "
+                f"metadata={stored_content_fingerprint}, "
+                f"actual={actual_content_fingerprint}"
+            )
+        result["content_fingerprint"] = actual_content_fingerprint
     return result
 
 
 def checkpoint_dataset_fields(dataset_metadata: Mapping) -> Dict:
     """Select the immutable provenance stored in every model checkpoint."""
-    return {
+    fields = {
         f"dataset_{key}": dataset_metadata.get(key)
         for key in (
             "schema_version",
@@ -236,6 +310,10 @@ def checkpoint_dataset_fields(dataset_metadata: Mapping) -> Dict:
             "seed",
         )
     }
+    content_fingerprint = dataset_metadata.get("content_fingerprint")
+    if content_fingerprint is not None:
+        fields["dataset_content_fingerprint"] = content_fingerprint
+    return fields
 
 
 def validate_checkpoint_dataset_compatibility(
@@ -248,6 +326,7 @@ def validate_checkpoint_dataset_compatibility(
     expected = checkpoint_dataset_fields(dataset_metadata)
     if not require_same_seed:
         expected.pop("dataset_seed", None)
+        expected.pop("dataset_content_fingerprint", None)
     mismatches = {
         key: (checkpoint_metadata.get(key), value)
         for key, value in expected.items()

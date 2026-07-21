@@ -1,8 +1,8 @@
 ---
 type: status
 status: current
-stage: v5_train20_val20_preflight
-last_updated: 2026-07-20
+stage: v5_dataset_content_gate
+last_updated: 2026-07-21
 related: [onboarding, quickstart, canonical_config]
 ---
 
@@ -10,9 +10,10 @@ related: [onboarding, quickstart, canonical_config]
 
 ## 一句话结论
 
-多模态 v5 的 Solver/Oracle、数据契约、SFT 与 DPO 运行链路已经闭环；下一步只生成
-相互独立的 v5 train20/val20 做质量预检。当前不能复用任何 v3/v4 数据或 checkpoint，
-也不能直接进入 train500、5000 条数据或正式联合训练。
+多模态 v5 的 Solver/Oracle、数据契约、SFT 与 DPO 运行链路已经闭环；独立的 v5
+train20/val20 已生成并通过数据质量门。当前正在补齐 JSONL+BEV 内容 fingerprint，
+服务器回归和 metadata 回填通过后进入 Stage-I 质量预检。不能复用任何 v3/v4 数据、
+tiny runtime checkpoint，也不能直接进入 train500、5000 条数据或正式联合训练。
 
 ## 当前主线架构
 
@@ -57,6 +58,9 @@ Split projection head
 
 - schema、prompt、solver/channel revision、完整物理配置 fingerprint 已进入数据契约。
 - checkpoint 保存数据 provenance；主线拒绝旧数据、错物理配置或错 checkpoint。
+- Stage-I continuation 与 DPO 还校验实际 SFT/DPO JSONL 内容 fingerprint，防止相同
+  seed 下的 tiny runtime 数据和正式训练数据被误认为同一数据集；held-out evaluation
+  只要求物理/schema 一致，不要求内容相同。
 - SFT/DPO 的 scheduler、warmup、epoch/step 解析、梯度累积、学习率日志和 checkpoint
   轮转均按配置真实执行。
 - DPO 中间与最终 metadata 明确覆盖 Stage-I 的 progress 字段，不再继承旧步数。
@@ -71,6 +75,11 @@ Split projection head
 - v5 2-step SFT：语言 LoRA 272、视觉 LoRA 0；cosine、独立裁剪与保留上限生效。
 - v5 3-step DPO：loss 有限，无 NaN/Inf/OOM；只保留 step 3；最终 metadata 记录
   DPO 自身的 global/micro step 3/3。
+- v5 train20/val20：两者物理 fingerprint 一致、seed 独立，各有 20 组一一配对的
+  SFT/DPO/BEV；40/40 Oracle feasible，约束误差接近机器精度，DPO utility gap 全为正。
+- train20/val20 的 Q/A/P target 均有跨样本变化，association 无固定用户，inactive
+  communication power 为严格零；实际多模态 control-only 最大长度 2722/2713，3072
+  下无截断。
 
 ## 兼容性边界
 
@@ -93,9 +102,14 @@ runtime SFT：
 
 runtime DPO：
 /root/autodl-tmp/outputs/mm_oracle_v5_runtime_dpo3_metadata_fix
+
+质量门数据：
+/root/autodl-tmp/data/mm_oracle_v5_train20_seed42
+/root/autodl-tmp/data/mm_oracle_v5_val20_seed2026
 ```
 
-以上三个路径都不是正式模型资产。
+runtime 数据和 checkpoint 不是正式模型资产；train20/val20 是 Stage-I 预检数据，尚不
+是 train500/val100 正式训练集。
 
 ## 未完成问题
 
@@ -110,11 +124,12 @@ runtime DPO：
 
 ## 下一步（严格顺序）
 
-1. 生成独立 v5 `train20_seed42` 与 `val20_seed2026`，两者使用相同物理配置。
-2. 分别验证 schema/provenance、SFT/DPO/BEV 数量、Oracle feasibility、target 分布与
-   实际多模态序列长度。
-3. 先做小规模 Stage-I 质量预检并分别诊断 Q/A/P；runtime checkpoint 不作为初始化。
-4. 只有 train20/val20 的数据和质量门通过，才生成 v5 train500/val100。
+1. 在服务器回归内容 fingerprint 与 generator 快速返回路径。
+2. 为现有 train20/val20 metadata 回填 JSONL+BEV 内容 fingerprint，并确认两套数据
+   内容指纹不同、物理指纹相同。
+3. 从基础 Gemma 模型做小规模 Stage-I 质量预检并分别诊断 Q/A/P；runtime checkpoint
+   不作为初始化。
+4. 只有 train20/val20 的模型质量门通过，才生成 v5 train500/val100。
 5. 单分支有效后再做联合 SFT；联合 SFT 通过后才运行正式 multimodal DPO 和 solver
    评估。
 

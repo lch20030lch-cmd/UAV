@@ -6,6 +6,7 @@ from src.data.oracle_contract import (
     assert_resume_compatible,
     build_dataset_metadata,
     checkpoint_dataset_fields,
+    dataset_content_fingerprint,
     paired_record_state,
     simulation_fingerprint,
     validate_checkpoint_dataset_compatibility,
@@ -50,6 +51,59 @@ def _metadata(simulation=None):
 
 
 class OracleContractTest(unittest.TestCase):
+    def test_content_fingerprint_changes_with_actual_records(self):
+        with (
+            tempfile.TemporaryDirectory() as first_dir,
+            tempfile.TemporaryDirectory() as second_dir,
+        ):
+            first = Path(first_dir)
+            second = Path(second_dir)
+            for root, utility in ((first, 1.0), (second, 2.0)):
+                (root / "sft.jsonl").write_text(
+                    f'{{"id":"env_0","utility":{utility}}}\n',
+                    encoding="utf-8",
+                )
+                (root / "dpo.jsonl").write_text(
+                    '{"id":"env_0_dpo"}\n',
+                    encoding="utf-8",
+                )
+
+            self.assertNotEqual(
+                dataset_content_fingerprint(first, "sft.jsonl", "dpo.jsonl"),
+                dataset_content_fingerprint(second, "sft.jsonl", "dpo.jsonl"),
+            )
+
+    def test_content_fingerprint_includes_referenced_bev_images(self):
+        with (
+            tempfile.TemporaryDirectory() as first_dir,
+            tempfile.TemporaryDirectory() as second_dir,
+        ):
+            for root_text, image_bytes in (
+                (first_dir, b"first-image"),
+                (second_dir, b"second-image"),
+            ):
+                root = Path(root_text)
+                (root / "images").mkdir()
+                (root / "images" / "env_000000.png").write_bytes(image_bytes)
+                (root / "sft.jsonl").write_text(
+                    '{"id":"env_0","bev_image_path":'
+                    '"images/env_000000.png"}\n',
+                    encoding="utf-8",
+                )
+                (root / "dpo.jsonl").write_text(
+                    '{"id":"env_0_dpo"}\n',
+                    encoding="utf-8",
+                )
+
+            self.assertNotEqual(
+                dataset_content_fingerprint(
+                    Path(first_dir), "sft.jsonl", "dpo.jsonl"
+                ),
+                dataset_content_fingerprint(
+                    Path(second_dir), "sft.jsonl", "dpo.jsonl"
+                ),
+            )
+
     def test_fingerprint_is_stable_but_physics_sensitive(self):
         first = _simulation()
         reordered = dict(reversed(list(first.items())))
@@ -93,7 +147,17 @@ class OracleContractTest(unittest.TestCase):
                 expected_seed=42,
             )
 
+            tampered_metadata = dict(metadata, content_fingerprint="0" * 64)
+            with self.assertRaisesRegex(ValueError, "content fingerprint"):
+                validate_dataset_metadata(
+                    tampered_metadata,
+                    data_dir=root,
+                    expected_simulation=_simulation(),
+                    expected_seed=42,
+                )
+
         self.assertEqual(validated["num_sft_records"], 2)
+        self.assertEqual(len(validated["content_fingerprint"]), 64)
 
     def test_checkpoint_must_share_dataset_provenance(self):
         dataset = _metadata()
@@ -107,6 +171,46 @@ class OracleContractTest(unittest.TestCase):
             )
 
         validate_checkpoint_dataset_compatibility(checkpoint, dataset)
+
+    def test_training_checkpoint_requires_exact_dataset_content(self):
+        metadata = _metadata()
+        metadata.update({
+            "generation_complete": True,
+            "num_sft_records": 1,
+            "num_dpo_records": 1,
+        })
+        with (
+            tempfile.TemporaryDirectory() as first_dir,
+            tempfile.TemporaryDirectory() as second_dir,
+        ):
+            validated = []
+            for root_text, utility in ((first_dir, 1.0), (second_dir, 2.0)):
+                root = Path(root_text)
+                (root / "sft_dataset.jsonl").write_text(
+                    f'{{"id":"env_0","utility":{utility}}}\n',
+                    encoding="utf-8",
+                )
+                (root / "dpo_dataset.jsonl").write_text(
+                    '{"id":"env_0_dpo"}\n',
+                    encoding="utf-8",
+                )
+                validated.append(validate_dataset_metadata(metadata, data_dir=root))
+
+            checkpoint = checkpoint_dataset_fields(validated[0])
+            validate_checkpoint_dataset_compatibility(
+                checkpoint,
+                validated[0],
+                require_same_seed=True,
+            )
+            with self.assertRaisesRegex(ValueError, "dataset_content_fingerprint"):
+                validate_checkpoint_dataset_compatibility(
+                    checkpoint,
+                    validated[1],
+                    require_same_seed=True,
+                )
+
+            # Held-out evaluation intentionally shares physics, not records.
+            validate_checkpoint_dataset_compatibility(checkpoint, validated[1])
 
     def test_paired_records_recover_next_id_after_checkpoint_lag(self):
         with tempfile.TemporaryDirectory() as temp_dir:
