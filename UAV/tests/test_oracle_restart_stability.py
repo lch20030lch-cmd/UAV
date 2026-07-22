@@ -1,8 +1,10 @@
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
 from scripts.analyze_oracle_restart_stability import summarize_restart_set
+from src.data.oracle_generator import select_near_optimal_q_medoid
 
 
 class OracleRestartStabilityTest(unittest.TestCase):
@@ -41,6 +43,47 @@ class OracleRestartStabilityTest(unittest.TestCase):
 
         self.assertAlmostEqual(result["top_second_q_3d_cosine"], 0.0)
         self.assertTrue(result["near_equal_divergent"])
+
+
+class NearOptimalOracleSelectionTest(unittest.TestCase):
+    @staticmethod
+    def _solution(direction, utility):
+        q = np.asarray(direction, dtype=np.float64)[None, :]
+        return SimpleNamespace(Q=q, utility=float(utility))
+
+    def test_selects_real_consensus_candidate_within_utility_tolerance(self):
+        highest_utility_outlier = self._solution([15.0, 0.0, 0.0], 100.0)
+        consensus_first = self._solution([0.0, 15.0, 0.0], 99.8)
+        consensus_medoid = self._solution([1.5, 14.9248, 0.0], 99.7)
+
+        selected, diagnostics = select_near_optimal_q_medoid(
+            [highest_utility_outlier, consensus_first, consensus_medoid],
+            np.zeros((1, 3)),
+            utility_tolerance=0.01,
+        )
+
+        self.assertIs(selected, consensus_medoid)
+        self.assertEqual(diagnostics["oracle_chosen_candidate_rank"], 3)
+        self.assertEqual(diagnostics["oracle_near_optimal_candidate_count"], 3)
+        self.assertGreater(diagnostics["oracle_q_consensus_gain"], 0.0)
+        self.assertLessEqual(
+            diagnostics["oracle_chosen_relative_utility_gap"], 0.01
+        )
+
+    def test_excludes_candidates_outside_utility_tolerance(self):
+        best = self._solution([15.0, 0.0, 0.0], 100.0)
+        lower_consensus_first = self._solution([0.0, 15.0, 0.0], 98.0)
+        lower_consensus_second = self._solution([1.5, 14.9248, 0.0], 97.9)
+
+        selected, diagnostics = select_near_optimal_q_medoid(
+            [best, lower_consensus_first, lower_consensus_second],
+            np.zeros((1, 3)),
+            utility_tolerance=0.01,
+        )
+
+        self.assertIs(selected, best)
+        self.assertEqual(diagnostics["oracle_near_optimal_candidate_count"], 1)
+        self.assertEqual(diagnostics["oracle_chosen_candidate_rank"], 1)
 
 
 if __name__ == "__main__":

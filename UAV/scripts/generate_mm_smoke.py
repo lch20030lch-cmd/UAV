@@ -28,8 +28,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import numpy as np
 import yaml
 
-from src.data.oracle_generator import OracleDataGenerator
+from src.data.oracle_generator import (
+    OracleDataGenerator,
+    select_near_optimal_q_medoid,
+)
 from src.data.oracle_contract import (
+    DEFAULT_ORACLE_SELECTION_UTILITY_TOLERANCE,
+    ORACLE_SELECTION_MODE,
     PROMPT_TYPE,
     assert_resume_compatible,
     build_dataset_metadata,
@@ -169,7 +174,11 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
     if not candidates:
         return None, []
 
-    chosen_sol = candidates[0]
+    chosen_sol, selection_diagnostics = select_near_optimal_q_medoid(
+        candidates,
+        q_current,
+        generator.oracle_selection_utility_tolerance,
+    )
     delta_q, delta_a, delta_p = generator._extract_prior(chosen_sol, env_sample)
     response = format_oracle_response(sample_id, delta_q, delta_a, delta_p)
 
@@ -184,6 +193,7 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
         "solver_algorithm": chosen_sol.algorithm,
         "oracle_feasible": bool(chosen_sol.feasible),
         "constraint_violations": chosen_sol.constraint_violations,
+        **selection_diagnostics,
     }
 
     sft_sample = {
@@ -291,6 +301,13 @@ def main():
         image_size=image_size,
         sft_file=sft_path.name,
         dpo_file=dpo_path.name,
+        oracle_selection_mode=data_cfg.get(
+            "oracle_selection_mode", ORACLE_SELECTION_MODE
+        ),
+        oracle_selection_utility_tolerance=data_cfg.get(
+            "oracle_selection_utility_tolerance",
+            DEFAULT_ORACLE_SELECTION_UTILITY_TOLERANCE,
+        ),
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)

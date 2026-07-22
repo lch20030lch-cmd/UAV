@@ -24,7 +24,10 @@ import yaml
 from scripts.generate_mm_smoke import _build_solver
 from src.data.geometry_cues import CUE_NAMES, parse_q_geometry_cues
 from src.data.multimodal_dataset import validate_multimodal_oracle_contract
-from src.data.oracle_generator import OracleDataGenerator
+from src.data.oracle_generator import (
+    OracleDataGenerator,
+    select_near_optimal_q_medoid,
+)
 from src.env import ISACScenarioGenerator
 
 
@@ -189,8 +192,19 @@ def main():
             ),
         }
         if feasible_solutions:
+            candidates = generator._pareto_filter(feasible_solutions.copy())
+            selected_solution, selection_diagnostics = (
+                select_near_optimal_q_medoid(
+                    candidates,
+                    env_dict["q_current"],
+                    generator.oracle_selection_utility_tolerance,
+                )
+            )
+            reproduced_delta_q = generator._extract_prior(
+                selected_solution, environment
+            )[0]
+            row.update(selection_diagnostics)
             stored_delta_q = np.asarray(record["delta_q"], dtype=np.float64)
-            reproduced_delta_q = restart_delta_q[0]
             row["stored_vs_reproduced_q_cosine"] = float(
                 np.sum(_unit(stored_delta_q) * _unit(reproduced_delta_q), axis=-1).mean()
             )
@@ -216,6 +230,24 @@ def main():
         "restart_q_3d_cosine_mean": _mean(rows, "restart_q_3d_cosine_mean"),
         "restart_q_xy_cosine_mean": _mean(rows, "restart_q_xy_cosine_mean"),
         "restart_cue_agreement_mean": _mean(rows, "restart_cue_agreement_mean"),
+        "oracle_near_optimal_candidate_count_mean": _mean(
+            rows, "oracle_near_optimal_candidate_count"
+        ),
+        "oracle_chosen_candidate_rank_mean": _mean(
+            rows, "oracle_chosen_candidate_rank"
+        ),
+        "oracle_chosen_relative_utility_gap_mean": _mean(
+            rows, "oracle_chosen_relative_utility_gap"
+        ),
+        "oracle_chosen_q_consensus_cosine_mean": _mean(
+            rows, "oracle_chosen_q_consensus_cosine"
+        ),
+        "oracle_best_q_consensus_cosine_mean": _mean(
+            rows, "oracle_best_q_consensus_cosine"
+        ),
+        "oracle_q_consensus_gain_mean": _mean(
+            rows, "oracle_q_consensus_gain"
+        ),
         "near_equal_divergent_environment_ratio": float(
             np.mean([row["near_equal_divergent"] for row in rows])
         ) if rows else 0.0,

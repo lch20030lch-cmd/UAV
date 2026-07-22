@@ -7,7 +7,7 @@ Oracle 数据生成器
   2. 构造 prompt Π^(i)
   3. 运行 N 次 SCA-FP (随机初始点)
   4. 按效用排序 u_π(1) ≥ u_π(2) ≥ ... ≥ u_π(N)
-  5. 最优解 → D_SFT (监督信号)
+  5. 近最优 Q 方向 medoid → D_SFT (监督信号)
   6. 偏好对 (满足 u_diff > Δ_min) → D_DPO
   7. 提取 prior: Ξ(Ω*) → δ = (δ_q, δ_a, δ_p)
 
@@ -24,7 +24,114 @@ from tqdm import tqdm
 
 from ..env import ISACScenarioGenerator, EnvironmentSample
 from ..solver.sca_fp import SCAFPOptimizer, SCAFPSolution
+from .oracle_contract import (
+    DEFAULT_ORACLE_SELECTION_UTILITY_TOLERANCE,
+    ORACLE_SELECTION_MODE,
+)
 from .prompt_builder import build_full_prompt, format_oracle_response
+
+
+def select_near_optimal_q_medoid(
+    solutions: List[SCAFPSolution],
+    q_current: np.ndarray,
+    utility_tolerance: float = DEFAULT_ORACLE_SELECTION_UTILITY_TOLERANCE,
+) -> Tuple[SCAFPSolution, Dict]:
+    """Choose a real near-optimal solution with a consensus Q direction.
+
+    Random restarts can converge to different Q directions with almost equal
+    utility.  Selecting the numerically highest utility then turns a tiny
+    optimizer fluctuation into a hard label change.  This selector first keeps
+    candidates within ``utility_tolerance`` of the best utility, then returns
+    the candidate whose per-UAV 3-D movement direction has the highest mean
+    cosine to the other near-optimal candidates.  It never averages solution
+    tensors, so the selected Q/A/P tuple remains an actual feasible solver
+    output.
+    """
+    if not solutions:
+        raise ValueError("cannot select an Oracle target from no solutions")
+    utility_tolerance = float(utility_tolerance)
+    if not 0.0 <= utility_tolerance < 1.0:
+        raise ValueError("utility_tolerance must be in [0, 1)")
+
+    q_current = np.asarray(q_current, dtype=np.float64)
+    utilities = np.asarray(
+        [solution.utility for solution in solutions], dtype=np.float64
+    )
+    if not np.isfinite(utilities).all():
+        raise ValueError("Oracle selection candidates must have finite utility")
+
+    best_index = int(np.argmax(utilities))
+    best_utility = float(utilities[best_index])
+    utility_scale = max(1.0, abs(best_utility))
+    threshold = best_utility - utility_tolerance * utility_scale
+    eligible_indices = [
+        index
+        for index, utility in enumerate(utilities)
+        if float(utility) >= threshold
+    ]
+
+    deltas = []
+    for index in eligible_indices:
+        q_candidate = np.asarray(solutions[index].Q, dtype=np.float64)
+        if q_candidate.shape != q_current.shape:
+            raise ValueError(
+                "Oracle candidate Q shape does not match q_current: "
+                f"{q_candidate.shape} != {q_current.shape}"
+            )
+        deltas.append(q_candidate - q_current)
+    delta_q = np.stack(deltas)
+    norms = np.linalg.norm(delta_q, axis=-1, keepdims=True)
+    directions = np.divide(
+        delta_q,
+        np.maximum(norms, 1e-12),
+        out=np.zeros_like(delta_q),
+        where=norms > 1e-12,
+    )
+
+    if len(eligible_indices) == 1:
+        consensus_scores = np.ones(1, dtype=np.float64)
+    else:
+        pairwise = np.einsum("imd,jmd->ijm", directions, directions).mean(axis=-1)
+        consensus_scores = (
+            pairwise.sum(axis=1) - np.diag(pairwise)
+        ) / (len(eligible_indices) - 1)
+
+    # Prefer consensus first, then utility, then the original deterministic
+    # candidate order.  The last key makes exact ties reproducible.
+    selected_local_index = max(
+        range(len(eligible_indices)),
+        key=lambda local_index: (
+            float(consensus_scores[local_index]),
+            float(utilities[eligible_indices[local_index]]),
+            -eligible_indices[local_index],
+        ),
+    )
+    selected_index = eligible_indices[selected_local_index]
+    best_local_index = eligible_indices.index(best_index)
+    utility_ranking = sorted(
+        range(len(solutions)),
+        key=lambda index: (-float(utilities[index]), index),
+    )
+    selected_rank = utility_ranking.index(selected_index) + 1
+    diagnostics = {
+        "oracle_selection_mode": ORACLE_SELECTION_MODE,
+        "oracle_near_optimal_candidate_count": len(eligible_indices),
+        "oracle_chosen_candidate_rank": selected_rank,
+        "oracle_chosen_relative_utility_gap": float(
+            (best_utility - float(utilities[selected_index])) / utility_scale
+        ),
+        "oracle_chosen_q_consensus_cosine": float(
+            consensus_scores[selected_local_index]
+        ),
+        "oracle_best_q_consensus_cosine": float(
+            consensus_scores[best_local_index]
+        ),
+        "oracle_q_consensus_gain": float(
+            consensus_scores[selected_local_index]
+            - consensus_scores[best_local_index]
+        ),
+    }
+    return solutions[selected_index], diagnostics
 
 
 class OracleDataGenerator:
@@ -32,7 +139,7 @@ class OracleDataGenerator:
     Best-of-N 数据生成器 (Algorithm 1)
 
     生成:
-      - SFT 数据集: (Π, δ_best)
+      - SFT 数据集: (Π, δ_near-optimal-medoid)
       - DPO 数据集: (Π, δ_winner, δ_loser)
     """
 
@@ -51,6 +158,22 @@ class OracleDataGenerator:
         self.num_environments = config.get("num_environments", 20000)
         self.pair_margin_rho = config.get("pair_margin_rho", 0.2)
         self.min_pairs = config.get("dpo_min_pairs_per_sample", 2)
+        self.oracle_selection_mode = config.get(
+            "oracle_selection_mode", ORACLE_SELECTION_MODE
+        )
+        if self.oracle_selection_mode != ORACLE_SELECTION_MODE:
+            raise ValueError(
+                "unsupported Oracle selection mode: "
+                f"{self.oracle_selection_mode!r}"
+            )
+        self.oracle_selection_utility_tolerance = float(config.get(
+            "oracle_selection_utility_tolerance",
+            DEFAULT_ORACLE_SELECTION_UTILITY_TOLERANCE,
+        ))
+        if not 0.0 <= self.oracle_selection_utility_tolerance < 1.0:
+            raise ValueError(
+                "oracle_selection_utility_tolerance must be in [0, 1)"
+            )
 
         # ── 微扰回弹测试参数 ──
         self.snapback_epsilon = config.get("snapback_epsilon", 1.5)        # 微扰幅度 (m)
@@ -143,8 +266,13 @@ class OracleDataGenerator:
         if len(candidates) < 1:
             return None, []
 
-        # Step 4: 选 Chosen (15m 墙下 snapback 无区分度 → 直取效用最高)
-        chosen_sol = candidates[0]
+        # Step 4: select a real near-optimal Q/A/P tuple with the most
+        # representative Q direction across restart-local optima.
+        chosen_sol, selection_diagnostics = select_near_optimal_q_medoid(
+            candidates,
+            q_current,
+            self.oracle_selection_utility_tolerance,
+        )
         # Extract the exact chosen tuple before constructing/evaluating the
         # rejected Q-only preference sample.
         delta_q_chosen, delta_a_chosen, delta_p_chosen = self._extract_prior(
@@ -181,6 +309,7 @@ class OracleDataGenerator:
             "solver_algorithm": chosen_sol.algorithm,
             "oracle_feasible": bool(chosen_sol.feasible),
             "constraint_violations": chosen_sol.constraint_violations,
+            **selection_diagnostics,
         }
 
         # DPO 样本 — 单个对: Chosen vs Rejected
@@ -212,6 +341,7 @@ class OracleDataGenerator:
                 "delta_q": delta_q_chosen.tolist(),
                 "delta_a": delta_a_chosen.tolist(),
                 "delta_p": delta_p_chosen.tolist(),
+                **selection_diagnostics,
             }
 
         dpo_samples = [dpo_sample] if dpo_sample is not None else []

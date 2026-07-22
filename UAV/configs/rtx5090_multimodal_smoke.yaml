@@ -117,6 +117,11 @@ simulation:
 data:
   num_environments: 20
   num_restarts: 3
+  # Multiple feasible restarts can have almost identical utility but different
+  # Q directions. Keep a real solution within 1% of the best utility and use
+  # the Q-direction medoid as the canonical Oracle target.
+  oracle_selection_mode: "near_optimal_q_medoid"
+  oracle_selection_utility_tolerance: 0.01
   pair_margin_rho: 0.2
   dpo_min_pairs_per_sample: 1
   image_size: 224

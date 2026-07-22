@@ -17,8 +17,10 @@ from typing import Dict, Mapping, Optional
 SCHEMA_VERSION = 5
 PROMPT_TYPE = "multimodal_bev_image_v5_constraint_aware"
 SOLVER_ALGORITHM = "constraint_aware_alternating_optimization"
-SOLVER_REVISION = 1
+SOLVER_REVISION = 2
 CHANNEL_MODEL = "elevation_los_3gpp_pathloss_v2"
+ORACLE_SELECTION_MODE = "near_optimal_q_medoid"
+DEFAULT_ORACLE_SELECTION_UTILITY_TOLERANCE = 0.01
 
 SIMULATION_KEYS = (
     "area_size",
@@ -47,6 +49,8 @@ IMMUTABLE_DATASET_FIELDS = (
     "prompt_type",
     "solver_algorithm",
     "solver_revision",
+    "oracle_selection_mode",
+    "oracle_selection_utility_tolerance",
     "channel_model",
     "simulation_fingerprint",
     "seed",
@@ -149,7 +153,21 @@ def build_dataset_metadata(
     image_size: int,
     sft_file: str,
     dpo_file: str,
+    oracle_selection_mode: str = ORACLE_SELECTION_MODE,
+    oracle_selection_utility_tolerance: float = (
+        DEFAULT_ORACLE_SELECTION_UTILITY_TOLERANCE
+    ),
 ) -> Dict:
+    if oracle_selection_mode != ORACLE_SELECTION_MODE:
+        raise ValueError(
+            "unsupported Oracle selection mode: "
+            f"{oracle_selection_mode!r}"
+        )
+    utility_tolerance = float(oracle_selection_utility_tolerance)
+    if not 0.0 <= utility_tolerance < 1.0:
+        raise ValueError(
+            "oracle_selection_utility_tolerance must be in [0, 1)"
+        )
     canonical = canonical_simulation_config(simulation)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -162,6 +180,8 @@ def build_dataset_metadata(
         "dpo_file": str(dpo_file),
         "solver_algorithm": SOLVER_ALGORITHM,
         "solver_revision": SOLVER_REVISION,
+        "oracle_selection_mode": oracle_selection_mode,
+        "oracle_selection_utility_tolerance": utility_tolerance,
         "channel_model": CHANNEL_MODEL,
         "simulation": canonical,
         "simulation_fingerprint": simulation_fingerprint(canonical),
@@ -237,6 +257,7 @@ def validate_dataset_metadata(
         "prompt_type": PROMPT_TYPE,
         "solver_algorithm": SOLVER_ALGORITHM,
         "solver_revision": SOLVER_REVISION,
+        "oracle_selection_mode": ORACLE_SELECTION_MODE,
         "channel_model": CHANNEL_MODEL,
         "requires_oracle_feasible": True,
         "generation_complete": True,
@@ -246,6 +267,17 @@ def validate_dataset_metadata(
         for key, expected in required.items()
         if metadata.get(key) != expected
     }
+    try:
+        utility_tolerance = float(
+            metadata["oracle_selection_utility_tolerance"]
+        )
+    except (KeyError, TypeError, ValueError):
+        utility_tolerance = -1.0
+    if not 0.0 <= utility_tolerance < 1.0:
+        mismatches["oracle_selection_utility_tolerance"] = (
+            metadata.get("oracle_selection_utility_tolerance"),
+            "a number in [0, 1)",
+        )
     if expected_simulation is not None:
         expected_fingerprint = simulation_fingerprint(expected_simulation)
         if metadata.get("simulation_fingerprint") != expected_fingerprint:
@@ -305,6 +337,8 @@ def checkpoint_dataset_fields(dataset_metadata: Mapping) -> Dict:
             "prompt_type",
             "solver_algorithm",
             "solver_revision",
+            "oracle_selection_mode",
+            "oracle_selection_utility_tolerance",
             "channel_model",
             "simulation_fingerprint",
             "seed",

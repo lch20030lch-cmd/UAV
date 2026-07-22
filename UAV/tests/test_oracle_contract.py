@@ -123,6 +123,25 @@ class OracleContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "simulation_fingerprint"):
             assert_resume_compatible(existing, changed)
 
+    def test_contract_records_oracle_consensus_selection(self):
+        metadata = _metadata()
+
+        self.assertEqual(metadata["solver_revision"], 2)
+        self.assertEqual(
+            metadata["oracle_selection_mode"], "near_optimal_q_medoid"
+        )
+        self.assertEqual(
+            metadata["oracle_selection_utility_tolerance"], 0.01
+        )
+
+        changed = dict(
+            metadata, oracle_selection_utility_tolerance=0.02
+        )
+        with self.assertRaisesRegex(
+            ValueError, "oracle_selection_utility_tolerance"
+        ):
+            assert_resume_compatible(metadata, changed)
+
     def test_complete_contract_checks_actual_paired_record_counts(self):
         metadata = _metadata()
         metadata.update({
