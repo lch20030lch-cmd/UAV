@@ -48,6 +48,29 @@ class UAVISACLosses:
         dpo_beta: float = 0.1,
         sft_anchor_mu: float = 0.05,
     ):
+        weights = {
+            "lambda_ctl": lambda_ctl,
+            "lambda_q": lambda_q,
+            "lambda_a": lambda_a,
+            "lambda_p": lambda_p,
+            "lambda_sep": lambda_sep,
+            "lambda_assoc_ce": lambda_assoc_ce,
+            "lambda_assoc_raw_ce": lambda_assoc_raw_ce,
+            "lambda_q_dir": lambda_q_dir,
+            "lambda_q_projected_dir": lambda_q_projected_dir,
+            "lambda_q_cue_ce": lambda_q_cue_ce,
+            "lambda_p_raw_kl": lambda_p_raw_kl,
+            "sft_anchor_mu": sft_anchor_mu,
+        }
+        negative = {
+            name: float(value)
+            for name, value in weights.items()
+            if float(value) < 0.0
+        }
+        if negative:
+            raise ValueError(f"loss weights must be non-negative: {negative}")
+        if float(dpo_beta) <= 0.0:
+            raise ValueError("dpo_beta must be positive")
         self.lambda_ctl = lambda_ctl
         self.lambda_q = lambda_q
         self.lambda_a = lambda_a
@@ -139,7 +162,19 @@ class UAVISACLosses:
         cosine = torch.sum(cue_dir * target_dir.unsqueeze(2), dim=-1)
         if q_geometry_mask is not None:
             mask = q_geometry_mask.to(device=logits.device, dtype=torch.bool)
+            if tuple(mask.shape) != tuple(logits.shape):
+                raise ValueError(
+                    "q_geometry_mask must align with q_cue_logits: "
+                    f"{tuple(mask.shape)} != {tuple(logits.shape)}"
+                )
+            if not torch.all(mask.any(dim=-1)):
+                raise ValueError(
+                    "each UAV must have at least one valid q geometry cue"
+                )
             cosine = cosine.masked_fill(~mask, -1e4)
+            logits = logits.masked_fill(
+                ~mask, torch.finfo(logits.dtype).min
+            )
         target_idx = torch.argmax(cosine, dim=-1)
         return F.cross_entropy(
             logits.reshape(-1, logits.shape[-1]),
@@ -280,7 +315,10 @@ class UAVISACLosses:
             if self.lambda_assoc_ce != 0
             else da_hat.new_tensor(0.0)
         )
-        if "delta_a_raw" in delta_hat:
+        if (
+            "delta_a_raw" in delta_hat
+            and self.lambda_assoc_raw_ce != 0
+        ):
             da_raw = delta_hat["delta_a_raw"].to(dtype=common_dtype)
             loss_a_raw_ce = self.compute_association_raw_ce_loss(da_raw, da_tgt)
         else:
@@ -375,8 +413,8 @@ class UAVISACLosses:
         total_penalty = 0.0
         for m in range(M):
             for mp in range(m + 1, M):
-                diff = q_hat[:, m, :2] - q_hat[:, mp, :2]  # (B, 2) — 仅水平
-                dist = torch.norm(diff, dim=-1)             # (B,)
+                diff = q_hat[:, m, :] - q_hat[:, mp, :]
+                dist = torch.norm(diff, dim=-1)
                 penalty = F.relu(d_min - dist) ** 2         # (B,)
                 total_penalty += penalty.mean()
 
@@ -481,10 +519,17 @@ class UAVISACLosses:
             return_components=True,
         )
         total = lambda_ctl * loss_ctl
+        loss_sep = total.new_zeros(())
+        q_current = delta_target.get("q_current")
+        if self.lambda_sep > 0.0 and q_current is not None:
+            q_absolute = q_current + delta_hat["delta_q"]
+            loss_sep = self.compute_separation_penalty(q_absolute)
+            total = total + loss_sep
 
         metrics = {
             "loss_ctl": loss_ctl.item(),
             "loss_total": total.item(),
+            "loss_sep": loss_sep.item(),
             "phase": "phase1",
             "loss_q": ctl_parts["loss_q"].item(),
             "loss_a_bce": ctl_parts["loss_a_bce"].item(),

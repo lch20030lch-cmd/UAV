@@ -21,6 +21,7 @@ class IndexedAssociationPromptTest(unittest.TestCase):
                 dtype=np.float32,
             ),
             s_positions=np.array([[50.0, 50.0]], dtype=np.float32),
+            target_detected=np.array([True]),
             association=np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
             user_weights=np.array([1.25, 0.75], dtype=np.float32),
             channel_gains_users=np.array(

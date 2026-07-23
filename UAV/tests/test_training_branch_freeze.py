@@ -3,10 +3,12 @@ import unittest
 import torch
 import torch.nn as nn
 
+from src.model.gemma_multimodal_isac import keep_vision_modules_in_eval_mode
 from src.training.train_sft_mm import (
     _backward_accumulated_loss,
     _clip_projection_and_lora_gradients,
     _freeze_projection_except,
+    _isolate_loss_weights,
     _is_accumulation_boundary,
     _resolve_gradient_accumulation_steps,
 )
@@ -32,6 +34,19 @@ class _DummyModel(nn.Module):
 
 
 class ProjectionBranchFreezeTest(unittest.TestCase):
+    def test_frozen_vision_modules_remain_in_eval_mode(self):
+        model = nn.Module()
+        model.language_model = nn.Sequential(nn.Dropout(0.5))
+        model.vision_tower = nn.Sequential(nn.Dropout(0.5))
+        model.train()
+
+        frozen = keep_vision_modules_in_eval_mode(model)
+
+        self.assertTrue(model.language_model.training)
+        self.assertFalse(model.vision_tower.training)
+        self.assertFalse(model.vision_tower[0].training)
+        self.assertIn("vision_tower", frozen)
+
     def test_qp_freeze_includes_fixed_geometry_residual_adapter(self):
         model = _DummyModel()
 
@@ -136,6 +151,83 @@ class ProjectionBranchFreezeTest(unittest.TestCase):
         self.assertEqual(actual_trainable, expected_trainable)
         self.assertEqual(set(trainable), expected_trainable)
         self.assertTrue(set(frozen).isdisjoint(expected_trainable))
+
+    def test_association_isolation_disables_shared_q_and_p_losses(self):
+        weights = {
+            "lambda_q": 1.0,
+            "lambda_a": 2.0,
+            "lambda_p": 3.0,
+            "lambda_sep": 4.0,
+            "lambda_assoc_ce": 5.0,
+            "lambda_assoc_raw_ce": 6.0,
+            "lambda_q_dir": 7.0,
+            "lambda_q_projected_dir": 8.0,
+            "lambda_q_cue_ce": 9.0,
+            "lambda_p_raw_kl": 10.0,
+        }
+
+        isolated = _isolate_loss_weights("association", weights)
+
+        self.assertEqual(isolated["lambda_a"], 2.0)
+        self.assertEqual(isolated["lambda_assoc_ce"], 5.0)
+        self.assertEqual(isolated["lambda_assoc_raw_ce"], 6.0)
+        for key in (
+            "lambda_q",
+            "lambda_p",
+            "lambda_sep",
+            "lambda_q_dir",
+            "lambda_q_projected_dir",
+            "lambda_q_cue_ce",
+            "lambda_p_raw_kl",
+        ):
+            self.assertEqual(isolated[key], 0.0)
+
+    def test_q_isolation_disables_association_and_power_losses(self):
+        isolated = _isolate_loss_weights(
+            "q",
+            {
+                "lambda_q": 1.0,
+                "lambda_a": 1.0,
+                "lambda_p": 1.0,
+                "lambda_sep": 1.0,
+                "lambda_assoc_ce": 1.0,
+                "lambda_assoc_raw_ce": 1.0,
+                "lambda_q_dir": 1.0,
+                "lambda_q_projected_dir": 1.0,
+                "lambda_q_cue_ce": 1.0,
+                "lambda_p_raw_kl": 1.0,
+            },
+        )
+
+        self.assertEqual(isolated["lambda_q_dir"], 1.0)
+        self.assertEqual(isolated["lambda_sep"], 1.0)
+        self.assertEqual(isolated["lambda_a"], 0.0)
+        self.assertEqual(isolated["lambda_p"], 0.0)
+        self.assertEqual(isolated["lambda_assoc_raw_ce"], 0.0)
+        self.assertEqual(isolated["lambda_p_raw_kl"], 0.0)
+
+    def test_frozen_association_branch_disables_a_losses(self):
+        isolated = _isolate_loss_weights(
+            "q_power",
+            {
+                "lambda_q": 1.0,
+                "lambda_a": 2.0,
+                "lambda_p": 3.0,
+                "lambda_sep": 4.0,
+                "lambda_assoc_ce": 5.0,
+                "lambda_assoc_raw_ce": 6.0,
+                "lambda_q_dir": 7.0,
+                "lambda_q_projected_dir": 8.0,
+                "lambda_q_cue_ce": 9.0,
+                "lambda_p_raw_kl": 10.0,
+            },
+        )
+
+        self.assertEqual(isolated["lambda_a"], 0.0)
+        self.assertEqual(isolated["lambda_assoc_ce"], 0.0)
+        self.assertEqual(isolated["lambda_assoc_raw_ce"], 0.0)
+        self.assertEqual(isolated["lambda_q_dir"], 7.0)
+        self.assertEqual(isolated["lambda_p_raw_kl"], 10.0)
 
 
 if __name__ == "__main__":

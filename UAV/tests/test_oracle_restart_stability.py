@@ -23,6 +23,8 @@ class OracleRestartStabilityTest(unittest.TestCase):
         result = summarize_restart_set(
             np.array([10.0, 9.0, 8.0]),
             np.stack([delta, delta, delta]),
+            np.ones((3, 1, 2)),
+            np.ones((3, 1, 3)),
             self.cues,
             self.mask,
         )
@@ -37,12 +39,39 @@ class OracleRestartStabilityTest(unittest.TestCase):
         result = summarize_restart_set(
             np.array([10.0, 9.95]),
             np.stack([first, second]),
+            np.ones((2, 1, 2)),
+            np.ones((2, 1, 3)),
             self.cues,
             self.mask,
         )
 
         self.assertAlmostEqual(result["top_second_q_3d_cosine"], 0.0)
         self.assertTrue(result["near_equal_divergent"])
+
+    def test_far_suboptimal_outlier_does_not_poison_near_optimal_metrics(self):
+        consensus = np.array(
+            [[15.0, 0.0, 0.0], [15.0, 0.0, 0.0]]
+        )
+        outlier = np.array(
+            [[0.0, 15.0, 0.0], [0.0, 15.0, 0.0]]
+        )
+        result = summarize_restart_set(
+            np.array([10.0, 9.95, 1.0]),
+            np.stack([consensus, consensus, outlier]),
+            np.ones((3, 1, 2)),
+            np.ones((3, 1, 3)),
+            self.cues,
+            self.mask,
+            utility_tolerance=0.01,
+        )
+
+        self.assertLess(result["restart_q_3d_cosine_mean"], 1.0)
+        self.assertAlmostEqual(
+            result["near_optimal_q_3d_cosine_mean"], 1.0
+        )
+        self.assertAlmostEqual(
+            result["near_optimal_cue_agreement_mean"], 1.0
+        )
 
 
 class NearOptimalOracleSelectionTest(unittest.TestCase):

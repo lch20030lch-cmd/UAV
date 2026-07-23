@@ -19,6 +19,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import numpy as np
 import yaml
 
+from src.data.multimodal_dataset import validate_multimodal_oracle_contract
+
 
 def _load_jsonl(path: Path) -> List[Dict]:
     records = []
@@ -287,6 +289,7 @@ def main():
     )
     parser.add_argument("--reference_sft_file", type=str, default=None)
     parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--allow_legacy_dataset", action="store_true")
     args = parser.parse_args()
 
     with (PROJECT_ROOT / args.config).open("r", encoding="utf-8") as f:
@@ -294,7 +297,17 @@ def main():
 
     data_cfg = cfg["data"]
     data_dir = Path(args.data_dir or data_cfg["output_dir"])
-    data_path = data_dir / (args.sft_file or data_cfg.get("sft_file", "sft_dataset.jsonl"))
+    dataset_metadata = validate_multimodal_oracle_contract(
+        data_dir,
+        allow_legacy=args.allow_legacy_dataset,
+        expected_simulation=cfg["simulation"],
+    )
+    data_path = data_dir / (
+        args.sft_file
+        or dataset_metadata.get(
+            "sft_file", data_cfg.get("sft_file", "sft_dataset.jsonl")
+        )
+    )
     records = _load_jsonl(data_path)
     targets = _load_targets(records)
 

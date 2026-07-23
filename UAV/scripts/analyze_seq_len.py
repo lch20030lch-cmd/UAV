@@ -34,6 +34,7 @@ from src.data.multimodal_dataset import (
     _encode_text_image,
     format_multimodal_user_prompt,
     resolve_multimodal_chat_template,
+    validate_multimodal_oracle_contract,
 )
 
 
@@ -44,6 +45,7 @@ def analyze(
     num_control_tokens: int = 8,
     current_max_length: int = 4096,
     use_chat_template: bool = None,
+    allow_legacy_dataset: bool = False,
 ):
     # ---- 加载数据 ----
     print(f"Loading dataset from {data_path}...")
@@ -79,11 +81,9 @@ def analyze(
     response_lengths = []
 
     data_root = Path(data_path).resolve().parent
-    metadata_path = data_root / "dataset_metadata.json"
-    dataset_metadata = (
-        json.loads(metadata_path.read_text(encoding="utf-8"))
-        if metadata_path.exists()
-        else {}
+    dataset_metadata = validate_multimodal_oracle_contract(
+        data_root,
+        allow_legacy=allow_legacy_dataset,
     )
     use_chat_template_value = resolve_multimodal_chat_template(
         dataset_metadata=dataset_metadata,
@@ -212,9 +212,17 @@ if __name__ == "__main__":
         default=None,
         help="override formatting; schema-v5 data defaults to the Gemma chat template",
     )
+    parser.add_argument("--allow-legacy-dataset", action="store_true")
     args = parser.parse_args()
 
-    data_path = os.path.join(args.data_dir, "sft_dataset.jsonl")
+    dataset_metadata = validate_multimodal_oracle_contract(
+        args.data_dir,
+        allow_legacy=args.allow_legacy_dataset,
+    )
+    data_path = os.path.join(
+        args.data_dir,
+        dataset_metadata.get("sft_file", "sft_dataset.jsonl"),
+    )
     if not os.path.exists(data_path):
         print(f"ERROR: {data_path} not found!")
         sys.exit(1)
@@ -226,4 +234,5 @@ if __name__ == "__main__":
         num_control_tokens=args.num_control_tokens,
         current_max_length=args.current_max_length,
         use_chat_template=args.use_chat_template,
+        allow_legacy_dataset=args.allow_legacy_dataset,
     )

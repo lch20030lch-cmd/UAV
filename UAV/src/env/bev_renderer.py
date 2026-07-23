@@ -162,14 +162,17 @@ def render_bev_image(
                 )
 
         # 紧凑感知几何线: 每架 UAV 只指向最近目标。
-        if targets.size > 0:
+        visible_targets = targets[detected]
+        if visible_targets.size > 0:
             for m in range(q.shape[0]):
                 q_xy = q[m, :2]
-                d_target = np.linalg.norm(targets - q_xy[None, :], axis=1)
+                d_target = np.linalg.norm(
+                    visible_targets - q_xy[None, :], axis=1
+                )
                 nearest_t = int(np.argmin(d_target))
                 ax.plot(
-                    [q[m, 0], targets[nearest_t, 0]],
-                    [q[m, 1], targets[nearest_t, 1]],
+                    [q[m, 0], visible_targets[nearest_t, 0]],
+                    [q[m, 1], visible_targets[nearest_t, 1]],
                     color="#f97316",
                     linewidth=0.8,
                     alpha=0.48,
@@ -212,7 +215,6 @@ def render_bev_image(
 
     if targets.size > 0:
         visible_targets = targets[detected]
-        hidden_targets = targets[~detected]
         if visible_targets.size > 0:
             ax.scatter(
                 visible_targets[:, 0],
@@ -223,17 +225,6 @@ def render_bev_image(
                 edgecolors="white",
                 linewidths=0.45,
                 alpha=0.95,
-                zorder=4,
-            )
-        if hidden_targets.size > 0:
-            ax.scatter(
-                hidden_targets[:, 0],
-                hidden_targets[:, 1],
-                s=34,
-                marker="x",
-                c="#991b1b",
-                linewidths=1.0,
-                alpha=0.45,
                 zorder=4,
             )
 
@@ -274,6 +265,7 @@ def render_bev_sample(
         q_positions=env_sample.q_current,
         user_positions=env_sample.u_positions,
         target_positions=env_sample.s_positions,
+        target_detected=env_sample.target_detected,
         association=env_sample.association,
         user_weights=env_sample.user_weights,
         channel_gains_users=env_sample.channel_gains_users,

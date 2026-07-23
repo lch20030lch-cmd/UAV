@@ -22,8 +22,10 @@ from src.data.multimodal_dataset import (
     validate_multimodal_oracle_contract,
 )
 from src.data.oracle_contract import validate_checkpoint_dataset_compatibility
-from src.env import ISACScenarioGenerator
-from src.solver import SCAFPConfig, SCAFPOptimizer
+from src.data.oracle_runtime import (
+    build_oracle_scenario,
+    build_oracle_solver,
+)
 from src.training.train_dpo_mm import _checkpoint_metadata, _load_model
 
 
@@ -58,16 +60,26 @@ def _solution_metrics(solver, solution, env):
         * solver.N_r
         / solver.N0
     )
-    best_uav = np.argmax(sensing_sinr, axis=0)
-    best_sinr = sensing_sinr[best_uav, np.arange(solver.T)]
-    crbs = [
-        solver.channel.compute_crb(
-            solution.Q[best_uav[target_idx]],
-            env["target_positions"][target_idx],
-            best_sinr[target_idx],
-        )
-        for target_idx in range(solver.T)
-    ]
+    detected_indices = np.flatnonzero(
+        np.asarray(env["target_detected"], dtype=bool)
+    )
+    if detected_indices.size:
+        visible_sinr = sensing_sinr[:, detected_indices]
+        best_uav = np.argmax(visible_sinr, axis=0)
+        best_sinr = visible_sinr[
+            best_uav, np.arange(detected_indices.size)
+        ]
+        crbs = [
+            solver.channel.compute_crb(
+                solution.Q[best_uav[visible_index]],
+                env["target_positions"][target_index],
+                best_sinr[visible_index],
+            )
+            for visible_index, target_index in enumerate(detected_indices)
+        ]
+    else:
+        best_sinr = np.empty(0, dtype=np.float64)
+        crbs = []
     return {
         "utility": float(solution.utility),
         "raw_utility": float(solution.raw_utility),
@@ -76,15 +88,19 @@ def _solution_metrics(solver, solution, env):
         "solve_time": float(solution.solve_time),
         "feasible": float(solution.feasible),
         "sum_rate_mbps": sum_rate_mbps,
-        "mean_sensing_sinr_db": float(
-            np.mean(10.0 * np.log10(best_sinr + 1e-12))
+        "mean_sensing_sinr_db": (
+            float(np.mean(10.0 * np.log10(best_sinr + 1e-12)))
+            if best_sinr.size
+            else 0.0
         ),
-        "mean_crb": float(np.mean(crbs)),
+        "mean_crb": float(np.mean(crbs)) if crbs else 0.0,
         "communication_satisfaction": float(
-            np.mean(comm_sinr[active] >= solver.cfg.sinr_c_min)
+            np.mean(comm_sinr[active] >= solver.comm_sinr_min)
         ),
-        "sensing_satisfaction": float(
-            np.mean(best_sinr >= solver.cfg.sinr_s_min)
+        "sensing_satisfaction": (
+            float(np.mean(best_sinr >= solver.cfg.sinr_s_min))
+            if best_sinr.size
+            else 1.0
         ),
         "constraint_violations": solution.constraint_violations,
     }
@@ -110,7 +126,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/rtx5090_multimodal_smoke.yaml")
     parser.add_argument("--data_dir", required=True)
-    parser.add_argument("--data_seed", type=int, required=True)
+    parser.add_argument(
+        "--data_seed",
+        type=int,
+        default=None,
+        help=(
+            "optional assertion; the evaluator normally uses the sealed "
+            "dataset seed from dataset_metadata.json"
+        ),
+    )
     parser.add_argument("--model", default=None)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--num_samples", type=int, default=100)
@@ -131,12 +155,23 @@ def main():
         expected_simulation=cfg["simulation"],
         expected_seed=args.data_seed,
     )
+    if not dataset_metadata:
+        if args.data_seed is None:
+            raise ValueError(
+                "--data_seed is required only for an explicitly allowed "
+                "legacy dataset without sealed metadata"
+            )
+        data_seed = int(args.data_seed)
+    else:
+        data_seed = int(dataset_metadata["seed"])
     if not args.allow_legacy_dataset:
         validate_checkpoint_dataset_compatibility(
             _checkpoint_metadata(checkpoint_dir), dataset_metadata
         )
     model, metadata = _load_model(cfg, checkpoint_dir, trainable=False)
-    data_path = data_root / cfg["data"].get("sft_file", "sft_dataset.jsonl")
+    data_path = data_root / dataset_metadata.get(
+        "sft_file", cfg["data"].get("sft_file", "sft_dataset.jsonl")
+    )
     use_chat_template = resolve_multimodal_chat_template(
         dataset_metadata=dataset_metadata,
         checkpoint_metadata=metadata,
@@ -154,43 +189,8 @@ def main():
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
 
     sim = cfg["simulation"]
-    scenario = ISACScenarioGenerator(
-        num_uavs=sim["num_uavs"],
-        num_users=sim["num_users"],
-        num_targets=sim["num_targets"],
-        area_size=tuple(sim["area_size"]),
-        carrier_freq_ghz=sim["carrier_freq_ghz"],
-        bandwidth_mhz=sim["bandwidth_mhz"],
-        num_antennas=sim["num_antennas_tx"],
-        num_antennas_rx=sim.get("num_antennas_rx", sim["num_antennas_tx"]),
-        p_max_dbm=sim["p_max_dbm"],
-        noise_figure_db=sim["noise_figure_db"],
-        seed=args.data_seed,
-    )
-    solver = SCAFPOptimizer(
-        SCAFPConfig(
-            max_outer_iters=30,
-            max_inner_iters=5,
-            sinr_c_min=10 ** (sim["sinr_c_min_db"] / 10),
-            sinr_s_min=10 ** (sim["sinr_s_min_db"] / 10),
-            min_separation_m=sim.get("uav_min_separation_m", 10.0),
-        ),
-        M=sim["num_uavs"],
-        K=sim["num_users"],
-        T=sim["num_targets"],
-        N_t=sim["num_antennas_tx"],
-        N_r=sim.get("num_antennas_rx", sim["num_antennas_tx"]),
-        carrier_freq_ghz=sim["carrier_freq_ghz"],
-        bandwidth_mhz=sim["bandwidth_mhz"],
-        noise_figure_db=sim["noise_figure_db"],
-        area_size=tuple(sim["area_size"]),
-        altitude_range=(sim["altitude_min_m"], sim["altitude_max_m"]),
-        p_max=10 ** ((sim["p_max_dbm"] - 30) / 10),
-        noise_power=scenario.channel.noise_power,
-        load_cap=sim["load_cap_per_uav"],
-        v_max=sim["uav_max_speed_ms"],
-        slot_duration=sim["slot_duration_s"],
-    )
+    scenario = build_oracle_scenario(sim, seed=data_seed)
+    solver = build_oracle_solver(sim)
 
     warm_rows = []
     cold_rows = []
@@ -209,13 +209,14 @@ def main():
             np.asarray(record["q_current"]), env_sample.q_current, atol=1e-5
         ):
             raise ValueError(
-                "data_seed does not reproduce dataset q_current for "
+                "sealed dataset seed does not reproduce q_current for "
                 f"sample {sample_id}"
             )
         env = {
             "q_current": env_sample.q_current,
             "user_positions": env_sample.u_positions,
             "target_positions": env_sample.s_positions,
+            "target_detected": env_sample.target_detected,
             "channel_gains": env_sample.channel_gains_users,
             "user_weights": env_sample.user_weights,
         }
@@ -225,7 +226,7 @@ def main():
             for key, value in batch.items()
             if key not in {
                 "labels", "label_mask", "has_q_current", "delta_q_target",
-                "delta_a_target", "delta_p_target", "q_geometry_mask",
+                "delta_a_target", "delta_p_target",
             }
         }
         with torch.no_grad():
@@ -255,7 +256,7 @@ def main():
     result = {
         "checkpoint": str(checkpoint_dir),
         "data": str(data_path),
-        "data_seed": args.data_seed,
+        "data_seed": data_seed,
         "solver_algorithm": "constraint_aware_alternating_optimization",
         "warm": _summarize(warm_rows),
         "cold": _summarize(cold_rows),

@@ -341,8 +341,8 @@ class AssociationProjection(nn.Module):
         """
         离散化软关联 → 二进制关联 (推理时使用)
 
-        贪心算法: 每列取最大值, 容量超出时移到次优
-        简化版: 直接 argmax + 容量后处理
+        这里只保证每个用户恰好选择一个 UAV，不保证行容量。正式推理必须
+        将 soft scores 交给下游 constraint-aware solver 的容量约束指派。
         """
         # 简化为 argmax (列方向)
         best_m = torch.argmax(z_hat, dim=1)  # (B, K)
@@ -503,6 +503,7 @@ class ConstraintProjectionHead(nn.Module):
         delta_q_raw: torch.Tensor,
         q_geometry_cues: Optional[torch.Tensor],
         q_cue_logits: Optional[torch.Tensor],
+        q_geometry_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         用 prompt/BEV 的三类候选 xy 方向组合 q 位移。
@@ -518,11 +519,42 @@ class ConstraintProjectionHead(nn.Module):
             raise ValueError(f"q_geometry_cues are required for q_geometry_mode={self.q_geometry_mode}")
 
         cues = q_geometry_cues.to(device=delta_q_raw.device, dtype=delta_q_raw.dtype)
+        expected_shape = (
+            delta_q_raw.shape[0],
+            self.M,
+            3,
+            2,
+        )
+        if tuple(cues.shape) != expected_shape:
+            raise ValueError(
+                f"q_geometry_cues must have shape {expected_shape}, "
+                f"got {tuple(cues.shape)}"
+            )
+        mask = (
+            torch.ones(cues.shape[:-1], device=cues.device, dtype=torch.bool)
+            if q_geometry_mask is None
+            else q_geometry_mask.to(device=cues.device, dtype=torch.bool)
+        )
+        if tuple(mask.shape) != tuple(cues.shape[:-1]):
+            raise ValueError(
+                "q_geometry_mask must align with q_geometry_cues, got "
+                f"{tuple(mask.shape)} and {tuple(cues.shape)}"
+            )
+        if not torch.all(mask.any(dim=-1)):
+            raise ValueError(
+                "each UAV must have at least one valid q geometry cue"
+            )
         radius = self.proj_q.v_max_dt.to(device=delta_q_raw.device, dtype=delta_q_raw.dtype)
 
         if self.q_geometry_mode == "fixed_residual_xy":
-            weights = self.q_fixed_cue_weights.to(device=cues.device, dtype=cues.dtype)
-            fixed_xy = torch.sum(weights.view(1, 1, 3, 1) * cues, dim=2)
+            weights = self.q_fixed_cue_weights.to(
+                device=cues.device, dtype=cues.dtype
+            ).view(1, 1, 3)
+            weights = weights * mask.to(dtype=cues.dtype)
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(
+                1e-8
+            )
+            fixed_xy = torch.sum(weights.unsqueeze(-1) * cues, dim=2)
             fixed_xy = F.normalize(fixed_xy, p=2, dim=-1, eps=1e-6)
             fixed_direction = torch.cat([fixed_xy, torch.zeros_like(fixed_xy[..., :1])], dim=-1)
             residual = torch.tanh(self.q_residual_adapter(delta_q_raw))
@@ -536,7 +568,10 @@ class ConstraintProjectionHead(nn.Module):
 
         if q_cue_logits is None:
             raise ValueError("q_cue_logits are required for q_geometry_mode=cue_xy")
-        weights = F.softmax(q_cue_logits.to(dtype=delta_q_raw.dtype), dim=-1)
+        masked_logits = q_cue_logits.to(
+            dtype=delta_q_raw.dtype
+        ).masked_fill(~mask, torch.finfo(delta_q_raw.dtype).min)
+        weights = F.softmax(masked_logits, dim=-1)
         cue_xy = torch.sum(weights.unsqueeze(-1) * cues, dim=2)
         cue_xy = F.normalize(cue_xy, p=2, dim=-1, eps=1e-6)
         q_xy = cue_xy * radius
@@ -547,6 +582,7 @@ class ConstraintProjectionHead(nn.Module):
         control_states: torch.Tensor,      # (B, num_control_tokens, hidden_dim)
         q_current: Optional[torch.Tensor] = None,  # (B, M, 3)
         q_geometry_cues: Optional[torch.Tensor] = None,  # (B, M, 3, 2)
+        q_geometry_mask: Optional[torch.Tensor] = None,  # (B, M, 3)
     ) -> dict:
         """
         前向传播
@@ -586,9 +622,25 @@ class ConstraintProjectionHead(nn.Module):
         q_cue_weights = None
         if self.q_geometry_mode == "cue_xy" and q_geometry_cues is not None:
             q_cue_logits = self.readout_q_cue(control_states).reshape(control_states.shape[0], self.M, 3)
-            q_cue_weights = F.softmax(q_cue_logits, dim=-1)
+            if q_geometry_mask is None:
+                q_cue_weights = F.softmax(q_cue_logits, dim=-1)
+            else:
+                cue_mask = q_geometry_mask.to(
+                    device=q_cue_logits.device, dtype=torch.bool
+                )
+                q_cue_weights = F.softmax(
+                    q_cue_logits.masked_fill(
+                        ~cue_mask, torch.finfo(q_cue_logits.dtype).min
+                    ),
+                    dim=-1,
+                )
 
-        dq_for_projection = self._compose_q_from_geometry_cues(dq, q_geometry_cues, q_cue_logits)
+        dq_for_projection = self._compose_q_from_geometry_cues(
+            dq,
+            q_geometry_cues,
+            q_cue_logits,
+            q_geometry_mask,
+        )
         dq_proj = self.proj_q(dq_for_projection, q_current)
         da_proj = self.proj_a(da)
         dp_proj = self.proj_p(dp, association=da_proj)

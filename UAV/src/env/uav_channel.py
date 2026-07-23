@@ -225,7 +225,11 @@ class ISACChannel:
         array_gain_rx = self.N_r
 
         signal = sensing_power * path_loss * array_gain_tx * array_gain_rx
-        sinr = signal / (self.noise_power + 1e-12)
+        # ``noise_power`` is already strictly positive.  Adding a fixed
+        # 1e-12 W here materially changes the configured 20 MHz / 9 dB noise
+        # floor and made the prompt sensing summary disagree with the Oracle
+        # solver, which uses the exact same physical channel model.
+        sinr = signal / max(self.noise_power, 1e-30)
         return float(sinr)
 
     def compute_crb(

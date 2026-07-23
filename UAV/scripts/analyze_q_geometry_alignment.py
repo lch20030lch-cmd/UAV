@@ -21,6 +21,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import numpy as np
 import yaml
 
+from src.data.multimodal_dataset import validate_multimodal_oracle_contract
+
 
 UAV_LINE_RE = re.compile(r"^\s*UAV\s+(\d+):")
 CUE_PATTERNS = {
@@ -147,6 +149,7 @@ def main():
     parser.add_argument("--prediction_npz", type=str, default=None,
                         help="可选：analyze_mm_delta_outputs.py --save_raw 生成的 npz")
     parser.add_argument("--output", type=str, required=True)
+    parser.add_argument("--allow_legacy_dataset", action="store_true")
     args = parser.parse_args()
 
     with (PROJECT_ROOT / args.config).open("r", encoding="utf-8") as f:
@@ -154,7 +157,17 @@ def main():
 
     data_cfg = cfg["data"]
     data_dir = Path(args.data_dir or data_cfg["output_dir"])
-    data_path = data_dir / (args.sft_file or data_cfg.get("sft_file", "sft_dataset.jsonl"))
+    dataset_metadata = validate_multimodal_oracle_contract(
+        data_dir,
+        allow_legacy=args.allow_legacy_dataset,
+        expected_simulation=cfg["simulation"],
+    )
+    data_path = data_dir / (
+        args.sft_file
+        or dataset_metadata.get(
+            "sft_file", data_cfg.get("sft_file", "sft_dataset.jsonl")
+        )
+    )
     records = _load_jsonl(data_path)
 
     delta_q = np.asarray([r["delta_q"] for r in records], dtype=np.float32)
@@ -165,12 +178,19 @@ def main():
     cue_dists = {name: [] for name in CUE_PATTERNS}
     prompt_types = Counter()
     parse_ok = 0
+    all_cues_ok = 0
 
     for record in records:
         prompt_types[str(record.get("prompt_type", "unknown"))] += 1
         dirs, dists = _parse_prompt_geometry(record.get("prompt", ""), num_uavs)
-        if all(np.isfinite(dirs[name]).all() for name in cue_dirs):
+        valid_cues = np.stack(
+            [np.isfinite(dirs[name]).all(axis=-1) for name in cue_dirs],
+            axis=-1,
+        )
+        if valid_cues.any(axis=-1).all():
             parse_ok += 1
+        if valid_cues.all():
+            all_cues_ok += 1
         for name in cue_dirs:
             cue_dirs[name].append(dirs[name])
             cue_dists[name].append(dists[name])
@@ -193,6 +213,9 @@ def main():
         "num_uavs": int(num_uavs),
         "prompt_type_counts": dict(prompt_types),
         "prompt_geometry_parse_rate": float(parse_ok / max(num_samples, 1)),
+        "prompt_geometry_all_cues_rate": float(
+            all_cues_ok / max(num_samples, 1)
+        ),
         **_summarize_norm("target_delta_q_3d", delta_q),
         **_summarize_norm("target_delta_q_xy", delta_q[..., :2]),
         "target_delta_q_abs_dh_mean": float(np.abs(delta_q[..., 2]).mean()),

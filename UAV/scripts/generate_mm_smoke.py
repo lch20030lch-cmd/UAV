@@ -40,10 +40,14 @@ from src.data.oracle_contract import (
     build_dataset_metadata,
     dataset_content_fingerprint,
     paired_record_state,
+    validate_dataset_metadata,
+)
+from src.data.oracle_runtime import (
+    build_oracle_scenario,
+    build_oracle_solver,
 )
 from src.data.prompt_builder import build_multimodal_prompt, format_oracle_response
-from src.env import ISACScenarioGenerator, render_bev_sample
-from src.solver.sca_fp import SCAFPConfig, SCAFPOptimizer
+from src.env import render_bev_sample
 
 
 _stop_requested = False
@@ -58,6 +62,60 @@ def _on_interrupt(sig, frame):
 def _append_jsonl(path: Path, record: dict) -> None:
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _read_record_by_id(path: Path, record_id: str):
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record.get("id") == record_id:
+                return record
+    return None
+
+
+def _recover_pending_pair(
+    journal_path: Path,
+    sft_path: Path,
+    dpo_path: Path,
+) -> None:
+    """Complete an interrupted two-file append before validating paired IDs."""
+    if not journal_path.exists():
+        return
+    pending = json.loads(journal_path.read_text(encoding="utf-8"))
+    for label, path in (("sft", sft_path), ("dpo", dpo_path)):
+        expected = pending[label]
+        existing = _read_record_by_id(path, str(expected["id"]))
+        if existing is None:
+            _append_jsonl(path, expected)
+        elif existing != expected:
+            raise ValueError(
+                f"pending {label} record conflicts with {path}: "
+                f"{expected['id']}"
+            )
+    journal_path.unlink()
+
+
+def _append_paired_jsonl(
+    journal_path: Path,
+    sft_path: Path,
+    dpo_path: Path,
+    sft_record: dict,
+    dpo_record: dict,
+) -> None:
+    pending = {"sft": sft_record, "dpo": dpo_record}
+    temporary = journal_path.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(pending, handle, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(journal_path)
+    _recover_pending_pair(journal_path, sft_path, dpo_path)
 
 
 def _finalize_dataset_metadata(
@@ -107,51 +165,6 @@ def _finalize_dataset_metadata(
     return result
 
 
-def _build_solver(sim_cfg: dict) -> SCAFPOptimizer:
-    solver_config = SCAFPConfig(
-        max_outer_iters=30,
-        max_inner_iters=5,
-        tol=1e-4,
-        lambda_sensing=0.5,
-        lambda_idle_penalty=0.0,
-        sinr_c_min=10 ** (sim_cfg["sinr_c_min_db"] / 10),
-        sinr_s_min=10 ** (sim_cfg["sinr_s_min_db"] / 10),
-        min_separation_m=sim_cfg.get("uav_min_separation_m", 10.0),
-        ground_clutter_db=6.0,
-        lambda_repel=0.01,
-        verbose=False,
-    )
-
-    noise_power = 10 ** (
-        (
-            -174
-            + 10 * np.log10(sim_cfg["bandwidth_mhz"] * 1e6)
-            + sim_cfg["noise_figure_db"]
-            - 30
-        )
-        / 10
-    )
-
-    return SCAFPOptimizer(
-        config=solver_config,
-        M=sim_cfg["num_uavs"],
-        K=sim_cfg["num_users"],
-        T=sim_cfg["num_targets"],
-        N_t=sim_cfg["num_antennas_tx"],
-        N_r=sim_cfg.get("num_antennas_rx", sim_cfg["num_antennas_tx"]),
-        carrier_freq_ghz=sim_cfg["carrier_freq_ghz"],
-        bandwidth_mhz=sim_cfg["bandwidth_mhz"],
-        noise_figure_db=sim_cfg["noise_figure_db"],
-        area_size=tuple(sim_cfg["area_size"]),
-        altitude_range=(sim_cfg["altitude_min_m"], sim_cfg["altitude_max_m"]),
-        p_max=10 ** ((sim_cfg["p_max_dbm"] - 30) / 10),
-        noise_power=noise_power,
-        load_cap=sim_cfg["load_cap_per_uav"],
-        v_max=sim_cfg.get("uav_max_speed_ms", 15),
-        slot_duration=sim_cfg.get("slot_duration_s", 1.0),
-    )
-
-
 def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
                  output_dir: Path, image_size: int):
     env_sample = generator.scenario_gen.sample(sample_id)
@@ -180,6 +193,15 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
         generator.oracle_selection_utility_tolerance,
     )
     delta_q, delta_a, delta_p = generator._extract_prior(chosen_sol, env_sample)
+    chosen_eval = generator.evaluate_prior(
+        env_dict,
+        delta_q,
+        delta_a,
+        delta_p,
+    )
+    if not chosen_eval["feasible"]:
+        return None, []
+    chosen_utility = float(chosen_eval["utility"])
     response = format_oracle_response(sample_id, delta_q, delta_a, delta_p)
 
     common = {
@@ -187,12 +209,13 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
         "prompt_type": PROMPT_TYPE,
         "bev_grid_text": env_sample.bev_grid_text,
         "q_current": q_current.tolist(),
+        "target_detected": env_sample.target_detected.astype(bool).tolist(),
         "delta_q": delta_q.tolist(),
         "delta_a": delta_a.tolist(),
         "delta_p": delta_p.tolist(),
         "solver_algorithm": chosen_sol.algorithm,
-        "oracle_feasible": bool(chosen_sol.feasible),
-        "constraint_violations": chosen_sol.constraint_violations,
+        "oracle_feasible": bool(chosen_eval["feasible"]),
+        "constraint_violations": chosen_eval["constraint_violations"],
         **selection_diagnostics,
     }
 
@@ -200,25 +223,28 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
         "id": f"env_{sample_id}",
         "prompt": prompt,
         "response": response,
-        "utility": float(chosen_sol.utility),
+        "utility": chosen_utility,
         **common,
     }
 
-    rejected_delta_q, rejected_util = generator._construct_rejected(
+    rejected_delta_q, _ = generator._construct_rejected(
         env_dict, solutions, q_current, sample_id
     )
-    rejected_util = float(generator.evaluate_prior(
+    rejected_eval = generator.evaluate_prior(
         env_dict, rejected_delta_q, delta_a, delta_p
-    )["utility"])
+    )
+    rejected_util = float(rejected_eval["utility"])
+    if not np.isfinite(rejected_util):
+        return None, []
     dpo_samples = []
     if not np.allclose(rejected_delta_q, delta_q, atol=1e-3):
         rejected_response = generator._format_rejected_response(
             sample_id, rejected_delta_q, delta_a, delta_p
         )
         gap = (
-            float(chosen_sol.utility) - rejected_util
+            chosen_utility - rejected_util
             if rejected_util is not None
-            else abs(float(chosen_sol.utility)) * 0.05
+            else abs(chosen_utility) * 0.05
         )
         if gap > 0:
             dpo_samples.append({
@@ -226,7 +252,8 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
                 "prompt": prompt,
                 "chosen": response,
                 "rejected": rejected_response,
-                "utility_chosen": float(chosen_sol.utility),
+                "utility_chosen": chosen_utility,
+                "utility_rejected": rejected_util,
                 "utility_gap": gap,
                 **common,
             })
@@ -292,6 +319,7 @@ def main():
     dpo_path = output_dir / data_cfg.get("dpo_file", "dpo_dataset.jsonl")
     ckpt_path = output_dir / "checkpoint.txt"
     metadata_path = output_dir / "dataset_metadata.json"
+    pair_journal_path = output_dir / ".pending_pair.json"
 
     expected_metadata = build_dataset_metadata(
         sim_cfg,
@@ -315,7 +343,14 @@ def main():
 
     existing_metadata = None
     if args.overwrite:
-        for path in [sft_path, dpo_path, ckpt_path, metadata_path]:
+        for path in [
+            sft_path,
+            dpo_path,
+            ckpt_path,
+            metadata_path,
+            pair_journal_path,
+            pair_journal_path.with_suffix(".tmp"),
+        ]:
             if path.exists():
                 path.unlink()
         for image_path in (output_dir / "images").glob("env_*.png"):
@@ -341,6 +376,7 @@ def main():
             )
         except ValueError as exc:
             raise ValueError(f"invalid generation checkpoint: {ckpt_path}") from exc
+    _recover_pending_pair(pair_journal_path, sft_path, dpo_path)
     record_state = paired_record_state(
         output_dir, sft_path.name, dpo_path.name
     )
@@ -350,6 +386,21 @@ def main():
     # before checkpoint.txt is advanced.  Never reuse an ID already present.
     start_id = max(checkpoint_next_id, record_state["next_environment_id"])
     if existing_sft >= num_samples and existing_dpo >= num_samples:
+        if existing_metadata and existing_metadata.get(
+            "generation_complete"
+        ) is True:
+            validated = validate_dataset_metadata(
+                existing_metadata,
+                data_dir=output_dir,
+                expected_simulation=sim_cfg,
+                expected_seed=args.seed,
+            )
+            print(f"All {num_samples} samples already exist at {output_dir}")
+            print(
+                "  content_fingerprint: "
+                f"{validated['content_fingerprint']}"
+            )
+            return
         dataset_metadata = _finalize_dataset_metadata(
             existing_metadata or expected_metadata,
             output_dir=output_dir,
@@ -370,22 +421,8 @@ def main():
         return
 
     # 复用 text-grid baseline 的场景生成器与 SCA-FP solver，保证两条路线可对照。
-    scenario_gen = ISACScenarioGenerator(
-        num_uavs=sim_cfg["num_uavs"],
-        num_users=sim_cfg["num_users"],
-        num_targets=sim_cfg["num_targets"],
-        area_size=tuple(sim_cfg["area_size"]),
-        carrier_freq_ghz=sim_cfg["carrier_freq_ghz"],
-        bandwidth_mhz=sim_cfg["bandwidth_mhz"],
-        num_antennas=sim_cfg["num_antennas_tx"],
-        num_antennas_rx=sim_cfg.get(
-            "num_antennas_rx", sim_cfg["num_antennas_tx"]
-        ),
-        p_max_dbm=sim_cfg["p_max_dbm"],
-        noise_figure_db=sim_cfg["noise_figure_db"],
-        seed=args.seed,
-    )
-    solver = _build_solver(sim_cfg)
+    scenario_gen = build_oracle_scenario(sim_cfg, seed=args.seed)
+    solver = build_oracle_solver(sim_cfg)
     generator = OracleDataGenerator(
         scenario_gen=scenario_gen,
         solver=solver,
@@ -431,14 +468,24 @@ def main():
             sft_sample, dpo_samples = _process_one(
                 sample_id, generator, sim_cfg, output_dir, image_size
             )
-            if sft_sample is not None:
-                _append_jsonl(sft_path, sft_sample)
-                n_sft += 1
-                for dpo_sample in dpo_samples:
-                    _append_jsonl(dpo_path, dpo_sample)
-                    n_dpo += 1
         except Exception as exc:
-            print(f"[ERROR] env {sample_id}: {exc}")
+            raise RuntimeError(
+                f"unexpected Oracle generation failure at env {sample_id}"
+            ) from exc
+        if sft_sample is not None:
+            if len(dpo_samples) != 1:
+                raise RuntimeError(
+                    "v5 generation requires exactly one DPO row per SFT row"
+                )
+            _append_paired_jsonl(
+                pair_journal_path,
+                sft_path,
+                dpo_path,
+                sft_sample,
+                dpo_samples[0],
+            )
+            n_sft += 1
+            n_dpo += 1
 
         with ckpt_path.open("w", encoding="utf-8") as f:
             f.write(f"{sample_id + 1}\n")

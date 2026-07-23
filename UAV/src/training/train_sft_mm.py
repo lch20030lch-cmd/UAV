@@ -43,7 +43,10 @@ from src.data.oracle_contract import (
     validate_checkpoint_dataset_compatibility,
 )
 from src.model import Gemma3MultimodalISAC, UAVISACLosses, build_proj_head_config
-from src.model.gemma_multimodal_isac import is_vision_parameter_name
+from src.model.gemma_multimodal_isac import (
+    is_vision_parameter_name,
+    keep_vision_modules_in_eval_mode,
+)
 from src.training.runtime_utils import resolve_warmup_steps, rotate_step_checkpoints
 
 
@@ -189,18 +192,27 @@ def _load_mm_smoke_checkpoint(
             require_same_seed=True,
         )
     proj_path = ckpt_dir / "projection_head.pt"
-    if proj_path.exists():
-        state = torch.load(proj_path, map_location="cpu")
-        load_result = model.projection_head.load_state_dict(
-            state, strict=not allow_partial_projection_load
+    if not proj_path.exists():
+        raise FileNotFoundError(
+            f"init checkpoint is missing projection_head.pt: {ckpt_dir}"
         )
-        loaded["projection_head"] = str(proj_path)
-        loaded["projection_missing_keys"] = list(load_result.missing_keys)
-        loaded["projection_unexpected_keys"] = list(load_result.unexpected_keys)
+    state = torch.load(proj_path, map_location="cpu")
+    load_result = model.projection_head.load_state_dict(
+        state, strict=not allow_partial_projection_load
+    )
+    loaded["projection_head"] = str(proj_path)
+    loaded["projection_missing_keys"] = list(load_result.missing_keys)
+    loaded["projection_unexpected_keys"] = list(load_result.unexpected_keys)
 
     loaded_ctrl = model.load_control_token_embeddings(ckpt_dir)
-    if loaded_ctrl:
-        loaded["control_token_embeddings"] = loaded_ctrl
+    required_control_files = {"ctrl_embed", "ctrl_offset"}
+    missing_control = required_control_files - set(loaded_ctrl)
+    if missing_control:
+        raise FileNotFoundError(
+            "init checkpoint is missing control-token state: "
+            f"{sorted(missing_control)}"
+        )
+    loaded["control_token_embeddings"] = loaded_ctrl
     return loaded
 
 
@@ -229,6 +241,54 @@ def _freeze_projection_except(model, trainable_prefixes):
         else:
             frozen.append(name)
     return frozen, trainable
+
+
+def _isolate_loss_weights(branch: str, weights: dict) -> dict:
+    """Make a branch-isolation flag authoritative for every shared gradient.
+
+    Freezing projection tensors alone is insufficient when LoRA or the control
+    offsets are trainable: unrelated losses still update those shared
+    representation parameters.  This helper ensures that a Q/A/P isolation
+    experiment is optimized by only its own objective.
+    """
+    result = {key: float(value) for key, value in weights.items()}
+    allowed = {
+        None: set(result),
+        "q": {
+            "lambda_q",
+            "lambda_q_dir",
+            "lambda_q_projected_dir",
+            "lambda_sep",
+        },
+        "q_cue": {
+            "lambda_q_projected_dir",
+            "lambda_q_cue_ce",
+        },
+        "q_power": {
+            "lambda_q",
+            "lambda_p",
+            "lambda_sep",
+            "lambda_q_dir",
+            "lambda_q_projected_dir",
+            "lambda_q_cue_ce",
+            "lambda_p_raw_kl",
+        },
+        "association": {
+            "lambda_a",
+            "lambda_assoc_ce",
+            "lambda_assoc_raw_ce",
+        },
+        "power": {
+            "lambda_p",
+            "lambda_p_raw_kl",
+        },
+    }
+    if branch not in allowed:
+        raise ValueError(f"unsupported isolated projection branch: {branch}")
+    for key in result:
+        if key not in allowed[branch]:
+            result[key] = 0.0
+    return result
 
 
 def train_mm_sft_smoke(
@@ -266,6 +326,7 @@ def train_mm_sft_smoke(
     gradient_accumulation_steps: int = None,
     lambda_lm_ce: float = None,
     use_chat_template: bool = None,
+    train_control_offsets: bool = None,
     allow_partial_projection_load: bool = False,
     allow_legacy_oracle_data: bool = False,
     allow_checkpoint_dataset_mismatch: bool = False,
@@ -287,7 +348,9 @@ def train_mm_sft_smoke(
         expected_simulation=sim_cfg,
     )
     checkpoint_provenance = checkpoint_dataset_fields(dataset_metadata)
-    sft_path = data_root / data_cfg.get("sft_file", "sft_dataset.jsonl")
+    sft_path = data_root / dataset_metadata.get(
+        "sft_file", data_cfg.get("sft_file", "sft_dataset.jsonl")
+    )
     model_name = model_path or model_cfg["backbone"]
     max_seq_length = int(max_length or train_cfg["max_seq_length"])
     steps_limit = int(
@@ -308,6 +371,11 @@ def train_mm_sft_smoke(
     )
     if lambda_lm_ce_value < 0.0:
         raise ValueError("lambda_lm_ce must be non-negative")
+    phase1_lambda_ctl_value = float(
+        train_cfg.get("phase1", {}).get("lambda_ctl", 1.0)
+    )
+    if phase1_lambda_ctl_value < 0.0:
+        raise ValueError("phase1.lambda_ctl must be non-negative")
     include_response_tokens = lambda_lm_ce_value > 0.0
     if include_response_tokens and not train_lora:
         raise ValueError(
@@ -339,9 +407,10 @@ def train_mm_sft_smoke(
     lora_enabled = bool(train_lora or load_lora)
     checkpoint_prefix = f"mm_sft_{'lora_' if lora_enabled else ''}smoke_step_"
     init_lora_checkpoint = _resolve_lora_checkpoint(init_checkpoint, lora_enabled)
-    if load_lora and init_lora_checkpoint is None:
+    if init_checkpoint and lora_enabled and init_lora_checkpoint is None:
         raise FileNotFoundError(
-            "--load_lora requires --init_checkpoint containing lora/adapter_config.json"
+            "LoRA-enabled continuation requires --init_checkpoint containing "
+            "lora/adapter_config.json"
         )
 
     init_metadata = {}
@@ -379,12 +448,21 @@ def train_mm_sft_smoke(
         + (" + response" if include_response_tokens else " (response omitted)")
     )
     print(f"  chat template: {use_chat_template_value}")
+    control_offsets_trainable = bool(
+        train_control_offsets
+        if train_control_offsets is not None
+        else train_cfg.get("phase1", {}).get(
+            "train_control_offsets", True
+        )
+    )
     if train_lora:
         trainable_label = "projection_head + LoRA"
     elif load_lora:
         trainable_label = "projection_head (loaded LoRA frozen)"
     else:
         trainable_label = "projection_head only"
+    if control_offsets_trainable:
+        trainable_label += " + control offsets"
     print(f"  trainable:  {trainable_label}")
     print()
 
@@ -443,10 +521,18 @@ def train_mm_sft_smoke(
 
     if train_lora:
         model.base_model.train()
+        frozen_vision_modules = keep_vision_modules_in_eval_mode(
+            model.base_model
+        )
     else:
         for param in model.base_model.parameters():
             param.requires_grad = False
         model.base_model.eval()
+        frozen_vision_modules = []
+    # This compact adapter can train without opening the 4-bit backbone.  It
+    # provides a controlled way to repair collapsed control states before a
+    # larger LoRA stage is justified.
+    model.control_token_offsets.requires_grad_(control_offsets_trainable)
     model.projection_head.train()
 
     frozen_projection_branches = []
@@ -476,6 +562,7 @@ def train_mm_sft_smoke(
             branch_prefixes=("readout_a", "a_mlp"),
             trainable=False,
         )
+        isolated_projection_branch = "q_power"
     elif freeze_qp_branch:
         (
             frozen_projection_branches,
@@ -494,6 +581,8 @@ def train_mm_sft_smoke(
         include_response=include_response_tokens,
         use_chat_template=use_chat_template_value,
     )
+    if len(dataset) == 0:
+        raise ValueError(f"multimodal SFT dataset is empty: {sft_path}")
     dataloader = DataLoader(
         dataset,
         batch_size=train_cfg["per_device_batch_size"],
@@ -540,12 +629,48 @@ def train_mm_sft_smoke(
             )
         )
     )
+    effective_loss_weights = _isolate_loss_weights(
+        isolated_projection_branch,
+        {
+            "lambda_q": lambda_q_value,
+            "lambda_a": lambda_a_value,
+            "lambda_p": lambda_p_value,
+            "lambda_sep": model_cfg["loss"]["lambda_sep"],
+            "lambda_assoc_ce": assoc_ce_weight,
+            "lambda_assoc_raw_ce": assoc_raw_ce_weight,
+            "lambda_q_dir": lambda_q_dir_value,
+            "lambda_q_projected_dir": lambda_q_projected_dir_value,
+            "lambda_q_cue_ce": lambda_q_cue_ce_value,
+            "lambda_p_raw_kl": lambda_p_raw_kl_value,
+        },
+    )
+    negative_loss_weights = {
+        key: value
+        for key, value in effective_loss_weights.items()
+        if value < 0.0
+    }
+    if negative_loss_weights:
+        raise ValueError(
+            f"control loss weights must be non-negative: {negative_loss_weights}"
+        )
+    lambda_q_value = effective_loss_weights["lambda_q"]
+    lambda_a_value = effective_loss_weights["lambda_a"]
+    lambda_p_value = effective_loss_weights["lambda_p"]
+    assoc_ce_weight = effective_loss_weights["lambda_assoc_ce"]
+    assoc_raw_ce_weight = effective_loss_weights["lambda_assoc_raw_ce"]
+    lambda_q_dir_value = effective_loss_weights["lambda_q_dir"]
+    lambda_q_projected_dir_value = effective_loss_weights[
+        "lambda_q_projected_dir"
+    ]
+    lambda_q_cue_ce_value = effective_loss_weights["lambda_q_cue_ce"]
+    lambda_p_raw_kl_value = effective_loss_weights["lambda_p_raw_kl"]
+    lambda_sep_value = effective_loss_weights["lambda_sep"]
     loss_fn = UAVISACLosses(
         lambda_ctl=model_cfg["loss"]["lambda_ctl"],
         lambda_q=lambda_q_value,
         lambda_a=lambda_a_value,
         lambda_p=lambda_p_value,
-        lambda_sep=model_cfg["loss"]["lambda_sep"],
+        lambda_sep=lambda_sep_value,
         lambda_assoc_ce=assoc_ce_weight,
         lambda_assoc_raw_ce=assoc_raw_ce_weight,
         lambda_q_dir=lambda_q_dir_value,
@@ -555,7 +680,15 @@ def train_mm_sft_smoke(
         power_temperature=float(model_cfg["projection_head"]["tau_power"]),
     )
     # 默认只训练投影头；--load_lora 只加载并冻结 adapter，--train_lora 才更新它。
-    proj_params = [p for p in model.projection_head.parameters() if p.requires_grad]
+    proj_params = [
+        p for p in model.projection_head.parameters() if p.requires_grad
+    ]
+    control_offset_params = (
+        [model.control_token_offsets]
+        if model.control_token_offsets.requires_grad
+        else []
+    )
+    projection_optimizer_params = proj_params + control_offset_params
     lora_named_params = [
         (name, parameter)
         for name, parameter in model.base_model.named_parameters()
@@ -574,16 +707,28 @@ def train_mm_sft_smoke(
             "freeze_vision_tower=True but trainable vision LoRA tensors remain: "
             f"{trainable_vision_lora_names[:5]}"
         )
-    proj_lr = float(projection_lr) if projection_lr is not None else 1e-3
+    proj_lr = (
+        float(projection_lr)
+        if projection_lr is not None
+        else float(
+            train_cfg.get("phase1", {}).get("projection_lr", 1e-3)
+        )
+    )
     lora_lr = (
         float(lora_lr_override)
         if lora_lr_override is not None
         else train_cfg.get("phase1", {}).get("lr_lora", train_cfg.get("learning_rate", 2e-4))
     )
+    if proj_lr <= 0.0:
+        raise ValueError("projection_lr must be positive")
+    if train_lora and float(lora_lr) <= 0.0:
+        raise ValueError("lora_lr must be positive when --train_lora is used")
     if train_lora and not lora_params:
         raise RuntimeError("已传入 --train_lora，但没有发现可训练的 LoRA 参数。")
 
-    param_groups = [{"params": proj_params, "lr": proj_lr}]
+    param_groups = [
+        {"params": projection_optimizer_params, "lr": proj_lr}
+    ]
     if train_lora and lora_params:
         param_groups.append({"params": lora_params, "lr": lora_lr})
     optimizer = torch.optim.AdamW(
@@ -600,6 +745,10 @@ def train_mm_sft_smoke(
         num_training_steps=steps_limit,
     )
     print(f"  trainable projection tensors: {len(proj_params)}")
+    print(
+        "  trainable control offsets:   "
+        f"{len(control_offset_params)}"
+    )
     print(f"  trainable LoRA tensors:       {len(lora_params)}")
     print(f"  trainable language LoRA:      {len(trainable_language_lora_names)}")
     print(f"  trainable vision LoRA:        {len(trainable_vision_lora_names)}")
@@ -607,6 +756,7 @@ def train_mm_sft_smoke(
         "  frozen vision parameters:    "
         f"{len(getattr(model, 'frozen_vision_parameter_names', []))}"
     )
+    print(f"  vision modules kept in eval:  {len(frozen_vision_modules)}")
     print(f"  projection lr:                {proj_lr}")
     print(f"  LoRA lr:                      {lora_lr if train_lora else 0.0}")
     print(f"  lr scheduler:                 {scheduler_name}")
@@ -625,6 +775,8 @@ def train_mm_sft_smoke(
     print(f"  association CE weight:        {assoc_ce_weight}")
     print(f"  association raw CE weight:    {assoc_raw_ce_weight}")
     print(f"  language-model CE weight:     {lambda_lm_ce_value}")
+    print(f"  phase-I control weight:       {phase1_lambda_ctl_value}")
+    print(f"  separation weight:            {lambda_sep_value}")
 
     device = model.device
     global_step = 0
@@ -650,7 +802,6 @@ def train_mm_sft_smoke(
                     "delta_q_target",
                     "delta_a_target",
                     "delta_p_target",
-                    "q_geometry_mask",
                 }
             }
             forward_keys["compute_full_logits"] = include_response_tokens
@@ -683,6 +834,8 @@ def train_mm_sft_smoke(
                 "delta_a": batch["delta_a_target"],
                 "delta_p": batch["delta_p_target"],
             }
+            if isolated_projection_branch in {None, "q"}:
+                delta_target["q_current"] = batch["q_current"]
             if "q_geometry_cues" in batch:
                 delta_target["q_geometry_cues"] = batch["q_geometry_cues"]
             if "q_geometry_mask" in batch:
@@ -690,7 +843,7 @@ def train_mm_sft_smoke(
             total_loss, metrics = loss_fn.compute_phase1_total(
                 delta_hat=delta_hat,
                 delta_target=delta_target,
-                phase1_lambda_ctl=train_cfg.get("phase1", {}).get("lambda_ctl", 1.0),
+                phase1_lambda_ctl=phase1_lambda_ctl_value,
             )
             loss_lm_ce = total_loss.new_zeros(())
             if include_response_tokens:
@@ -741,6 +894,7 @@ def train_mm_sft_smoke(
             }
             metric_sums = {}
             grad_norm = _grad_norm(proj_params)
+            grad_norm_control = _grad_norm(control_offset_params)
             grad_norm_lora = _grad_norm(lora_params) if train_lora else 0.0
             q_residual_adapter = getattr(model.projection_head, "q_residual_adapter", None)
             grad_norm_q_residual = (
@@ -755,6 +909,14 @@ def train_mm_sft_smoke(
                 proj_params,
                 lora_params,
                 float(cfg["hardware"].get("max_grad_norm", 1.0)),
+            )
+            if control_offset_params:
+                torch.nn.utils.clip_grad_norm_(
+                    control_offset_params,
+                    float(cfg["hardware"].get("max_grad_norm", 1.0)),
+                )
+            grad_norm_control_post_clip = _grad_norm(
+                control_offset_params
             )
             step_proj_lr = float(optimizer.param_groups[0]["lr"])
             step_lora_lr = (
@@ -788,11 +950,14 @@ def train_mm_sft_smoke(
                 f"loss_p_active={metrics['loss_p_active']:.6f} "
                 f"loss_p_inactive={metrics['loss_p_inactive']:.6f} "
                 f"loss_p_sensing={metrics['loss_p_sensing']:.6f} "
+                f"loss_sep={metrics['loss_sep']:.6f} "
                 f"delta_p_entropy={metrics['delta_p_entropy']:.6f} "
                 f"delta_p_inactive_leakage={metrics['delta_p_inactive_leakage']:.6f} "
                 f"grad_norm_proj={grad_norm:.6f} "
+                f"grad_norm_control={grad_norm_control:.6f} "
                 f"grad_norm_lora={grad_norm_lora:.6f} "
                 f"grad_norm_proj_post_clip={grad_norm_proj_post_clip:.6f} "
+                f"grad_norm_control_post_clip={grad_norm_control_post_clip:.6f} "
                 f"grad_norm_lora_post_clip={grad_norm_lora_post_clip:.6f} "
                 f"lr_proj={step_proj_lr:.9g} "
                 f"lr_lora={step_lora_lr:.9g} "
@@ -814,14 +979,23 @@ def train_mm_sft_smoke(
                         "loss_ctl": metrics["loss_ctl"],
                         "loss_total": metrics["loss_total"],
                         "grad_norm_proj": grad_norm,
+                        "grad_norm_control": grad_norm_control,
                         "grad_norm_lora": grad_norm_lora,
                         "grad_norm_proj_post_clip": grad_norm_proj_post_clip,
+                        "grad_norm_control_post_clip": grad_norm_control_post_clip,
                         "grad_norm_lora_post_clip": grad_norm_lora_post_clip,
                         "trainable": trainable_label,
                         "train_lora": train_lora,
                         "load_lora": load_lora,
+                        "train_control_offsets": control_offsets_trainable,
+                        "trainable_control_offset_tensors": len(
+                            control_offset_params
+                        ),
                         "trainable_language_lora_tensors": len(trainable_language_lora_names),
                         "trainable_vision_lora_tensors": len(trainable_vision_lora_names),
+                        "vision_modules_kept_in_eval": len(
+                            frozen_vision_modules
+                        ),
                         "frozen_vision_parameters": len(
                             getattr(model, "frozen_vision_parameter_names", [])
                         ),
@@ -834,6 +1008,7 @@ def train_mm_sft_smoke(
                         "include_response_tokens": include_response_tokens,
                         "use_chat_template": use_chat_template_value,
                         "lambda_lm_ce": lambda_lm_ce_value,
+                        "phase1_lambda_ctl": phase1_lambda_ctl_value,
                         "projection_lr": proj_lr,
                         "lora_lr": lora_lr if train_lora else 0.0,
                         "lora_rank": model_cfg["lora"]["rank"] if lora_enabled else 0,
@@ -857,6 +1032,7 @@ def train_mm_sft_smoke(
                         "lambda_q": lambda_q_value,
                         "lambda_a": lambda_a_value,
                         "lambda_p": lambda_p_value,
+                        "lambda_sep": lambda_sep_value,
                         "lambda_q_dir": lambda_q_dir_value,
                         "lambda_q_projected_dir": lambda_q_projected_dir_value,
                         "lambda_q_cue_ce": lambda_q_cue_ce_value,
@@ -896,8 +1072,13 @@ def train_mm_sft_smoke(
             "trainable": trainable_label,
             "train_lora": train_lora,
             "load_lora": load_lora,
+            "train_control_offsets": control_offsets_trainable,
+            "trainable_control_offset_tensors": len(
+                control_offset_params
+            ),
             "trainable_language_lora_tensors": len(trainable_language_lora_names),
             "trainable_vision_lora_tensors": len(trainable_vision_lora_names),
+            "vision_modules_kept_in_eval": len(frozen_vision_modules),
             "frozen_vision_parameters": len(
                 getattr(model, "frozen_vision_parameter_names", [])
             ),
@@ -910,6 +1091,7 @@ def train_mm_sft_smoke(
             "include_response_tokens": include_response_tokens,
             "use_chat_template": use_chat_template_value,
             "lambda_lm_ce": lambda_lm_ce_value,
+            "phase1_lambda_ctl": phase1_lambda_ctl_value,
             "projection_lr": proj_lr,
             "lora_lr": lora_lr if train_lora else 0.0,
             "lora_rank": model_cfg["lora"]["rank"] if lora_enabled else 0,
@@ -933,6 +1115,7 @@ def train_mm_sft_smoke(
             "lambda_q": lambda_q_value,
             "lambda_a": lambda_a_value,
             "lambda_p": lambda_p_value,
+            "lambda_sep": lambda_sep_value,
             "lambda_q_dir": lambda_q_dir_value,
             "lambda_q_projected_dir": lambda_q_projected_dir_value,
             "lambda_q_cue_ce": lambda_q_cue_ce_value,
@@ -976,6 +1159,15 @@ if __name__ == "__main__":
         help="maximum number of matching intermediate step checkpoints to retain",
     )
     parser.add_argument("--train_lora", action="store_true")
+    parser.add_argument(
+        "--train_control_offsets",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "train the compact control-token representation adapter; "
+            "defaults to training.sft.phase1.train_control_offsets"
+        ),
+    )
     parser.add_argument(
         "--load_lora",
         action="store_true",
@@ -1082,6 +1274,7 @@ if __name__ == "__main__":
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
         train_lora=args.train_lora,
+        train_control_offsets=args.train_control_offsets,
         load_lora=args.load_lora,
         lambda_assoc_ce=args.lambda_assoc_ce,
         lambda_q=args.lambda_q,

@@ -20,6 +20,7 @@ def _simulation():
         "num_uavs": 4,
         "num_users": 20,
         "num_targets": 6,
+        "target_detection_probability": 0.8,
         "num_antennas_tx": 8,
         "num_antennas_rx": 8,
         "carrier_freq_ghz": 5.8,
@@ -126,7 +127,11 @@ class OracleContractTest(unittest.TestCase):
     def test_contract_records_oracle_consensus_selection(self):
         metadata = _metadata()
 
-        self.assertEqual(metadata["solver_revision"], 2)
+        self.assertEqual(metadata["solver_revision"], 3)
+        self.assertEqual(
+            metadata["channel_model"],
+            "elevation_los_3gpp_pathloss_v3",
+        )
         self.assertEqual(
             metadata["oracle_selection_mode"], "near_optimal_q_medoid"
         )
@@ -158,6 +163,9 @@ class OracleContractTest(unittest.TestCase):
                 '{"id":"env_0_dpo"}\n{"id":"env_2_dpo"}\n',
                 encoding="utf-8",
             )
+            metadata["content_fingerprint"] = dataset_content_fingerprint(
+                root
+            )
 
             validated = validate_dataset_metadata(
                 metadata,
@@ -177,6 +185,25 @@ class OracleContractTest(unittest.TestCase):
 
         self.assertEqual(validated["num_sft_records"], 2)
         self.assertEqual(len(validated["content_fingerprint"]), 64)
+
+    def test_complete_contract_requires_sealed_content_fingerprint(self):
+        metadata = _metadata()
+        metadata.update({
+            "generation_complete": True,
+            "num_sft_records": 1,
+            "num_dpo_records": 1,
+        })
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "sft_dataset.jsonl").write_text(
+                '{"id":"env_0"}\n', encoding="utf-8"
+            )
+            (root / "dpo_dataset.jsonl").write_text(
+                '{"id":"env_0_dpo"}\n', encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(ValueError, "sealed"):
+                validate_dataset_metadata(metadata, data_dir=root)
 
     def test_checkpoint_must_share_dataset_provenance(self):
         dataset = _metadata()
@@ -213,7 +240,13 @@ class OracleContractTest(unittest.TestCase):
                     '{"id":"env_0_dpo"}\n',
                     encoding="utf-8",
                 )
-                validated.append(validate_dataset_metadata(metadata, data_dir=root))
+                root_metadata = dict(
+                    metadata,
+                    content_fingerprint=dataset_content_fingerprint(root),
+                )
+                validated.append(
+                    validate_dataset_metadata(root_metadata, data_dir=root)
+                )
 
             checkpoint = checkpoint_dataset_fields(validated[0])
             validate_checkpoint_dataset_compatibility(

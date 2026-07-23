@@ -37,6 +37,7 @@ class SCAFPConfig:
     lambda_idle_penalty: float = 0.0
     sinr_c_min: float = 1.0
     sinr_s_min: float = 10.0
+    rate_min_bps: float = 1e6
     min_separation_m: float = 10.0
     constraint_penalty: float = 100.0
     power_update_rate: float = 0.5
@@ -114,6 +115,14 @@ class SCAFPOptimizer:
             noise_figure_db=noise_figure_db,
         )
         self.wavelength = self.channel.wavelength
+        if self.cfg.rate_min_bps < 0.0:
+            raise ValueError("rate_min_bps must be non-negative")
+        rate_sinr_min = (
+            2.0 ** (float(self.cfg.rate_min_bps) / self.channel.B) - 1.0
+        )
+        self.comm_sinr_min = max(
+            float(self.cfg.sinr_c_min), float(rate_sinr_min)
+        )
         self.rng = np.random.RandomState()
 
         if self.M <= 0 or self.K <= 0 or self.T <= 0:
@@ -151,6 +160,13 @@ class SCAFPOptimizer:
         initial = self.evaluate_solution(Q, A, P_comm, P_sense, env)
         initial_utility = initial["utility"]
         previous_utility = initial_utility
+        best = initial
+        best_state = (
+            Q.copy(),
+            A.copy(),
+            P_comm.copy(),
+            P_sense.copy(),
+        )
         converged = False
         max_iters = (
             int(self.cfg.max_iters)
@@ -187,6 +203,7 @@ class SCAFPOptimizer:
                     gains_next,
                     env["target_positions"],
                     env["user_weights"],
+                    env["target_detected"],
                 )
                 alpha = self.cfg.power_update_rate
                 P_comm_next = (1.0 - alpha) * P_comm + alpha * P_opt_comm
@@ -209,6 +226,14 @@ class SCAFPOptimizer:
             P_comm, P_sense = P_comm_next, P_sense_next
             if not np.isfinite(utility):
                 break
+            if self._candidate_is_better(current, best):
+                best = current
+                best_state = (
+                    Q.copy(),
+                    A.copy(),
+                    P_comm.copy(),
+                    P_sense.copy(),
+                )
 
             relative_change = abs(utility - previous_utility) / (
                 1.0 + abs(previous_utility)
@@ -221,7 +246,13 @@ class SCAFPOptimizer:
                 break
             previous_utility = utility
 
-        final = self.evaluate_solution(Q, A, P_comm, P_sense, env)
+        # Alternating updates are not guaranteed to be monotone.  Returning
+        # the last iterate silently discarded an earlier feasible optimum and
+        # made otherwise deterministic Oracle labels depend on when the loop
+        # happened to stop.  Always return the best visited state, preferring
+        # feasibility before the penalized objective.
+        Q, A, P_comm, P_sense = best_state
+        final = best
         return SCAFPSolution(
             Q=Q.astype(np.float32),
             A=A.astype(np.float32),
@@ -236,6 +267,22 @@ class SCAFPOptimizer:
             constraint_violations=final["constraint_violations"],
             solve_time=time.time() - started,
         )
+
+    @staticmethod
+    def _candidate_is_better(candidate: Dict, incumbent: Dict) -> bool:
+        candidate_feasible = bool(candidate["feasible"])
+        incumbent_feasible = bool(incumbent["feasible"])
+        if candidate_feasible != incumbent_feasible:
+            return candidate_feasible
+        candidate_utility = float(candidate["utility"])
+        incumbent_utility = float(incumbent["utility"])
+        candidate_finite = np.isfinite(candidate_utility)
+        incumbent_finite = np.isfinite(incumbent_utility)
+        if candidate_finite != incumbent_finite:
+            return bool(candidate_finite)
+        if not candidate_finite:
+            return False
+        return candidate_utility > incumbent_utility
 
     def evaluate_solution(
         self,
@@ -260,6 +307,7 @@ class SCAFPOptimizer:
             gains_comm,
             gains_sense,
             env["user_weights"],
+            env["target_detected"],
         )
         violations = self._constraint_violations(
             Q,
@@ -269,6 +317,7 @@ class SCAFPOptimizer:
             gains_comm,
             gains_sense,
             env["q_current"],
+            env["target_detected"],
         )
         penalty = self.cfg.constraint_penalty * sum(violations.values())
         feasible = all(value <= 1e-5 for value in violations.values())
@@ -295,6 +344,7 @@ class SCAFPOptimizer:
             "target_positions": np.zeros((self.T, 2), dtype=np.float64),
             "channel_gains": np.ones((self.M, self.K), dtype=np.float64),
             "user_weights": np.ones(self.K, dtype=np.float64),
+            "target_detected": np.ones(self.T, dtype=bool),
         }
         shapes = {
             "q_current": (self.M, 3),
@@ -302,9 +352,11 @@ class SCAFPOptimizer:
             "target_positions": (self.T, 2),
             "channel_gains": (self.M, self.K),
             "user_weights": (self.K,),
+            "target_detected": (self.T,),
         }
         for key, default in defaults.items():
-            value = np.asarray(env.get(key, default), dtype=np.float64)
+            dtype = bool if key == "target_detected" else np.float64
+            value = np.asarray(env.get(key, default), dtype=dtype)
             if value.shape != shapes[key]:
                 raise ValueError(
                     f"{key} must have shape {shapes[key]}, got {value.shape}"
@@ -373,7 +425,12 @@ class SCAFPOptimizer:
         A = self._capacity_constrained_assignment(-distances)
         gains = self._communication_gains(Q, env)
         P_comm, P_sense = self._optimize_beamforming(
-            Q, A, gains, env["target_positions"], env["user_weights"]
+            Q,
+            A,
+            gains,
+            env["target_positions"],
+            env["user_weights"],
+            env["target_detected"],
         )
         return Q, A, P_comm, P_sense
 
@@ -507,7 +564,9 @@ class SCAFPOptimizer:
             )
         candidate_power = self.P_max / float(self.K_max + 1)
         sinr = np.maximum(gains, 0.0) * candidate_power / self.N0
-        required_power = self.cfg.sinr_c_min * self.N0 / np.maximum(gains, 1e-30)
+        required_power = (
+            self.comm_sinr_min * self.N0 / np.maximum(gains, 1e-30)
+        )
         # Reward rate while discouraging links whose QoS requirement alone
         # would consume a large fraction of the UAV budget.
         scores = weights[None, :] * np.log2(1.0 + sinr)
@@ -523,6 +582,7 @@ class SCAFPOptimizer:
         channel_gains: np.ndarray,
         target_positions: np.ndarray,
         user_weights: Optional[np.ndarray] = None,
+        target_detected: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Allocate power from QoS requirements plus marginal utility.
 
@@ -536,7 +596,21 @@ class SCAFPOptimizer:
             else np.asarray(user_weights, dtype=np.float64)
         )
         sensing_gains = self._sensing_gains(Q, target_positions)
-        target_owner = np.argmax(sensing_gains, axis=0)
+        detected = (
+            np.ones(self.T, dtype=bool)
+            if target_detected is None
+            else np.asarray(target_detected, dtype=bool)
+        )
+        if detected.shape != (self.T,):
+            raise ValueError(
+                f"target_detected must have shape {(self.T,)}, "
+                f"got {detected.shape}"
+            )
+        target_owner = np.full(self.T, -1, dtype=np.int64)
+        if np.any(detected):
+            target_owner[detected] = np.argmax(
+                sensing_gains[:, detected], axis=0
+            )
         P_comm = np.zeros((self.M, self.K), dtype=np.float64)
         P_sense = np.zeros(self.M, dtype=np.float64)
 
@@ -545,7 +619,7 @@ class SCAFPOptimizer:
             owned_targets = np.flatnonzero(target_owner == m)
             comm_required = np.array(
                 [
-                    self.cfg.sinr_c_min * self.N0
+                    self.comm_sinr_min * self.N0
                     / max(channel_gains[m, k], 1e-30)
                     for k in active
                 ],
@@ -579,11 +653,11 @@ class SCAFPOptimizer:
             else:
                 comm_scores = np.empty(0, dtype=np.float64)
             sensing_score = self.cfg.lambda_sensing * float(
-                np.sqrt(sensing_gains[m]).sum()
+                np.sqrt(sensing_gains[m, detected]).sum()
             )
             score_total = float(comm_scores.sum() + sensing_score)
             if score_total <= 0.0:
-                sense_extra = spare
+                sense_extra = spare if np.any(detected) else 0.0
                 comm_extra = np.zeros_like(comm_scores)
             else:
                 comm_extra = spare * comm_scores / score_total
@@ -662,6 +736,7 @@ class SCAFPOptimizer:
         gains_comm: np.ndarray,
         gains_sense: np.ndarray,
         user_weights: np.ndarray,
+        target_detected: np.ndarray,
     ) -> float:
         comm_sinr = gains_comm * P_comm / self.N0
         comm_utility = float(
@@ -676,8 +751,15 @@ class SCAFPOptimizer:
         )
         # Each target is considered served by its best UAV.  A logarithmic
         # term keeps communication and sensing on comparable numerical scales.
-        sensing_utility = float(
-            np.log2(1.0 + np.max(sensing_sinr, axis=0)).sum()
+        detected = np.asarray(target_detected, dtype=bool)
+        sensing_utility = (
+            float(
+                np.log2(
+                    1.0 + np.max(sensing_sinr[:, detected], axis=0)
+                ).sum()
+            )
+            if np.any(detected)
+            else 0.0
         )
         idle_count = float(np.sum(A.sum(axis=1) < 0.5))
         return (
@@ -695,6 +777,7 @@ class SCAFPOptimizer:
         gains_comm: np.ndarray,
         gains_sense: np.ndarray,
         q_current: np.ndarray,
+        target_detected: np.ndarray,
     ) -> Dict[str, float]:
         column_error = float(np.max(np.abs(A.sum(axis=0) - 1.0)))
         load_excess = float(
@@ -745,8 +828,8 @@ class SCAFPOptimizer:
         if active_sinr.size:
             comm_shortfall = float(
                 np.max(
-                    np.maximum(self.cfg.sinr_c_min - active_sinr, 0.0)
-                ) / max(self.cfg.sinr_c_min, 1e-30)
+                    np.maximum(self.comm_sinr_min - active_sinr, 0.0)
+                ) / max(self.comm_sinr_min, 1e-30)
             )
         else:
             comm_shortfall = 1.0
@@ -757,12 +840,21 @@ class SCAFPOptimizer:
             * self.N_r
             / self.N0
         )
-        best_sensing_sinr = np.max(sensing_sinr, axis=0)
-        sensing_shortfall = float(
-            np.max(
-                np.maximum(self.cfg.sinr_s_min - best_sensing_sinr, 0.0)
-            ) / max(self.cfg.sinr_s_min, 1e-30)
-        )
+        detected = np.asarray(target_detected, dtype=bool)
+        if np.any(detected):
+            best_sensing_sinr = np.max(
+                sensing_sinr[:, detected], axis=0
+            )
+            sensing_shortfall = float(
+                np.max(
+                    np.maximum(
+                        self.cfg.sinr_s_min - best_sensing_sinr, 0.0
+                    )
+                )
+                / max(self.cfg.sinr_s_min, 1e-30)
+            )
+        else:
+            sensing_shortfall = 0.0
         return {
             "association_column_error": column_error,
             "association_load_excess": load_excess,
@@ -787,8 +879,19 @@ class SCAFPOptimizer:
         channel_gains: np.ndarray,
         target_positions: np.ndarray,
         user_weights: np.ndarray,
+        target_detected: Optional[np.ndarray] = None,
     ) -> float:
         gains_sense = self._sensing_gains(Q, target_positions)
         return self._raw_utility(
-            A, P_comm, P_sense, channel_gains, gains_sense, user_weights
+            A,
+            P_comm,
+            P_sense,
+            channel_gains,
+            gains_sense,
+            user_weights,
+            (
+                np.ones(self.T, dtype=bool)
+                if target_detected is None
+                else target_detected
+            ),
         )

@@ -278,6 +278,15 @@ class OracleDataGenerator:
         delta_q_chosen, delta_a_chosen, delta_p_chosen = self._extract_prior(
             chosen_sol, env_sample,
         )
+        chosen_eval = self.evaluate_prior(
+            env_dict,
+            delta_q_chosen,
+            delta_a_chosen,
+            delta_p_chosen,
+        )
+        if not chosen_eval["feasible"]:
+            return None, []
+        chosen_utility = float(chosen_eval["utility"])
 
         # Step 5: 构造 Rejected
         rejected_delta_q, rejected_util = self._construct_rejected(
@@ -301,14 +310,16 @@ class OracleDataGenerator:
             "id": f"env_{sample_id}",
             "prompt": prompt,
             "response": response_chosen,
-            "utility": float(chosen_sol.utility),
+            "utility": chosen_utility,
             "q_current": q_current.tolist(),
             "delta_q": delta_q_chosen.tolist(),
             "delta_a": delta_a_chosen.tolist(),
             "delta_p": delta_p_chosen.tolist(),
             "solver_algorithm": chosen_sol.algorithm,
-            "oracle_feasible": bool(chosen_sol.feasible),
-            "constraint_violations": chosen_sol.constraint_violations,
+            "oracle_feasible": bool(chosen_eval["feasible"]),
+            "constraint_violations": chosen_eval[
+                "constraint_violations"
+            ],
             **selection_diagnostics,
         }
 
@@ -320,9 +331,9 @@ class OracleDataGenerator:
 
         # Gap: 启发式陷阱 → 保守估计 5% gap; SCA-FP 次优解 → 实际 gap
         if rejected_util is not None:
-            gap = float(chosen_sol.utility) - rejected_util
+            gap = chosen_utility - rejected_util
         else:
-            gap = abs(float(chosen_sol.utility)) * 0.05
+            gap = abs(chosen_utility) * 0.05
 
         # 如果 Rejected δ_q 在物理上退化为 Chosen → 丢弃
         if np.allclose(rejected_delta_q, delta_q_chosen, atol=1e-3):
@@ -335,7 +346,7 @@ class OracleDataGenerator:
                 "prompt": prompt,
                 "chosen": response_chosen,
                 "rejected": rejected_response,
-                "utility_chosen": float(chosen_sol.utility),
+                "utility_chosen": chosen_utility,
                 "utility_gap": gap,
                 "q_current": q_current.tolist(),
                 "delta_q": delta_q_chosen.tolist(),
@@ -556,14 +567,12 @@ class OracleDataGenerator:
         delta_p[:, :K] = solution.W_c_power
         delta_p[:, K] = solution.W_s_power
 
-        # Round to 4 decimal places (0.1mm) — drastically reduces token count
-        # for BPE tokenizers that fragment high-precision floats like 0.1910400390625
-        # into 5-8 subword tokens each. 4 decimals is ~10μm, well below UAV control limits.
-        # .astype(np.float32) removed: np.round already produces clean 4-decimal values;
-        # downstream JSON serialization strips the dtype anyway.
-        return (np.round(delta_q, 4),
-                np.round(delta_a, 4),
-                np.round(delta_p, 4))
+        # Six decimals avoid float32 representation tails in JSON while
+        # retaining enough precision for the post-serialization feasibility
+        # gate.
+        return (np.round(delta_q, 6),
+                np.round(delta_a, 6),
+                np.round(delta_p, 6))
 
     def evaluate_prior(
         self,
@@ -573,16 +582,28 @@ class OracleDataGenerator:
         delta_p: np.ndarray,
     ) -> Dict:
         """Evaluate the exact Q/A/P tuple serialized into a data record."""
-        Q, A, P_comm, P_sense = self.solver._warmstart_to_init(
-            {
-                "delta_q": delta_q,
-                "delta_a": delta_a,
-                "delta_p": delta_p,
-            },
-            self.solver._validate_environment(env_dict),
-        )
+        validated = self.solver._validate_environment(env_dict)
+        delta_q = np.asarray(delta_q, dtype=np.float64)
+        delta_a = np.asarray(delta_a, dtype=np.float64)
+        delta_p = np.asarray(delta_p, dtype=np.float64)
+        expected = {
+            "delta_q": ((self.solver.M, 3), delta_q),
+            "delta_a": ((self.solver.M, self.solver.K), delta_a),
+            "delta_p": ((self.solver.M, self.solver.K + 1), delta_p),
+        }
+        for name, (shape, value) in expected.items():
+            if value.shape != shape:
+                raise ValueError(
+                    f"{name} must have shape {shape}, got {value.shape}"
+                )
+            if not np.isfinite(value).all():
+                raise ValueError(f"{name} contains NaN or infinity")
+        Q = validated["q_current"] + delta_q
+        A = delta_a
+        P_comm = delta_p[:, : self.solver.K]
+        P_sense = delta_p[:, self.solver.K]
         return self.solver.evaluate_solution(
-            Q, A, P_comm, P_sense, env_dict
+            Q, A, P_comm, P_sense, validated
         )
 
     def _env_sample_to_dict(self, env_sample: EnvironmentSample) -> Dict:
@@ -591,6 +612,7 @@ class OracleDataGenerator:
             "q_current": env_sample.q_current.copy(),
             "user_positions": env_sample.u_positions.copy(),
             "target_positions": env_sample.s_positions.copy(),
+            "target_detected": env_sample.target_detected.copy(),
             "channel_gains": env_sample.channel_gains_users.copy(),
             "user_weights": env_sample.user_weights.copy().astype(np.float32),
             "association": env_sample.association.copy(),

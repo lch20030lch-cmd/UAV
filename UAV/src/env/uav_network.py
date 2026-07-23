@@ -69,6 +69,8 @@ class UAVNetwork:
         num_targets: int = 6,
         area_size: Tuple[float, float] = (1000.0, 1000.0),
         altitude_range: Tuple[float, float] = (50.0, 300.0),
+        rate_requirement_bps: float = 1e6,
+        target_detection_probability: float = 0.8,
         seed: Optional[int] = None,
     ):
         self.M = num_uavs
@@ -76,6 +78,16 @@ class UAVNetwork:
         self.T = num_targets
         self.area_w, self.area_h = area_size
         self.H_min, self.H_max = altitude_range
+        self.rate_requirement_bps = float(rate_requirement_bps)
+        self.target_detection_probability = float(
+            target_detection_probability
+        )
+        if self.rate_requirement_bps < 0.0:
+            raise ValueError("rate_requirement_bps must be non-negative")
+        if not 0.0 <= self.target_detection_probability <= 1.0:
+            raise ValueError(
+                "target_detection_probability must be in [0, 1]"
+            )
 
         self.rng = np.random.RandomState(seed)
 
@@ -130,6 +142,7 @@ class UAVNetwork:
                 idx=k,
                 position_2d=np.array([ux, uy], dtype=np.float32),
                 weight=weight,
+                rate_requirement_bps=self.rate_requirement_bps,
             ))
 
         # --- 目标初始化 ---
@@ -143,7 +156,9 @@ class UAVNetwork:
                 idx=t,
                 position_2d=np.array([tx, ty], dtype=np.float32),
                 velocity_2d=np.array([tvx, tvy], dtype=np.float32),
-                detected=self.rng.rand() > 0.2,  # 80% 被检测到
+                detected=(
+                    self.rng.rand() < self.target_detection_probability
+                ),
             ))
 
         # 初始关联: 最近 UAV 原则

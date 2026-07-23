@@ -17,7 +17,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from src.data.geometry_cues import parse_q_geometry_cues
-from src.data.oracle_contract import validate_dataset_metadata
+from src.data.oracle_contract import SCHEMA_VERSION, validate_dataset_metadata
 
 
 def validate_multimodal_oracle_contract(
@@ -39,6 +39,12 @@ def validate_multimodal_oracle_contract(
     with metadata_path.open("r", encoding="utf-8") as handle:
         metadata = json.load(handle)
     try:
+        schema_version = int(metadata.get("schema_version", 0))
+    except (TypeError, ValueError):
+        schema_version = 0
+    if allow_legacy and schema_version < SCHEMA_VERSION:
+        return metadata
+    try:
         return validate_dataset_metadata(
             metadata,
             data_dir=Path(data_dir),
@@ -46,8 +52,6 @@ def validate_multimodal_oracle_contract(
             expected_seed=expected_seed,
         )
     except (KeyError, TypeError, ValueError):
-        if allow_legacy:
-            return metadata
         raise
 
 
@@ -230,7 +234,8 @@ class MultimodalSFTDataset(Dataset):
     def __getitem__(self, idx):
         item = self.data[idx]
         image_path = self.data_dir / item["bev_image_path"]
-        image = Image.open(image_path).convert("RGB")
+        with Image.open(image_path) as source:
+            image = source.convert("RGB")
 
         response_ids = []
         if self.include_response:
@@ -460,7 +465,10 @@ class MultimodalDPODataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        image = Image.open(self.data_dir / item["bev_image_path"]).convert("RGB")
+        with Image.open(
+            self.data_dir / item["bev_image_path"]
+        ) as source:
+            image = source.convert("RGB")
         chosen = self._encode(item["prompt"], item["chosen"], image)
         rejected = self._encode(item["prompt"], item["rejected"], image)
         result = {}

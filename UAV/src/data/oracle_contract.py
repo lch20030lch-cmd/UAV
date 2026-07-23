@@ -17,8 +17,8 @@ from typing import Dict, Mapping, Optional
 SCHEMA_VERSION = 5
 PROMPT_TYPE = "multimodal_bev_image_v5_constraint_aware"
 SOLVER_ALGORITHM = "constraint_aware_alternating_optimization"
-SOLVER_REVISION = 2
-CHANNEL_MODEL = "elevation_los_3gpp_pathloss_v2"
+SOLVER_REVISION = 3
+CHANNEL_MODEL = "elevation_los_3gpp_pathloss_v3"
 ORACLE_SELECTION_MODE = "near_optimal_q_medoid"
 DEFAULT_ORACLE_SELECTION_UTILITY_TOLERANCE = 0.01
 
@@ -27,6 +27,7 @@ SIMULATION_KEYS = (
     "num_uavs",
     "num_users",
     "num_targets",
+    "target_detection_probability",
     "num_antennas_tx",
     "num_antennas_rx",
     "carrier_freq_ghz",
@@ -315,10 +316,14 @@ def validate_dataset_metadata(
             dpo_file,
         )
         stored_content_fingerprint = metadata.get("content_fingerprint")
-        if (
-            stored_content_fingerprint is not None
-            and stored_content_fingerprint != actual_content_fingerprint
+        if not isinstance(stored_content_fingerprint, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", stored_content_fingerprint
         ):
+            raise ValueError(
+                "completed v5 Oracle dataset metadata must contain a sealed "
+                "64-character SHA-256 content_fingerprint"
+            )
+        if stored_content_fingerprint != actual_content_fingerprint:
             raise ValueError(
                 "Oracle dataset content fingerprint does not match its files: "
                 f"metadata={stored_content_fingerprint}, "

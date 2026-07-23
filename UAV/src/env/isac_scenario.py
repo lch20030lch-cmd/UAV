@@ -30,6 +30,7 @@ class EnvironmentSample:
     q_current: np.ndarray         # UAV 位置 (M, 3)
     u_positions: np.ndarray       # 用户位置 (K, 2)
     s_positions: np.ndarray       # 目标位置 (T, 2)
+    target_detected: np.ndarray   # 可见目标 mask (T,)
     association: np.ndarray       # 当前关联 (M, K)
     user_weights: np.ndarray      # 用户权重 (K,) — ω_k, 来自 UAVNetwork
 
@@ -62,6 +63,9 @@ class ISACScenarioGenerator:
         num_users: int = 20,
         num_targets: int = 6,
         area_size: Tuple[float, float] = (1000.0, 1000.0),
+        altitude_range: Tuple[float, float] = (50.0, 300.0),
+        rate_requirement_bps: float = 1e6,
+        target_detection_probability: float = 0.8,
         carrier_freq_ghz: float = 5.8,
         bandwidth_mhz: float = 20.0,
         num_antennas: int = 8,
@@ -74,6 +78,11 @@ class ISACScenarioGenerator:
         self.K = num_users
         self.T = num_targets
         self.area_size = area_size
+        self.altitude_range = altitude_range
+        self.rate_requirement_bps = float(rate_requirement_bps)
+        self.target_detection_probability = float(
+            target_detection_probability
+        )
 
         self.channel = ISACChannel(
             carrier_freq_ghz=carrier_freq_ghz,
@@ -110,6 +119,9 @@ class ISACScenarioGenerator:
             num_users=self.K,
             num_targets=self.T,
             area_size=self.area_size,
+            altitude_range=self.altitude_range,
+            rate_requirement_bps=self.rate_requirement_bps,
+            target_detection_probability=self.target_detection_probability,
             seed=int(sample_rng.randint(0, 2**31 - 1)),
         )
 
@@ -157,6 +169,7 @@ class ISACScenarioGenerator:
             q_current=state["uav_positions"].copy(),
             u_positions=state["user_positions"].copy(),
             s_positions=state["target_positions"].copy(),
+            target_detected=state["target_detected"].copy(),
             association=state["association"].copy(),
             user_weights=state["user_weights"].copy(),
             channel_gains_users=channel_gains,

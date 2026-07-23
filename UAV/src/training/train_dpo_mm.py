@@ -29,6 +29,7 @@ from transformers import get_scheduler, set_seed
 
 from src.data.multimodal_dataset import (
     MultimodalDPODataset,
+    resolve_multimodal_chat_template,
     validate_multimodal_oracle_contract,
 )
 from src.data.oracle_contract import (
@@ -36,7 +37,10 @@ from src.data.oracle_contract import (
     validate_checkpoint_dataset_compatibility,
 )
 from src.model import Gemma3MultimodalISAC, UAVISACLosses, build_proj_head_config
-from src.model.gemma_multimodal_isac import is_vision_parameter_name
+from src.model.gemma_multimodal_isac import (
+    is_vision_parameter_name,
+    keep_vision_modules_in_eval_mode,
+)
 from src.training.runtime_utils import (
     resolve_optimizer_steps,
     resolve_warmup_steps,
@@ -113,10 +117,20 @@ def _load_model(cfg: dict, checkpoint_dir: Path, trainable: bool):
         lora_checkpoint=_resolve_lora(checkpoint_dir),
     )
     projection_path = checkpoint_dir / "projection_head.pt"
+    if not projection_path.is_file():
+        raise FileNotFoundError(
+            f"multimodal checkpoint is missing {projection_path}"
+        )
     model.projection_head.load_state_dict(
         torch.load(projection_path, map_location="cpu"), strict=True
     )
-    model.load_control_token_embeddings(checkpoint_dir)
+    loaded_control = model.load_control_token_embeddings(checkpoint_dir)
+    missing_control = {"ctrl_embed", "ctrl_offset"} - set(loaded_control)
+    if missing_control:
+        raise FileNotFoundError(
+            "multimodal checkpoint is missing control-token state: "
+            f"{sorted(missing_control)}"
+        )
     if not trainable:
         for parameter in model.parameters():
             parameter.requires_grad = False
@@ -144,6 +158,7 @@ def _forward(model, batch: dict, suffix: str, logit_positions: torch.Tensor):
         "control_mask": batch[f"control_mask_{suffix}"],
         "q_current": batch["q_current"],
         "q_geometry_cues": batch["q_geometry_cues"],
+        "q_geometry_mask": batch["q_geometry_mask"],
         "compute_full_logits": True,
         "logits_to_keep": logit_positions,
     }
@@ -217,18 +232,42 @@ def train_multimodal_dpo(args):
     )
     policy, stage1_metadata = _load_model(cfg, checkpoint_dir, trainable=True)
     reference, _ = _load_model(cfg, checkpoint_dir, trainable=False)
+    train_control_offsets = bool(
+        train_cfg.get("train_control_offsets", True)
+    )
+    policy.control_token_offsets.requires_grad_(train_control_offsets)
     policy.base_model.train()
+    frozen_vision_modules = keep_vision_modules_in_eval_mode(
+        policy.base_model
+    )
     policy.projection_head.train()
 
     max_length = int(args.max_length or train_cfg["max_seq_length"])
+    use_chat_template = resolve_multimodal_chat_template(
+        dataset_metadata=dataset_metadata,
+        checkpoint_metadata=stage1_metadata,
+        configured_value=cfg["training"]["sft"].get(
+            "use_chat_template"
+        ),
+    )
     dataset = MultimodalDPODataset(
-        data_path=str(data_root / data_cfg.get("dpo_file", "dpo_dataset.jsonl")),
+        data_path=str(
+            data_root
+            / dataset_metadata.get(
+                "dpo_file", data_cfg.get("dpo_file", "dpo_dataset.jsonl")
+            )
+        ),
         data_dir=str(data_root),
         processor=policy.processor,
         max_length=max_length,
         num_control_tokens=cfg["model"]["control_token"]["num_tokens"],
-        use_chat_template=True,
+        use_chat_template=use_chat_template,
     )
+    if len(dataset) == 0:
+        raise ValueError(
+            "multimodal DPO dataset is empty: "
+            f"{data_root / dataset_metadata.get('dpo_file', 'dpo_dataset.jsonl')}"
+        )
     dataloader = DataLoader(
         dataset,
         batch_size=int(train_cfg.get("per_device_batch_size", 1)),
@@ -259,28 +298,66 @@ def train_multimodal_dpo(args):
         if args.learning_rate is not None
         else train_cfg.get("learning_rate", 5e-5)
     )
-    projection_lr = float(args.projection_lr)
+    projection_lr = float(
+        args.projection_lr
+        if args.projection_lr is not None
+        else train_cfg.get("projection_lr", 1e-4)
+    )
     beta = float(args.beta if args.beta is not None else train_cfg.get("beta", 0.1))
-    sft_anchor = float(args.sft_anchor)
-    control_anchor = float(args.control_anchor)
+    sft_anchor = float(
+        args.sft_anchor
+        if args.sft_anchor is not None
+        else train_cfg.get("sft_anchor", 0.05)
+    )
+    control_anchor = float(
+        args.control_anchor
+        if args.control_anchor is not None
+        else train_cfg.get("control_anchor", 0.1)
+    )
+    if projection_lr <= 0.0 or learning_rate <= 0.0:
+        raise ValueError("DPO learning rates must be positive")
+    if beta <= 0.0:
+        raise ValueError("DPO beta must be positive")
+    if sft_anchor < 0.0 or control_anchor < 0.0:
+        raise ValueError("DPO anchor weights must be non-negative")
 
-    lora_parameters = [
-        parameter
+    lora_named_parameters = [
+        (name, parameter)
         for name, parameter in policy.base_model.named_parameters()
         if parameter.requires_grad
         and "lora_" in name
-        and not is_vision_parameter_name(name)
+    ]
+    trainable_vision_lora_names = [
+        name
+        for name, _ in lora_named_parameters
+        if is_vision_parameter_name(name)
+    ]
+    if trainable_vision_lora_names:
+        raise RuntimeError(
+            "multimodal DPO must keep vision LoRA frozen, but found "
+            f"{trainable_vision_lora_names[:5]}"
+        )
+    lora_parameters = [
+        parameter
+        for name, parameter in lora_named_parameters
+        if not is_vision_parameter_name(name)
     ]
     projection_parameters = [
         parameter for parameter in policy.projection_head.parameters()
         if parameter.requires_grad
     ]
+    control_offset_parameters = [
+        policy.control_token_offsets
+    ] if policy.control_token_offsets.requires_grad else []
     if not lora_parameters:
         raise RuntimeError("no trainable language LoRA parameters found")
     optimizer = torch.optim.AdamW(
         [
             {"params": lora_parameters, "lr": learning_rate},
-            {"params": projection_parameters, "lr": projection_lr},
+            {
+                "params": projection_parameters + control_offset_parameters,
+                "lr": projection_lr,
+            },
         ],
         weight_decay=float(train_cfg.get("weight_decay", 0.01)),
     )
@@ -328,7 +405,16 @@ def train_multimodal_dpo(args):
         "beta": beta,
         "sft_anchor": sft_anchor,
         "control_anchor": control_anchor,
-        "use_chat_template": True,
+        "train_control_offsets": train_control_offsets,
+        "trainable_control_offset_tensors": len(
+            control_offset_parameters
+        ),
+        "trainable_language_lora_tensors": len(lora_parameters),
+        "trainable_vision_lora_tensors": len(
+            trainable_vision_lora_names
+        ),
+        "vision_modules_kept_in_eval": len(frozen_vision_modules),
+        "use_chat_template": use_chat_template,
         **checkpoint_dataset_fields(dataset_metadata),
     }
     loss_helper = UAVISACLosses(
@@ -337,13 +423,40 @@ def train_multimodal_dpo(args):
         lambda_a=cfg["model"]["loss"]["lambda_a"],
         lambda_p=cfg["model"]["loss"]["lambda_p"],
         lambda_sep=cfg["model"]["loss"]["lambda_sep"],
+        lambda_assoc_ce=cfg["training"]["sft"]["phase1"].get(
+            "lambda_assoc_ce", 0.0
+        ),
+        lambda_assoc_raw_ce=cfg["training"]["sft"]["phase1"].get(
+            "lambda_assoc_raw_ce", 0.0
+        ),
+        lambda_q_dir=cfg["training"]["sft"]["phase1"].get(
+            "lambda_q_dir", 0.0
+        ),
+        lambda_q_projected_dir=cfg["training"]["sft"]["phase1"].get(
+            "lambda_q_projected_dir", 0.0
+        ),
+        lambda_q_cue_ce=cfg["training"]["sft"]["phase1"].get(
+            "lambda_q_cue_ce", 0.0
+        ),
+        lambda_p_raw_kl=cfg["training"]["sft"]["phase1"].get(
+            "lambda_p_raw_kl", 0.0
+        ),
+        power_temperature=float(
+            cfg["model"]["projection_head"]["tau_power"]
+        ),
     )
 
     device = policy.device
     optimizer.zero_grad(set_to_none=True)
     global_step = 0
     micro_step = 0
-    metric_sums = {"loss": 0.0, "loss_dpo": 0.0, "loss_sft": 0.0, "loss_ctl": 0.0}
+    metric_sums = {
+        "loss": 0.0,
+        "loss_dpo": 0.0,
+        "loss_sft": 0.0,
+        "loss_ctl": 0.0,
+        "dpo_accuracy": 0.0,
+    }
     metric_count = 0
     print("=" * 60)
     print("BEV-image multimodal DPO")
@@ -354,6 +467,19 @@ def train_multimodal_dpo(args):
     print(f"  gradient accumulation: {accumulation}")
     print(f"  lr scheduler:          {scheduler_name}")
     print(f"  warmup steps:          {warmup_steps}")
+    print(
+        "  trainable control offsets: "
+        f"{len(control_offset_parameters)}"
+    )
+    print(f"  trainable language LoRA: {len(lora_parameters)}")
+    print(
+        "  trainable vision LoRA:   "
+        f"{len(trainable_vision_lora_names)}"
+    )
+    print(
+        "  vision modules in eval:  "
+        f"{len(frozen_vision_modules)}"
+    )
     print(
         f"  checkpoints:           {checkpoint_root} "
         f"(every {checkpoint_interval} steps, keep {checkpoint_limit})"
@@ -409,10 +535,15 @@ def train_multimodal_dpo(args):
             for key in ("delta_q_raw", "delta_a_raw", "delta_p_raw"):
                 if key in chosen:
                     delta_hat[key] = chosen[key]
+            if "q_cue_logits" in chosen:
+                delta_hat["q_cue_logits"] = chosen["q_cue_logits"]
             delta_target = {
                 "delta_q": batch["delta_q_target"],
                 "delta_a": batch["delta_a_target"],
                 "delta_p": batch["delta_p_target"],
+                "q_current": batch["q_current"],
+                "q_geometry_cues": batch["q_geometry_cues"],
+                "q_geometry_mask": batch["q_geometry_mask"],
             }
             loss_ctl, _ = loss_helper.compute_phase1_total(
                 delta_hat, delta_target, phase1_lambda_ctl=1.0
@@ -434,6 +565,9 @@ def train_multimodal_dpo(args):
             metric_sums["loss_dpo"] += float(loss_dpo.detach().item())
             metric_sums["loss_sft"] += float(loss_sft.detach().item())
             metric_sums["loss_ctl"] += float(loss_ctl.detach().item())
+            metric_sums["dpo_accuracy"] += float(
+                (preference_logit.detach() > 0.0).float().mean().item()
+            )
             metric_count += 1
             micro_step += 1
             is_full_window = micro_step % accumulation == 0
@@ -450,6 +584,13 @@ def train_multimodal_dpo(args):
                 projection_parameters,
                 float(cfg["hardware"].get("max_grad_norm", 1.0)),
             )
+            if control_offset_parameters:
+                torch.nn.utils.clip_grad_norm_(
+                    control_offset_parameters,
+                    float(
+                        cfg["hardware"].get("max_grad_norm", 1.0)
+                    ),
+                )
             step_lora_lr = float(optimizer.param_groups[0]["lr"])
             step_projection_lr = float(optimizer.param_groups[1]["lr"])
             optimizer.step()
@@ -464,6 +605,7 @@ def train_multimodal_dpo(args):
                 "loss_dpo": 0.0,
                 "loss_sft": 0.0,
                 "loss_ctl": 0.0,
+                "dpo_accuracy": 0.0,
             }
             metric_count = 0
             progress.update(1)
@@ -473,6 +615,7 @@ def train_multimodal_dpo(args):
                 f"loss_dpo={window_metrics['loss_dpo']:.6f} "
                 f"loss_sft={window_metrics['loss_sft']:.6f} "
                 f"loss_ctl={window_metrics['loss_ctl']:.6f} "
+                f"dpo_accuracy={window_metrics['dpo_accuracy']:.6f} "
                 f"lr_lora={step_lora_lr:.9g} "
                 f"lr_projection={step_projection_lr:.9g}"
             )
@@ -526,10 +669,10 @@ def main():
     parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
-    parser.add_argument("--projection_lr", type=float, default=1e-4)
+    parser.add_argument("--projection_lr", type=float, default=None)
     parser.add_argument("--beta", type=float, default=None)
-    parser.add_argument("--sft_anchor", type=float, default=0.05)
-    parser.add_argument("--control_anchor", type=float, default=0.1)
+    parser.add_argument("--sft_anchor", type=float, default=None)
+    parser.add_argument("--control_anchor", type=float, default=None)
     parser.add_argument("--checkpoint_dir", default=None)
     parser.add_argument("--save_steps", type=int, default=None)
     parser.add_argument("--save_total_limit", type=int, default=None)

@@ -24,6 +24,9 @@ from src.data.multimodal_dataset import (
     resolve_multimodal_chat_template,
     validate_multimodal_oracle_contract,
 )
+from src.data.oracle_contract import (
+    validate_checkpoint_dataset_compatibility,
+)
 from src.model import Gemma3MultimodalISAC, build_proj_head_config
 
 
@@ -54,12 +57,25 @@ def _load_projection_head(model: Gemma3MultimodalISAC, checkpoint: str):
     return str(ckpt_path)
 
 
-def _load_control_token_embeddings(model: Gemma3MultimodalISAC, checkpoint: str):
+def _load_control_token_embeddings(
+    model: Gemma3MultimodalISAC,
+    checkpoint: str,
+    *,
+    require_complete: bool = False,
+):
     if not checkpoint:
         return {}
     ckpt_path = Path(checkpoint)
     ckpt_root = ckpt_path if ckpt_path.is_dir() else ckpt_path.parent
-    return model.load_control_token_embeddings(ckpt_root)
+    loaded = model.load_control_token_embeddings(ckpt_root)
+    if require_complete:
+        missing = {"ctrl_embed", "ctrl_offset"} - set(loaded)
+        if missing:
+            raise FileNotFoundError(
+                "checkpoint is missing required control-token state: "
+                f"{sorted(missing)}"
+            )
+    return loaded
 
 
 def _read_checkpoint_metadata(checkpoint: str) -> dict:
@@ -96,6 +112,16 @@ def main():
                         help="LoRA adapter 目录；不填时会尝试从 --checkpoint/lora 自动发现")
     parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument(
+        "--allow_legacy_dataset",
+        action="store_true",
+        help="diagnostic-only override for pre-v5 data",
+    )
+    parser.add_argument(
+        "--allow_checkpoint_dataset_mismatch",
+        action="store_true",
+        help="diagnostic-only checkpoint provenance override",
+    )
+    parser.add_argument(
         "--use_chat_template",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -127,13 +153,25 @@ def main():
     data_dir = Path(args.data_dir or data_cfg["output_dir"])
     dataset_metadata = validate_multimodal_oracle_contract(
         data_dir,
-        allow_legacy=True,
+        allow_legacy=args.allow_legacy_dataset,
         expected_simulation=sim_cfg,
     )
-    data_path = data_dir / data_cfg.get("sft_file", "sft_dataset.jsonl")
+    data_path = data_dir / dataset_metadata.get(
+        "sft_file", data_cfg.get("sft_file", "sft_dataset.jsonl")
+    )
     max_length = args.max_length or train_cfg["max_seq_length"]
     lora_checkpoint = _resolve_lora_checkpoint(args.checkpoint, args.lora_checkpoint)
     checkpoint_metadata = _read_checkpoint_metadata(args.checkpoint)
+    if args.checkpoint and dataset_metadata and not checkpoint_metadata:
+        raise FileNotFoundError(
+            "current-schema checkpoint diagnostics require metadata.json"
+        )
+    if checkpoint_metadata and dataset_metadata:
+        validate_checkpoint_dataset_compatibility(
+            checkpoint_metadata,
+            dataset_metadata,
+            allow_mismatch=args.allow_checkpoint_dataset_mismatch,
+        )
     use_chat_template = resolve_multimodal_chat_template(
         dataset_metadata=dataset_metadata,
         checkpoint_metadata=checkpoint_metadata,
@@ -172,7 +210,11 @@ def main():
         lora_checkpoint=lora_checkpoint,
     )
     loaded_projection = _load_projection_head(model, args.checkpoint)
-    loaded_control_embeddings = _load_control_token_embeddings(model, args.checkpoint)
+    loaded_control_embeddings = _load_control_token_embeddings(
+        model,
+        args.checkpoint,
+        require_complete=bool(dataset_metadata),
+    )
     model.eval()
 
     dataset = MultimodalSFTDataset(
@@ -197,7 +239,6 @@ def main():
             "delta_q_target",
             "delta_a_target",
             "delta_p_target",
-            "q_geometry_mask",
         }
     }
 

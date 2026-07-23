@@ -22,7 +22,11 @@ training:
     lr_scheduler: "cosine"
     warmup_ratio: 0.03
     weight_decay: 0.01
-    max_seq_length: 4096
+    # Control-only SFT excludes the ~830-token JSON response.  Current v5
+    # multimodal prompts fit below 2.8k tokens; 3072 avoids silent truncation
+    # while materially reducing attention cost.  DPO keeps 4096 below because
+    # it does supervise the response tokens.
+    max_seq_length: 3072
     # Gemma-3-4b-it expects the same multimodal chat layout in control-only
     # SFT, response SFT, diagnostics, and DPO.
     use_chat_template: true
@@ -32,8 +36,19 @@ training:
 
     phase1:
       enabled: true
-      lr_lora: 5.0e-4
+      projection_lr: 3.0e-4
+      # Start with the compact control-state adapter.  Full LoRA is only
+      # enabled after the isolated-head train/validation gate passes.
+      train_control_offsets: true
+      lr_lora: 1.0e-5
       lambda_ctl: 1.0
+      lambda_lm_ce: 0.0
+      lambda_assoc_ce: 0.2
+      lambda_assoc_raw_ce: 1.0
+      lambda_q_dir: 1.0
+      lambda_q_projected_dir: 0.0
+      lambda_q_cue_ce: 0.0
+      lambda_p_raw_kl: 1.0
       sensitivity_check_steps: 10
       sensitivity_threshold: 0.1
       max_steps: 30
@@ -47,6 +62,10 @@ training:
     warmup_ratio: 0.03
     beta: 0.1
     mu: 0.0
+    sft_anchor: 0.05
+    control_anchor: 0.1
+    train_control_offsets: true
+    projection_lr: 1.0e-4
     max_seq_length: 4096
     save_steps: 10
     save_total_limit: 2
@@ -74,6 +93,9 @@ model:
     hidden_dim: 2560
 
   projection_head:
+    head_type: "split"
+    q_projection_mode: "direction"
+    q_geometry_mode: "none"
     hidden_dim: 2560
     mlp_hidden: [256, 256]
     readout_out_dim: 128
@@ -87,10 +109,12 @@ model:
 
   loss:
     lambda_ctl: 0.5
-    lambda_q: 1.0
-    lambda_a: 0.5
-    lambda_p: 0.3
-    lambda_p_raw_kl: 0.0
+    # Raw metre-space Q MSE is intentionally disabled.  Q is trained through
+    # the direction loss above; otherwise it dominates the joint objective.
+    lambda_q: 0.0
+    lambda_a: 0.0
+    lambda_p: 0.1
+    lambda_p_raw_kl: 1.0
     lambda_sep: 0.1
 
 simulation:
@@ -98,6 +122,7 @@ simulation:
   num_uavs: 4
   num_users: 20
   num_targets: 6
+  target_detection_probability: 0.8
   num_antennas_tx: 8
   num_antennas_rx: 8
   carrier_freq_ghz: 5.8

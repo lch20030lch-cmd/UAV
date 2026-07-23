@@ -86,6 +86,22 @@ class FixedResidualQGeometryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "explicit q_fixed_cue_weights"):
             _make_head(weights=None)
 
+    def test_fixed_geometry_renormalizes_over_valid_cues(self):
+        head = _make_head(weights=[0.2, 0.3, 0.5])
+        raw = torch.zeros(1, 1, 3)
+        cues = torch.tensor(
+            [[[[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]]]
+        )
+        mask = torch.tensor([[[1.0, 0.0, 0.0]]])
+
+        composed = head._compose_q_from_geometry_cues(
+            raw, cues, None, mask
+        )
+
+        torch.testing.assert_close(
+            composed, torch.tensor([[[15.0, 0.0, 0.0]]])
+        )
+
     def test_old_mode_does_not_add_checkpoint_parameters(self):
         head = _make_head(mode="none")
         self.assertNotIn("q_residual_adapter.weight", head.state_dict())

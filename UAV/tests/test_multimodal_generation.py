@@ -5,8 +5,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts.generate_mm_smoke import (
+    _append_paired_jsonl,
     _finalize_dataset_metadata,
     _process_one,
+    _recover_pending_pair,
 )
 
 
@@ -29,6 +31,33 @@ class _RejectedEnvironmentGenerator:
 
 
 class MultimodalGenerationTest(unittest.TestCase):
+    def test_pending_pair_recovery_completes_interrupted_append(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            sft_path = root / "sft.jsonl"
+            dpo_path = root / "dpo.jsonl"
+            journal = root / ".pending_pair.json"
+            sft = {"id": "env_3", "value": 1}
+            dpo = {"id": "env_3_dpo", "value": 2}
+
+            _append_paired_jsonl(
+                journal, sft_path, dpo_path, sft, dpo
+            )
+            self.assertFalse(journal.exists())
+            self.assertEqual(sft_path.read_text().count("\n"), 1)
+            self.assertEqual(dpo_path.read_text().count("\n"), 1)
+
+            journal.write_text(
+                '{"sft":{"id":"env_4"},"dpo":{"id":"env_4_dpo"}}',
+                encoding="utf-8",
+            )
+            with sft_path.open("a", encoding="utf-8") as handle:
+                handle.write('{"id":"env_4"}\n')
+            _recover_pending_pair(journal, sft_path, dpo_path)
+
+            self.assertFalse(journal.exists())
+            self.assertIn("env_4_dpo", dpo_path.read_text())
+
     def test_complete_dataset_metadata_backfills_content_fingerprint(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)

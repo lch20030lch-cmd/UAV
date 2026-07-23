@@ -16,7 +16,7 @@ SYSTEM_INSTRUCTION = """You are a UAV-ISAC decision controller for low-altitude 
 Your task: Given the current network state (communication summary, sensing summary, and bird's-eye-view map), propose a warm-start decision prior δ = [δ_q, δ_a, δ_p] that will be used to initialize a numerical optimizer.
 
 ## Decision Variables
-- δ_q: UAV displacement suggestions (shape {M}×3). Each row is [dx, dy, dh] in meters. dx,dy are horizontal moves; dh is altitude change. Clamp dx,dy to [-v_max*Δt, +v_max*Δt] ≈ [-15, 15]m per slot. Clamp altitude to [{H_min}, {H_max}]m.
+- δ_q: UAV displacement suggestions (shape {M}×3). Each row is [dx, dy, dh] in meters. The full 3D displacement norm must be at most v_max*Δt = {max_move}m per slot. Clamp the resulting altitude to [{H_min}, {H_max}]m.
 - δ_a: User association proposals (shape {M}×{K}). A soft assignment matrix where each column sums to 1. Higher values mean stronger recommendation for that UAV to serve that user.
 - δ_p: Power allocation hints (shape {M}×({K}+1)). First {K} entries per UAV are communication power for each user; last entry is sensing probe power. Each UAV row must satisfy sum(δ_p[m]) ≤ P_max = {P_max_W:.4f}W.
 
@@ -26,7 +26,7 @@ Your task: Given the current network state (communication summary, sensing summa
 3. Single association: each user served by exactly one UAV
 4. Per-UAV load cap: at most {K_max} users per UAV
 5. UAV minimum separation: ≥ {d_min}m
-6. Communication SINR ≥ {sinr_c_min_dB}dB for associated users
+6. Communication SINR ≥ {sinr_c_min_dB}dB and rate ≥ {rate_min_mbps}Mbps for associated users
 7. Sensing SINR ≥ {sinr_s_min_dB}dB for detected targets
 
 ## Output Format
@@ -74,10 +74,15 @@ def build_system_prompt(config: dict) -> str:
         "H_min": config.get("altitude_min_m", 50),
         "H_max": config.get("altitude_max_m", 300),
         "v_max": config.get("uav_max_speed_ms", 15),
+        "max_move": (
+            config.get("uav_max_speed_ms", 15)
+            * config.get("slot_duration_s", 1.0)
+        ),
         "K_max": config.get("load_cap_per_uav", 10),
         "d_min": config.get("uav_min_separation_m", 10),
         "sinr_c_min_dB": config.get("sinr_c_min_db", 0),
         "sinr_s_min_dB": config.get("sinr_s_min_db", 10),
+        "rate_min_mbps": config.get("rate_min_bps", 1e6) / 1e6,
         "P_max_W": 10 ** ((config.get("p_max_dbm", 30) - 30) / 10),
     }
     return SYSTEM_INSTRUCTION.format(**params)
@@ -143,6 +148,21 @@ def build_geometry_guidance_str(env_sample, config: dict) -> str:
     q = np.asarray(env_sample.q_current, dtype=np.float32)
     users = np.asarray(env_sample.u_positions, dtype=np.float32)
     targets = np.asarray(env_sample.s_positions, dtype=np.float32)
+    target_detected = np.asarray(
+        getattr(
+            env_sample,
+            "target_detected",
+            np.ones(targets.shape[0], dtype=bool),
+        ),
+        dtype=bool,
+    )
+    if target_detected.shape != (targets.shape[0],):
+        raise ValueError(
+            "target_detected must align with s_positions, got "
+            f"{target_detected.shape} and {targets.shape}"
+        )
+    visible_target_indices = np.flatnonzero(target_detected)
+    visible_targets = targets[target_detected]
     assoc = np.asarray(env_sample.association, dtype=np.float32)
     weights = np.asarray(env_sample.user_weights, dtype=np.float32)
 
@@ -182,11 +202,19 @@ def build_geometry_guidance_str(env_sample, config: dict) -> str:
         else:
             user_text = "nearest_user:n/a"
 
-        if targets.size > 0:
-            d_target = np.linalg.norm(targets - q_xy[None, :], axis=1)
-            nearest_t = int(np.argmin(d_target))
-            target_dir, target_dist = _unit_direction(q_xy, targets[nearest_t])
-            target_text = f"nearest_target=t{nearest_t}:d={target_dist:.1f}m,dir={_fmt_vec(target_dir, 3)}"
+        if visible_targets.size > 0:
+            d_target = np.linalg.norm(
+                visible_targets - q_xy[None, :], axis=1
+            )
+            nearest_visible = int(np.argmin(d_target))
+            nearest_t = int(visible_target_indices[nearest_visible])
+            target_dir, target_dist = _unit_direction(
+                q_xy, targets[nearest_t]
+            )
+            target_text = (
+                f"nearest_target=t{nearest_t}:d={target_dist:.1f}m,"
+                f"dir={_fmt_vec(target_dir, 3)}"
+            )
         else:
             target_text = "nearest_target:n/a"
 
@@ -294,7 +322,7 @@ def build_multimodal_prompt(
     parts.append(
         "[Bird's-Eye-View Image]\n"
         "The attached BEV image uses the same compact geometry cues: blue triangles are UAVs, "
-        "green users are scaled by demand weight, red X markers are sensing targets, "
+        "green users are scaled by demand weight, red X markers are detected sensing targets, "
         "blue rings show the per-slot mobility radius, purple lines point to the weighted user center, "
         "green lines point to nearest users, and orange dashed lines point to nearest sensing targets. "
         "Visual markers are intentionally uncluttered; use the Indexed Association Map for exact user IDs."
@@ -316,11 +344,11 @@ def format_oracle_response(sample_id: int, delta_q, delta_a, delta_p) -> str:
         delta_p: (M, K+1) 功率分配
 
     Returns:
-        JSON 格式的响应字符串 (浮点数截断至 4 位小数)
+        JSON 格式的响应字符串（浮点数保留 6 位小数）
     """
     import json
 
-    def _trunc(obj, ndigits=4):
+    def _trunc(obj, ndigits=6):
         """递归截断浮点数精度。
         np.round 对 float32 不够：0.191 在 IEEE 754 中无法精确表示，
         .tolist() 会还原为 0.19099999964237213 这种 17 位噪声。
@@ -333,9 +361,9 @@ def format_oracle_response(sample_id: int, delta_q, delta_a, delta_p) -> str:
         return obj
 
     response_dict = {
-        "delta_q": _trunc(np.round(delta_q, 4).tolist()),
-        "delta_a": _trunc(np.round(delta_a, 4).tolist()),
-        "delta_p": _trunc(np.round(delta_p, 4).tolist()),
+        "delta_q": _trunc(np.round(delta_q, 6).tolist()),
+        "delta_a": _trunc(np.round(delta_a, 6).tolist()),
+        "delta_p": _trunc(np.round(delta_p, 6).tolist()),
     }
 
     # Compact JSON — no indent. With 176 floats, indent=2 adds ~1400 chars

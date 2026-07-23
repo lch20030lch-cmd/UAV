@@ -43,6 +43,16 @@ def freeze_vision_parameter_tree(module: nn.Module) -> list[str]:
     return frozen
 
 
+def keep_vision_modules_in_eval_mode(module: nn.Module) -> list[str]:
+    """Keep a frozen vision tower deterministic during language-side tuning."""
+    frozen_modules = []
+    for name, child in module.named_modules():
+        if name and is_vision_parameter_name(name):
+            child.eval()
+            frozen_modules.append(name)
+    return frozen_modules
+
+
 class Gemma3MultimodalISAC(nn.Module):
     def __init__(
         self,
@@ -142,6 +152,18 @@ class Gemma3MultimodalISAC(nn.Module):
         else:
             raise AttributeError("Cannot find hidden_size in Gemma3 multimodal config.")
         self.hidden_dim = hidden_dim
+        input_embeddings = self.base_model.get_input_embeddings()
+        self.control_token_offsets = nn.Parameter(
+            torch.zeros(
+                self.num_control_tokens,
+                hidden_dim,
+                dtype=torch.float32,
+                device=input_embeddings.weight.device,
+            )
+        )
+        self._control_embedding_hook = input_embeddings.register_forward_hook(
+            self._inject_control_token_offsets
+        )
 
         self.frozen_vision_parameter_names = []
         if freeze_vision_tower:
@@ -166,6 +188,26 @@ class Gemma3MultimodalISAC(nn.Module):
     def device(self) -> torch.device:
         return _first_device(self.base_model)
 
+    def _inject_control_token_offsets(self, module, inputs, output):
+        """Add a small trainable adapter only at control-token positions."""
+        if not inputs or not torch.is_tensor(inputs[0]):
+            return output
+        token_ids = inputs[0]
+        offset_indices = torch.full_like(token_ids, -1)
+        for index, token_id in enumerate(self.control_token_ids):
+            offset_indices = torch.where(
+                token_ids == int(token_id),
+                torch.full_like(offset_indices, index),
+                offset_indices,
+            )
+        valid = offset_indices >= 0
+        if not torch.any(valid):
+            return output
+        offsets = self.control_token_offsets[
+            offset_indices.clamp_min(0)
+        ].to(dtype=output.dtype)
+        return output + offsets * valid.unsqueeze(-1).to(output.dtype)
+
     def save_control_token_embeddings(self, save_dir: str) -> Dict[str, str]:
         """只保存新增控制 token 对应的 embedding 行。"""
         save_path = Path(save_dir)
@@ -177,6 +219,12 @@ class Gemma3MultimodalISAC(nn.Module):
         torch.save(ctrl_embed, ctrl_embed_path)
 
         saved = {"ctrl_embed": str(ctrl_embed_path)}
+        ctrl_offset_path = save_path / "ctrl_offset.pt"
+        torch.save(
+            self.control_token_offsets.detach().clone().cpu(),
+            ctrl_offset_path,
+        )
+        saved["ctrl_offset"] = str(ctrl_offset_path)
         output_embeds = self.base_model.get_output_embeddings()
         if output_embeds is not None and output_embeds.weight.data_ptr() != embed.weight.data_ptr():
             ctrl_lm = output_embeds.weight.data[self.control_token_ids].detach().clone().cpu()
@@ -193,17 +241,54 @@ class Gemma3MultimodalISAC(nn.Module):
         if ctrl_embed_path.exists():
             ctrl_embed = torch.load(ctrl_embed_path, map_location="cpu")
             embed = self.base_model.get_input_embeddings()
+            expected_shape = (
+                self.num_control_tokens,
+                int(embed.weight.shape[1]),
+            )
+            if tuple(ctrl_embed.shape) != expected_shape:
+                raise ValueError(
+                    "control token embedding shape mismatch: "
+                    f"{tuple(ctrl_embed.shape)} != {expected_shape}"
+                )
             embed.weight.data[self.control_token_ids] = ctrl_embed.to(
                 dtype=embed.weight.dtype,
                 device=embed.weight.device,
             )
             loaded["ctrl_embed"] = str(ctrl_embed_path)
 
+        ctrl_offset_path = load_path / "ctrl_offset.pt"
+        if ctrl_offset_path.exists():
+            ctrl_offset = torch.load(ctrl_offset_path, map_location="cpu")
+            if tuple(ctrl_offset.shape) != tuple(
+                self.control_token_offsets.shape
+            ):
+                raise ValueError(
+                    "control token offset shape mismatch: "
+                    f"{tuple(ctrl_offset.shape)} != "
+                    f"{tuple(self.control_token_offsets.shape)}"
+                )
+            self.control_token_offsets.data.copy_(
+                ctrl_offset.to(
+                    device=self.control_token_offsets.device,
+                    dtype=self.control_token_offsets.dtype,
+                )
+            )
+            loaded["ctrl_offset"] = str(ctrl_offset_path)
+
         ctrl_lm_path = load_path / "ctrl_lm_head.pt"
         if ctrl_lm_path.exists():
             ctrl_lm = torch.load(ctrl_lm_path, map_location="cpu")
             output_embeds = self.base_model.get_output_embeddings()
             if output_embeds is not None:
+                expected_shape = (
+                    self.num_control_tokens,
+                    int(output_embeds.weight.shape[1]),
+                )
+                if tuple(ctrl_lm.shape) != expected_shape:
+                    raise ValueError(
+                        "control LM-head row shape mismatch: "
+                        f"{tuple(ctrl_lm.shape)} != {expected_shape}"
+                    )
                 output_embeds.weight.data[self.control_token_ids] = ctrl_lm.to(
                     dtype=output_embeds.weight.dtype,
                     device=output_embeds.weight.device,
@@ -220,17 +305,13 @@ class Gemma3MultimodalISAC(nn.Module):
         states = []
         for b in range(batch_size):
             ctrl_positions = control_mask[b].nonzero(as_tuple=True)[0]
-            ctrl_hidden = hidden_states[b, ctrl_positions]
-            if ctrl_hidden.shape[0] < self.num_control_tokens:
-                pad = torch.zeros(
-                    self.num_control_tokens - ctrl_hidden.shape[0],
-                    self.hidden_dim,
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
+            if ctrl_positions.numel() != self.num_control_tokens:
+                raise ValueError(
+                    "control_mask must select exactly "
+                    f"{self.num_control_tokens} tokens per sample; "
+                    f"sample {b} selects {ctrl_positions.numel()}"
                 )
-                ctrl_hidden = torch.cat([ctrl_hidden, pad], dim=0)
-            elif ctrl_hidden.shape[0] > self.num_control_tokens:
-                ctrl_hidden = ctrl_hidden[:self.num_control_tokens]
+            ctrl_hidden = hidden_states[b, ctrl_positions]
             states.append(ctrl_hidden)
         return torch.stack(states, dim=0)
 
@@ -241,6 +322,7 @@ class Gemma3MultimodalISAC(nn.Module):
         control_mask: torch.Tensor,
         q_current: Optional[torch.Tensor] = None,
         q_geometry_cues: Optional[torch.Tensor] = None,
+        q_geometry_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         compute_full_logits: bool = False,
@@ -285,7 +367,14 @@ class Gemma3MultimodalISAC(nn.Module):
             q_current = q_current.to(control_states.device)
         if q_geometry_cues is not None:
             q_geometry_cues = q_geometry_cues.to(control_states.device)
-        prior_hat = self.projection_head(control_states.float(), q_current, q_geometry_cues)
+        if q_geometry_mask is not None:
+            q_geometry_mask = q_geometry_mask.to(control_states.device)
+        prior_hat = self.projection_head(
+            control_states.float(),
+            q_current,
+            q_geometry_cues,
+            q_geometry_mask,
+        )
 
         return {
             "logits": getattr(outputs, "logits", None),

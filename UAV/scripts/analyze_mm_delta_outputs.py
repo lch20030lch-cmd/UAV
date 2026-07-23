@@ -27,6 +27,9 @@ from src.data.multimodal_dataset import (
     resolve_multimodal_chat_template,
     validate_multimodal_oracle_contract,
 )
+from src.data.oracle_contract import (
+    validate_checkpoint_dataset_compatibility,
+)
 from src.model import Gemma3MultimodalISAC, build_proj_head_config
 
 
@@ -277,14 +280,29 @@ def _summarize_q_cues(
     q_cue_logits: np.ndarray,
     q_geometry_cues: np.ndarray,
     delta_q_target: np.ndarray,
+    q_geometry_mask: np.ndarray = None,
 ) -> Dict:
     target_xy = delta_q_target[..., :2]
     target_dir = target_xy / np.maximum(np.linalg.norm(target_xy, axis=-1, keepdims=True), 1e-8)
     cue_dir = q_geometry_cues / np.maximum(np.linalg.norm(q_geometry_cues, axis=-1, keepdims=True), 1e-8)
     cue_cos = (cue_dir * target_dir[:, :, None, :]).sum(axis=-1)
+    mask = (
+        np.ones_like(cue_cos, dtype=bool)
+        if q_geometry_mask is None
+        else np.asarray(q_geometry_mask, dtype=bool)
+    )
+    if mask.shape != cue_cos.shape:
+        raise ValueError("q geometry mask and cues must have matching axes")
+    if not np.all(mask.any(axis=-1)):
+        raise ValueError("each UAV must have at least one valid q geometry cue")
+    cue_cos = np.where(mask, cue_cos, -np.inf)
     target_idx = np.argmax(cue_cos, axis=-1)
-    pred_idx = np.argmax(q_cue_logits, axis=-1)
-    pred_probs = np.exp(q_cue_logits - q_cue_logits.max(axis=-1, keepdims=True))
+    masked_logits = np.where(mask, q_cue_logits, -np.inf)
+    pred_idx = np.argmax(masked_logits, axis=-1)
+    pred_probs = np.exp(
+        masked_logits - masked_logits.max(axis=-1, keepdims=True)
+    )
+    pred_probs = np.where(mask, pred_probs, 0.0)
     pred_probs = pred_probs / np.maximum(pred_probs.sum(axis=-1, keepdims=True), 1e-12)
     names = ["weighted_center", "nearest_user", "nearest_target"]
     target_hist = {names[i]: int((target_idx == i).sum()) for i in range(3)}
@@ -305,6 +323,7 @@ def _summarize_fixed_q_geometry(
     q_geometry_cues: np.ndarray,
     delta_q_target: np.ndarray,
     fixed_weights,
+    q_geometry_mask: np.ndarray = None,
 ) -> Dict:
     """Evaluate the train-derived fixed geometry mixture without model predictions."""
     if q_geometry_cues.shape[:2] != delta_q_target.shape[:2]:
@@ -313,7 +332,20 @@ def _summarize_fixed_q_geometry(
     if weights.shape != (3,) or np.any(weights < 0) or weights.sum() <= 0:
         raise ValueError("fixed q cue weights must be three non-negative values with positive sum")
     weights = weights / weights.sum()
-    fixed_xy = (q_geometry_cues * weights.reshape(1, 1, 3, 1)).sum(axis=2)
+    mask = (
+        np.ones(q_geometry_cues.shape[:-1], dtype=bool)
+        if q_geometry_mask is None
+        else np.asarray(q_geometry_mask, dtype=bool)
+    )
+    if mask.shape != q_geometry_cues.shape[:-1]:
+        raise ValueError("q geometry mask and cues must have matching axes")
+    sample_weights = weights.reshape(1, 1, 3) * mask
+    sample_weights = sample_weights / np.maximum(
+        sample_weights.sum(axis=-1, keepdims=True), 1e-8
+    )
+    fixed_xy = (
+        q_geometry_cues * sample_weights[..., None]
+    ).sum(axis=2)
     fixed_xy = fixed_xy / np.maximum(
         np.linalg.norm(fixed_xy, axis=-1, keepdims=True),
         1e-8,
@@ -393,6 +425,7 @@ def _summarize_deltas(
     delta_p_target: np.ndarray = None,
     q_cue_logits: np.ndarray = None,
     q_geometry_cues: np.ndarray = None,
+    q_geometry_mask: np.ndarray = None,
     q_fixed_cue_weights=None,
     control_states: np.ndarray = None,
     delta_raw: np.ndarray = None,
@@ -420,7 +453,14 @@ def _summarize_deltas(
         summary["delta_q_raw_dir_cosine_std"] = float(cos.std())
         summary["delta_q_raw_dir_mse_mean"] = float(mse.mean())
     if q_cue_logits is not None and q_geometry_cues is not None and delta_q_target is not None:
-        summary.update(_summarize_q_cues(q_cue_logits, q_geometry_cues, delta_q_target))
+        summary.update(
+            _summarize_q_cues(
+                q_cue_logits,
+                q_geometry_cues,
+                delta_q_target,
+                q_geometry_mask,
+            )
+        )
     if (
         q_geometry_cues is not None
         and delta_q_target is not None
@@ -431,6 +471,7 @@ def _summarize_deltas(
                 q_geometry_cues,
                 delta_q_target,
                 q_fixed_cue_weights,
+                q_geometry_mask,
             )
         )
     if delta_a_raw is not None:
@@ -542,12 +583,25 @@ def _read_checkpoint_metadata(checkpoint: str) -> Dict:
         return json.load(handle)
 
 
-def _load_control_token_embeddings(model: Gemma3MultimodalISAC, checkpoint: str):
+def _load_control_token_embeddings(
+    model: Gemma3MultimodalISAC,
+    checkpoint: str,
+    *,
+    require_complete: bool = False,
+):
     if not checkpoint:
         return {}
     ckpt_path = Path(checkpoint)
     ckpt_root = ckpt_path if ckpt_path.is_dir() else ckpt_path.parent
-    return model.load_control_token_embeddings(ckpt_root)
+    loaded = model.load_control_token_embeddings(ckpt_root)
+    if require_complete:
+        missing = {"ctrl_embed", "ctrl_offset"} - set(loaded)
+        if missing:
+            raise FileNotFoundError(
+                "checkpoint is missing required control-token state: "
+                f"{sorted(missing)}"
+            )
+    return loaded
 
 
 def _resolve_lora_checkpoint(checkpoint: str, lora_checkpoint: str):
@@ -583,6 +637,7 @@ def _collect_deltas(
     delta_p_targets: List[np.ndarray] = []
     q_cue_logits_list: List[np.ndarray] = []
     q_geometry_cues_list: List[np.ndarray] = []
+    q_geometry_mask_list: List[np.ndarray] = []
     control_states_list: List[np.ndarray] = []
     delta_raws: List[np.ndarray] = []
 
@@ -599,7 +654,6 @@ def _collect_deltas(
                 "delta_q_target",
                 "delta_a_target",
                 "delta_p_target",
-                "q_geometry_mask",
             }
         }
         with torch.no_grad():
@@ -623,6 +677,10 @@ def _collect_deltas(
             q_cue_logits_list.append(_as_np(outputs["q_cue_logits"].squeeze(0)))
         if "q_geometry_cues" in batch:
             q_geometry_cues_list.append(_as_np(batch["q_geometry_cues"].squeeze(0)))
+        if "q_geometry_mask" in batch:
+            q_geometry_mask_list.append(
+                _as_np(batch["q_geometry_mask"].squeeze(0))
+            )
         if "control_states" in outputs:
             control_states_list.append(_as_np(outputs["control_states"].squeeze(0)))
         if "delta_raw" in outputs:
@@ -649,6 +707,10 @@ def _collect_deltas(
         result["q_cue_logits"] = np.stack(q_cue_logits_list, axis=0)
     if q_geometry_cues_list:
         result["q_geometry_cues"] = np.stack(q_geometry_cues_list, axis=0)
+    if q_geometry_mask_list:
+        result["q_geometry_mask"] = np.stack(
+            q_geometry_mask_list, axis=0
+        )
     if control_states_list:
         result["control_states"] = np.stack(control_states_list, axis=0)
     if delta_raws:
@@ -671,6 +733,16 @@ def main():
     parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--save_raw", action="store_true")
+    parser.add_argument(
+        "--allow_legacy_dataset",
+        action="store_true",
+        help="diagnostic-only override for pre-v5 data",
+    )
+    parser.add_argument(
+        "--allow_checkpoint_dataset_mismatch",
+        action="store_true",
+        help="diagnostic-only checkpoint provenance override",
+    )
     parser.add_argument(
         "--use_chat_template",
         action=argparse.BooleanOptionalAction,
@@ -701,14 +773,26 @@ def main():
     data_dir = Path(args.data_dir or data_cfg["output_dir"])
     dataset_metadata = validate_multimodal_oracle_contract(
         data_dir,
-        allow_legacy=True,
+        allow_legacy=args.allow_legacy_dataset,
         expected_simulation=sim_cfg,
     )
-    data_path = data_dir / data_cfg.get("sft_file", "sft_dataset.jsonl")
+    data_path = data_dir / dataset_metadata.get(
+        "sft_file", data_cfg.get("sft_file", "sft_dataset.jsonl")
+    )
     model_name = args.model or model_cfg["backbone"]
     max_length = args.max_length or train_cfg["max_seq_length"]
     lora_checkpoint = _resolve_lora_checkpoint(args.checkpoint, args.lora_checkpoint)
     checkpoint_metadata = _read_checkpoint_metadata(args.checkpoint)
+    if args.checkpoint and dataset_metadata and not checkpoint_metadata:
+        raise FileNotFoundError(
+            "current-schema checkpoint diagnostics require metadata.json"
+        )
+    if checkpoint_metadata and dataset_metadata:
+        validate_checkpoint_dataset_compatibility(
+            checkpoint_metadata,
+            dataset_metadata,
+            allow_mismatch=args.allow_checkpoint_dataset_mismatch,
+        )
     use_chat_template = resolve_multimodal_chat_template(
         dataset_metadata=dataset_metadata,
         checkpoint_metadata=checkpoint_metadata,
@@ -748,7 +832,11 @@ def main():
         lora_checkpoint=lora_checkpoint,
     )
     loaded_projection = _load_projection_head(model, args.checkpoint)
-    loaded_control_embeddings = _load_control_token_embeddings(model, args.checkpoint)
+    loaded_control_embeddings = _load_control_token_embeddings(
+        model,
+        args.checkpoint,
+        require_complete=bool(dataset_metadata),
+    )
     model.eval()
 
     dataset = MultimodalSFTDataset(
@@ -775,6 +863,7 @@ def main():
         delta_p_target=deltas.get("delta_p_target"),
         q_cue_logits=deltas.get("q_cue_logits"),
         q_geometry_cues=deltas.get("q_geometry_cues"),
+        q_geometry_mask=deltas.get("q_geometry_mask"),
         q_fixed_cue_weights=proj_head_config.get("q_fixed_cue_weights"),
         control_states=deltas.get("control_states"),
         delta_raw=deltas.get("delta_raw"),

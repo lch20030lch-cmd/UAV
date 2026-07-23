@@ -1,16 +1,7 @@
 #!/usr/bin/env python
-"""
-多模态处理器输入烟雾测试。
-
-检查内容：
-  - 能读取一条 JSONL 样本
-  - 能解析并打开 BEV 图片路径
-  - AutoProcessor 能编码 text + image
-  - control token ids 能追加，并能按 token id 定位
-"""
+"""Validate the exact multimodal processor path used by SFT/evaluation."""
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -19,134 +10,115 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import yaml
 
-
-def _load_jsonl_record(path: Path, sample_index: int) -> dict:
-    current = 0
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                if current == sample_index:
-                    return json.loads(line)
-                current += 1
-    raise ValueError(f"No record index {sample_index} found in {path}")
+from src.data.multimodal_dataset import (
+    MultimodalSFTDataset,
+    resolve_multimodal_chat_template,
+    validate_multimodal_oracle_contract,
+)
 
 
-def _get_tokenizer(processor):
-    tokenizer = getattr(processor, "tokenizer", None)
-    if tokenizer is None:
-        raise AttributeError("Processor does not expose a .tokenizer attribute")
-    return tokenizer
-
-
-def _encode_text_image(processor, prompt: str, image, max_length: int):
-    kwargs = {
-        "text": prompt,
-        "images": image,
-        "return_tensors": "pt",
-        "truncation": True,
-        "max_length": max_length,
-    }
-    try:
-        return processor(**kwargs)
-    except TypeError:
-        kwargs.pop("truncation", None)
-        kwargs.pop("max_length", None)
-        return processor(**kwargs)
-
-
-def _get_image_token(processor) -> str:
-    tokenizer = getattr(processor, "tokenizer", None)
-    token = getattr(tokenizer, "boi_token", None) if tokenizer is not None else None
-    if token is None and tokenizer is not None:
-        token = getattr(tokenizer, "image_token", None)
-    if token is None:
-        token = getattr(processor, "image_token", None)
-    if token is None:
-        token = "<start_of_image>"
-    return str(token)
-
-
-def _ensure_one_image_token(processor, prompt: str) -> str:
-    image_token = _get_image_token(processor)
-    if image_token in prompt:
-        return prompt
-    marker = "[Bird's-Eye-View Image]"
-    if marker in prompt:
-        return prompt.replace(marker, f"{image_token}\n{marker}", 1)
-    return f"{image_token}\n{prompt}"
-
-
-def main():
-    parser = argparse.ArgumentParser(description="测试多模态 processor 输入")
-    parser.add_argument("--config", type=str, default="configs/rtx5090_multimodal_smoke.yaml")
-    parser.add_argument("--data_dir", type=str, default=None)
-    parser.add_argument("--model", type=str, default=None,
-                        help="覆盖配置文件中的 model.backbone")
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        default="configs/rtx5090_multimodal_smoke.yaml",
+    )
+    parser.add_argument("--data_dir", default=None)
+    parser.add_argument("--model", default=None)
     parser.add_argument("--max_length", type=int, default=None)
     parser.add_argument("--sample_index", type=int, default=0)
+    parser.add_argument(
+        "--use_chat_template",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--allow_legacy_dataset", action="store_true")
     args = parser.parse_args()
 
-    from PIL import Image
     from transformers import AutoProcessor
-    import torch
 
-    with (PROJECT_ROOT / args.config).open("r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = PROJECT_ROOT / config_path
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     model_cfg = cfg["model"]
     train_cfg = cfg["training"]["sft"]
     data_cfg = cfg["data"]
 
-    model_name = args.model or model_cfg["backbone"]
     data_dir = Path(args.data_dir or data_cfg["output_dir"])
-    max_length = args.max_length or train_cfg["max_seq_length"]
-    data_path = data_dir / data_cfg.get("sft_file", "sft_dataset.jsonl")
-
-    item = _load_jsonl_record(data_path, args.sample_index)
-    image_path = data_dir / item["bev_image_path"]
-    image = Image.open(image_path).convert("RGB")
-
-    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-    tokenizer = _get_tokenizer(processor)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
+    dataset_metadata = validate_multimodal_oracle_contract(
+        data_dir,
+        allow_legacy=args.allow_legacy_dataset,
+        expected_simulation=cfg["simulation"],
+    )
+    data_path = data_dir / dataset_metadata.get(
+        "sft_file", data_cfg.get("sft_file", "sft_dataset.jsonl")
+    )
+    model_name = args.model or model_cfg["backbone"]
+    max_length = int(args.max_length or train_cfg["max_seq_length"])
     num_control_tokens = int(model_cfg["control_token"]["num_tokens"])
-    control_tokens = [f"<ctrl_{i}>" for i in range(num_control_tokens)]
-    tokenizer.add_tokens(control_tokens, special_tokens=True)
-    control_token_ids = tokenizer.convert_tokens_to_ids(control_tokens)
-    if any(tid is None or tid == tokenizer.unk_token_id for tid in control_token_ids):
-        raise ValueError("Control tokens were not registered correctly")
+    use_chat_template = resolve_multimodal_chat_template(
+        dataset_metadata=dataset_metadata,
+        configured_value=train_cfg.get("use_chat_template"),
+        override=args.use_chat_template,
+    )
 
-    # Gemma3 处理器要求文本中恰好有一个图像占位符，否则文本/图像数量会不匹配。
-    prompt = _ensure_one_image_token(processor, item["prompt"])
-    encoded = _encode_text_image(processor, prompt, image, max_length)
-    input_ids = encoded["input_ids"]
-    attention_mask = encoded.get("attention_mask", torch.ones_like(input_ids))
+    processor = AutoProcessor.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+    )
+    dataset = MultimodalSFTDataset(
+        data_path=str(data_path),
+        data_dir=str(data_dir),
+        processor=processor,
+        max_length=max_length,
+        num_control_tokens=num_control_tokens,
+        include_response=False,
+        use_chat_template=use_chat_template,
+    )
+    if not 0 <= args.sample_index < len(dataset):
+        raise IndexError(
+            f"sample_index {args.sample_index} outside dataset size {len(dataset)}"
+        )
 
-    ctrl_ids = torch.tensor([control_token_ids], dtype=input_ids.dtype, device=input_ids.device)
-    input_ids = torch.cat([input_ids, ctrl_ids], dim=1)
-    attention_mask = torch.cat([attention_mask, torch.ones_like(ctrl_ids)], dim=1)
-
-    control_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-    for token_id in control_token_ids:
-        control_mask |= input_ids == token_id
-
-    pixel_keys = [
-        key for key, value in encoded.items()
-        if key not in {"input_ids", "attention_mask"} and hasattr(value, "shape")
+    record = dataset.data[args.sample_index]
+    batch = dataset[args.sample_index]
+    excluded = {
+        "input_ids",
+        "attention_mask",
+        "token_type_ids",
+        "labels",
+        "label_mask",
+        "control_mask",
+        "q_current",
+        "has_q_current",
+        "delta_q_target",
+        "delta_a_target",
+        "delta_p_target",
+        "q_geometry_cues",
+        "q_geometry_mask",
+    }
+    multimodal_keys = [
+        key
+        for key, value in batch.items()
+        if key not in excluded and hasattr(value, "shape")
     ]
+    control_count = int(batch["control_mask"].sum().item())
+    if control_count != num_control_tokens:
+        raise RuntimeError(
+            "control token count mismatch: "
+            f"{control_count} != {num_control_tokens}"
+        )
 
     print("OK: multimodal processor smoke")
     print(f"  data: {data_path}")
-    print(f"  image: {image_path} size={image.size}")
-    print(f"  input_ids: {tuple(input_ids.shape)}")
-    print(f"  attention_mask: {tuple(attention_mask.shape)}")
-    for key in pixel_keys:
-        print(f"  {key}: {tuple(encoded[key].shape)}")
-    print(f"  control_token_count: {int(control_mask.sum().item())}")
-    if int(control_mask.sum().item()) != num_control_tokens:
-        raise RuntimeError("Control token count mismatch")
+    print(f"  image: {data_dir / record['bev_image_path']}")
+    print(f"  chat template: {use_chat_template}")
+    print(f"  input_ids: {tuple(batch['input_ids'].shape)}")
+    print(f"  attention_mask: {tuple(batch['attention_mask'].shape)}")
+    for key in multimodal_keys:
+        print(f"  {key}: {tuple(batch[key].shape)}")
+    print(f"  control_token_count: {control_count}")
 
 
 if __name__ == "__main__":
