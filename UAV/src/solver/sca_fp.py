@@ -115,6 +115,7 @@ class SCAFPOptimizer:
             noise_figure_db=noise_figure_db,
         )
         self.wavelength = self.channel.wavelength
+        self.cfg.rate_min_bps = float(self.cfg.rate_min_bps)
         if self.cfg.rate_min_bps < 0.0:
             raise ValueError("rate_min_bps must be non-negative")
         rate_sinr_min = (

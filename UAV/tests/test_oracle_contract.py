@@ -5,6 +5,7 @@ from pathlib import Path
 from src.data.oracle_contract import (
     assert_resume_compatible,
     build_dataset_metadata,
+    canonical_simulation_config,
     checkpoint_dataset_fields,
     dataset_content_fingerprint,
     paired_record_state,
@@ -52,6 +53,19 @@ def _metadata(simulation=None):
 
 
 class OracleContractTest(unittest.TestCase):
+    def test_yaml_scientific_notation_string_is_normalized(self):
+        numeric = _simulation()
+        string_rate = dict(numeric, rate_min_bps="1e6")
+
+        normalized = canonical_simulation_config(string_rate)
+
+        self.assertEqual(normalized["rate_min_bps"], 1_000_000.0)
+        self.assertIsInstance(normalized["rate_min_bps"], float)
+        self.assertEqual(
+            simulation_fingerprint(numeric),
+            simulation_fingerprint(string_rate),
+        )
+
     def test_content_fingerprint_changes_with_actual_records(self):
         with (
             tempfile.TemporaryDirectory() as first_dir,

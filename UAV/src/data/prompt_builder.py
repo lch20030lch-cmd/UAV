@@ -68,22 +68,27 @@ def build_system_prompt(config: dict) -> str:
     Returns:
         参数化的系统指令字符串
     """
+    speed = float(config.get("uav_max_speed_ms", 15))
+    slot_duration = float(config.get("slot_duration_s", 1.0))
     params = {
-        "M": config.get("num_uavs", 4),
-        "K": config.get("num_users", 20),
-        "H_min": config.get("altitude_min_m", 50),
-        "H_max": config.get("altitude_max_m", 300),
-        "v_max": config.get("uav_max_speed_ms", 15),
+        "M": int(config.get("num_uavs", 4)),
+        "K": int(config.get("num_users", 20)),
+        "H_min": float(config.get("altitude_min_m", 50)),
+        "H_max": float(config.get("altitude_max_m", 300)),
+        "v_max": speed,
         "max_move": (
-            config.get("uav_max_speed_ms", 15)
-            * config.get("slot_duration_s", 1.0)
+            speed * slot_duration
         ),
-        "K_max": config.get("load_cap_per_uav", 10),
-        "d_min": config.get("uav_min_separation_m", 10),
-        "sinr_c_min_dB": config.get("sinr_c_min_db", 0),
-        "sinr_s_min_dB": config.get("sinr_s_min_db", 10),
-        "rate_min_mbps": config.get("rate_min_bps", 1e6) / 1e6,
-        "P_max_W": 10 ** ((config.get("p_max_dbm", 30) - 30) / 10),
+        "K_max": int(config.get("load_cap_per_uav", 10)),
+        "d_min": float(config.get("uav_min_separation_m", 10)),
+        "sinr_c_min_dB": float(config.get("sinr_c_min_db", 0)),
+        "sinr_s_min_dB": float(config.get("sinr_s_min_db", 10)),
+        "rate_min_mbps": float(
+            config.get("rate_min_bps", 1e6)
+        ) / 1e6,
+        "P_max_W": 10 ** (
+            (float(config.get("p_max_dbm", 30)) - 30) / 10
+        ),
     }
     return SYSTEM_INSTRUCTION.format(**params)
 

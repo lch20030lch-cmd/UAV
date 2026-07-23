@@ -161,3 +161,16 @@ revision-3 anchor or the only copy of a passing diagnostic.
   environment, so the complete test suite and model forward must run once in
   the `uavmllm` server environment before training.
 
+## Runtime-gate follow-up
+
+The first server gate passed 98 tests and then exposed a configuration-boundary
+defect before writing any records: PyYAML parsed `rate_min_bps: 1e6` as a
+string, while the solver expected a float.  The repair:
+
+- writes scientific notation as `1.0e6` in every maintained YAML config;
+- canonicalizes and validates every physical simulation field before hashing
+  or constructing the scenario/solver;
+- makes the solver defensive when called directly with a string rate;
+- casts numeric prompt fields explicitly; and
+- adds regression coverage for YAML-style numeric strings through both the
+  contract and the real runtime solver builder.

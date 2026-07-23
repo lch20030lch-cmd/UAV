@@ -11,6 +11,7 @@ from typing import Mapping
 import numpy as np
 
 from src.env import ISACScenarioGenerator
+from src.data.oracle_contract import canonical_simulation_config
 from src.solver.sca_fp import SCAFPConfig, SCAFPOptimizer
 
 
@@ -19,6 +20,7 @@ def build_oracle_scenario(
     *,
     seed: int,
 ) -> ISACScenarioGenerator:
+    simulation = canonical_simulation_config(simulation)
     return ISACScenarioGenerator(
         num_uavs=simulation["num_uavs"],
         num_users=simulation["num_users"],
@@ -45,6 +47,7 @@ def build_oracle_scenario(
 
 
 def build_oracle_solver(simulation: Mapping) -> SCAFPOptimizer:
+    simulation = canonical_simulation_config(simulation)
     solver_config = SCAFPConfig(
         max_outer_iters=30,
         max_inner_iters=5,

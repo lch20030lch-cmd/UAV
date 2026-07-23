@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 from typing import Dict, Mapping, Optional
@@ -45,6 +46,31 @@ SIMULATION_KEYS = (
     "load_cap_per_uav",
 )
 
+INTEGER_SIMULATION_KEYS = {
+    "num_uavs",
+    "num_users",
+    "num_targets",
+    "num_antennas_tx",
+    "num_antennas_rx",
+    "load_cap_per_uav",
+}
+
+FLOAT_SIMULATION_KEYS = {
+    "target_detection_probability",
+    "carrier_freq_ghz",
+    "bandwidth_mhz",
+    "p_max_dbm",
+    "noise_figure_db",
+    "altitude_min_m",
+    "altitude_max_m",
+    "uav_min_separation_m",
+    "uav_max_speed_ms",
+    "slot_duration_s",
+    "sinr_c_min_db",
+    "sinr_s_min_db",
+    "rate_min_bps",
+}
+
 IMMUTABLE_DATASET_FIELDS = (
     "schema_version",
     "prompt_type",
@@ -63,7 +89,12 @@ IMMUTABLE_DATASET_FIELDS = (
 
 
 def canonical_simulation_config(simulation: Mapping) -> Dict:
-    """Return the physical configuration in a stable JSON representation."""
+    """Return validated physical values in a stable JSON representation.
+
+    PyYAML treats literals such as ``1e6`` as strings.  Normalizing at the
+    contract boundary prevents the runtime simulator, solver, prompt, and
+    fingerprint from observing different types for the same physical value.
+    """
     missing = [key for key in SIMULATION_KEYS if key not in simulation]
     if missing:
         raise KeyError(f"simulation config is missing contract keys: {missing}")
@@ -71,9 +102,58 @@ def canonical_simulation_config(simulation: Mapping) -> Dict:
     canonical = {}
     for key in SIMULATION_KEYS:
         value = simulation[key]
-        if isinstance(value, tuple):
-            value = list(value)
-        canonical[key] = value
+        try:
+            if key == "area_size":
+                if len(value) != 2:
+                    raise ValueError("area_size must contain two values")
+                normalized = [float(item) for item in value]
+                if not all(math.isfinite(item) for item in normalized):
+                    raise ValueError("area_size must be finite")
+                canonical[key] = normalized
+            elif key in INTEGER_SIMULATION_KEYS:
+                numeric = float(value)
+                if not math.isfinite(numeric) or not numeric.is_integer():
+                    raise ValueError(f"{key} must be an integer")
+                normalized = int(numeric)
+                if normalized <= 0:
+                    raise ValueError(f"{key} must be positive")
+                canonical[key] = normalized
+            elif key in FLOAT_SIMULATION_KEYS:
+                normalized = float(value)
+                if not math.isfinite(normalized):
+                    raise ValueError(f"{key} must be finite")
+                canonical[key] = normalized
+            else:
+                canonical[key] = value
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"invalid simulation config value for {key}: {value!r}"
+            ) from exc
+    if not all(value > 0.0 for value in canonical["area_size"]):
+        raise ValueError("area_size values must be positive")
+    if not 0.0 <= canonical["target_detection_probability"] <= 1.0:
+        raise ValueError(
+            "target_detection_probability must be in [0, 1]"
+        )
+    for key in (
+        "carrier_freq_ghz",
+        "bandwidth_mhz",
+        "slot_duration_s",
+    ):
+        if canonical[key] <= 0.0:
+            raise ValueError(f"{key} must be positive")
+    for key in (
+        "altitude_min_m",
+        "uav_min_separation_m",
+        "uav_max_speed_ms",
+        "rate_min_bps",
+    ):
+        if canonical[key] < 0.0:
+            raise ValueError(f"{key} must be non-negative")
+    if canonical["altitude_max_m"] < canonical["altitude_min_m"]:
+        raise ValueError(
+            "altitude_max_m must be greater than or equal to altitude_min_m"
+        )
     return canonical
 
 

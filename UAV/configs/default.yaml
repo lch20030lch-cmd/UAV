@@ -119,7 +119,7 @@ simulation:
   slot_duration_s: 1.0       # Δt
   sinr_c_min_db: 0           # Γ_c^min
   sinr_s_min_db: 10          # Γ_s^min
-  rate_min_bps: 1e6          # R_k^min
+  rate_min_bps: 1.0e6        # R_k^min
   load_cap_per_uav: 10       # K_m^max
 
 # ---- 数据生成 ----

@@ -136,7 +136,7 @@ simulation:
   slot_duration_s: 1.0
   sinr_c_min_db: 0
   sinr_s_min_db: 10
-  rate_min_bps: 1e6
+  rate_min_bps: 1.0e6
   load_cap_per_uav: 10
 
 data:
