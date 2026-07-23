@@ -1,8 +1,11 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import numpy as np
 
 from scripts.generate_mm_smoke import (
     _append_paired_jsonl,
@@ -10,6 +13,7 @@ from scripts.generate_mm_smoke import (
     _process_one,
     _recover_pending_pair,
 )
+from src.data.oracle_generator import serialize_oracle_prior_exact
 
 
 class _RejectedEnvironmentGenerator:
@@ -31,6 +35,24 @@ class _RejectedEnvironmentGenerator:
 
 
 class MultimodalGenerationTest(unittest.TestCase):
+    def test_utility_inputs_are_exactly_the_serialized_json_values(self):
+        response, serialized = serialize_oracle_prior_exact(
+            3,
+            np.asarray([[1.23456789, -2.34567891, 0.00000049]]),
+            np.asarray([[0.9999999, 0.0000001]]),
+            np.asarray([[0.123456789, 0.876543211, 0.0]]),
+        )
+        payload = json.loads(response)
+
+        for key, actual in zip(
+            ("delta_q", "delta_a", "delta_p"), serialized
+        ):
+            np.testing.assert_array_equal(
+                actual,
+                np.asarray(payload[key], dtype=np.float64),
+            )
+        self.assertEqual(serialized[0][0, 0], 1.234568)
+
     def test_pending_pair_recovery_completes_interrupted_append(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)

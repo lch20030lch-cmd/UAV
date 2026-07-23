@@ -30,6 +30,7 @@ import yaml
 
 from src.data.oracle_generator import (
     OracleDataGenerator,
+    serialize_oracle_prior_exact,
     select_near_optimal_q_medoid,
 )
 from src.data.oracle_contract import (
@@ -46,7 +47,7 @@ from src.data.oracle_runtime import (
     build_oracle_scenario,
     build_oracle_solver,
 )
-from src.data.prompt_builder import build_multimodal_prompt, format_oracle_response
+from src.data.prompt_builder import build_multimodal_prompt
 from src.env import render_bev_sample
 
 
@@ -192,7 +193,13 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
         q_current,
         generator.oracle_selection_utility_tolerance,
     )
-    delta_q, delta_a, delta_p = generator._extract_prior(chosen_sol, env_sample)
+    delta_q, delta_a, delta_p = generator._extract_prior(
+        chosen_sol, env_sample
+    )
+    response, serialized_chosen = serialize_oracle_prior_exact(
+        sample_id, delta_q, delta_a, delta_p
+    )
+    delta_q, delta_a, delta_p = serialized_chosen
     chosen_eval = generator.evaluate_prior(
         env_dict,
         delta_q,
@@ -202,7 +209,6 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
     if not chosen_eval["feasible"]:
         return None, []
     chosen_utility = float(chosen_eval["utility"])
-    response = format_oracle_response(sample_id, delta_q, delta_a, delta_p)
 
     common = {
         "bev_image_path": env_sample.bev_image_path,
@@ -230,17 +236,25 @@ def _process_one(sample_id: int, generator: OracleDataGenerator, sim_cfg: dict,
     rejected_delta_q, _ = generator._construct_rejected(
         env_dict, solutions, q_current, sample_id
     )
+    rejected_response, serialized_rejected = serialize_oracle_prior_exact(
+        sample_id, rejected_delta_q, delta_a, delta_p
+    )
+    (
+        rejected_delta_q,
+        rejected_delta_a,
+        rejected_delta_p,
+    ) = serialized_rejected
     rejected_eval = generator.evaluate_prior(
-        env_dict, rejected_delta_q, delta_a, delta_p
+        env_dict,
+        rejected_delta_q,
+        rejected_delta_a,
+        rejected_delta_p,
     )
     rejected_util = float(rejected_eval["utility"])
     if not np.isfinite(rejected_util):
         return None, []
     dpo_samples = []
     if not np.allclose(rejected_delta_q, delta_q, atol=1e-3):
-        rejected_response = generator._format_rejected_response(
-            sample_id, rejected_delta_q, delta_a, delta_p
-        )
         gap = (
             chosen_utility - rejected_util
             if rejected_util is not None

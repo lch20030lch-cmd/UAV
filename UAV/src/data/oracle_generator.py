@@ -31,6 +31,28 @@ from .oracle_contract import (
 from .prompt_builder import build_full_prompt, format_oracle_response
 
 
+def serialize_oracle_prior_exact(
+    sample_id: int,
+    delta_q: np.ndarray,
+    delta_a: np.ndarray,
+    delta_p: np.ndarray,
+) -> Tuple[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Serialize once and return the exact numeric tuple stored in JSON.
+
+    Utility and feasibility must be evaluated on these parsed values, not on
+    higher-precision arrays that merely round to the same-looking response.
+    """
+    response = format_oracle_response(
+        sample_id, delta_q, delta_a, delta_p
+    )
+    payload = json.loads(response)
+    serialized = tuple(
+        np.asarray(payload[key], dtype=np.float64)
+        for key in ("delta_q", "delta_a", "delta_p")
+    )
+    return response, serialized
+
+
 def select_near_optimal_q_medoid(
     solutions: List[SCAFPSolution],
     q_current: np.ndarray,
@@ -273,11 +295,22 @@ class OracleDataGenerator:
             q_current,
             self.oracle_selection_utility_tolerance,
         )
-        # Extract the exact chosen tuple before constructing/evaluating the
-        # rejected Q-only preference sample.
+        # The parsed JSON values are authoritative for both evaluation and the
+        # record fields.  Never evaluate a higher-precision precursor.
         delta_q_chosen, delta_a_chosen, delta_p_chosen = self._extract_prior(
             chosen_sol, env_sample,
         )
+        response_chosen, serialized_chosen = serialize_oracle_prior_exact(
+            sample_id,
+            delta_q_chosen,
+            delta_a_chosen,
+            delta_p_chosen,
+        )
+        (
+            delta_q_chosen,
+            delta_a_chosen,
+            delta_p_chosen,
+        ) = serialized_chosen
         chosen_eval = self.evaluate_prior(
             env_dict,
             delta_q_chosen,
@@ -292,20 +325,28 @@ class OracleDataGenerator:
         rejected_delta_q, rejected_util = self._construct_rejected(
             env_dict, solutions, q_current, sample_id,
         )
+        rejected_response, serialized_rejected = (
+            serialize_oracle_prior_exact(
+                sample_id,
+                rejected_delta_q,
+                delta_a_chosen,
+                delta_p_chosen,
+            )
+        )
+        (
+            rejected_delta_q,
+            rejected_delta_a,
+            rejected_delta_p,
+        ) = serialized_rejected
         rejected_eval = self.evaluate_prior(
             env_dict,
             rejected_delta_q,
-            delta_a_chosen,
-            delta_p_chosen,
+            rejected_delta_a,
+            rejected_delta_p,
         )
         rejected_util = float(rejected_eval["utility"])
 
         # Step 6: 构造输出
-        # SFT 样本 — Chosen 的 prior
-        response_chosen = format_oracle_response(
-            sample_id, delta_q_chosen, delta_a_chosen, delta_p_chosen,
-        )
-
         sft_sample = {
             "id": f"env_{sample_id}",
             "prompt": prompt,
@@ -325,10 +366,6 @@ class OracleDataGenerator:
 
         # DPO 样本 — 单个对: Chosen vs Rejected
         # Rejected 只有 δ_q 为陷阱; δ_a/δ_p 复用 Chosen 的 — 被 Masked DPO 忽略
-        rejected_response = self._format_rejected_response(
-            sample_id, rejected_delta_q, delta_a_chosen, delta_p_chosen,
-        )
-
         # Gap: 启发式陷阱 → 保守估计 5% gap; SCA-FP 次优解 → 实际 gap
         if rejected_util is not None:
             gap = chosen_utility - rejected_util
@@ -347,6 +384,7 @@ class OracleDataGenerator:
                 "chosen": response_chosen,
                 "rejected": rejected_response,
                 "utility_chosen": chosen_utility,
+                "utility_rejected": rejected_util,
                 "utility_gap": gap,
                 "q_current": q_current.tolist(),
                 "delta_q": delta_q_chosen.tolist(),
@@ -530,14 +568,6 @@ class OracleDataGenerator:
     # ═══════════════════════════════════════════════════════════════
     # 辅助方法
     # ═══════════════════════════════════════════════════════════════
-
-    def _format_rejected_response(
-        self, sample_id: int,
-        delta_q: np.ndarray, delta_a: np.ndarray, delta_p: np.ndarray,
-    ) -> str:
-        """格式化 Rejected 响应 JSON — δ_q 是陷阱, δ_a/δ_p 是 Chosen 的"""
-        delta_q_disp = delta_q  # 已经在 _construct_rejected 中处理
-        return format_oracle_response(sample_id, delta_q_disp, delta_a, delta_p)
 
     def _extract_prior(
         self,

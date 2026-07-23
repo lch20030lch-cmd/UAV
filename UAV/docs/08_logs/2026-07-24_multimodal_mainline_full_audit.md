@@ -174,3 +174,17 @@ string, while the solver expected a float.  The repair:
 - casts numeric prompt fields explicitly; and
 - adds regression coverage for YAML-style numeric strings through both the
   contract and the real runtime solver builder.
+
+After that repair, 100 tests and two-sample generation passed.  The exact-data
+audit then found that rejected DPO utility was evaluated before the rejected
+response was rounded to six JSON decimals.  Chosen and rejected priors now
+follow one authoritative path:
+
+```text
+candidate arrays -> serialize JSON once -> parse stored JSON values
+                 -> evaluate utility/constraints -> write record
+```
+
+Both the record tensors and their utility fields therefore describe the exact
+same numeric tuple.  The invalid two-sample gate dataset must be regenerated;
+changing its sealed JSONL fields in place is forbidden.
