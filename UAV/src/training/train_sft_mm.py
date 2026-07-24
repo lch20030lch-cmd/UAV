@@ -307,6 +307,7 @@ def train_mm_sft_smoke(
     lambda_q: float = None,
     lambda_a: float = None,
     lambda_p: float = None,
+    lambda_sep: float = None,
     lambda_assoc_raw_ce: float = None,
     lambda_q_dir: float = None,
     lambda_q_projected_dir: float = None,
@@ -604,6 +605,11 @@ def train_mm_sft_smoke(
     lambda_q_value = float(lambda_q) if lambda_q is not None else float(model_cfg["loss"]["lambda_q"])
     lambda_a_value = float(lambda_a) if lambda_a is not None else float(model_cfg["loss"]["lambda_a"])
     lambda_p_value = float(lambda_p) if lambda_p is not None else float(model_cfg["loss"]["lambda_p"])
+    lambda_sep_value = (
+        float(lambda_sep)
+        if lambda_sep is not None
+        else float(model_cfg["loss"]["lambda_sep"])
+    )
     lambda_q_dir_value = (
         float(lambda_q_dir)
         if lambda_q_dir is not None
@@ -635,7 +641,7 @@ def train_mm_sft_smoke(
             "lambda_q": lambda_q_value,
             "lambda_a": lambda_a_value,
             "lambda_p": lambda_p_value,
-            "lambda_sep": model_cfg["loss"]["lambda_sep"],
+            "lambda_sep": lambda_sep_value,
             "lambda_assoc_ce": assoc_ce_weight,
             "lambda_assoc_raw_ce": assoc_raw_ce_weight,
             "lambda_q_dir": lambda_q_dir_value,
@@ -1183,6 +1189,12 @@ if __name__ == "__main__":
                         help="可选 delta_a BCE 损失权重覆盖值")
     parser.add_argument("--lambda_p", type=float, default=None,
                         help="可选 delta_p 损失权重覆盖值")
+    parser.add_argument(
+        "--lambda_sep",
+        type=float,
+        default=None,
+        help="optional UAV separation-penalty override",
+    )
     parser.add_argument("--lambda_q_dir", type=float, default=None,
                         help="可选 delta_q raw 方向辅助损失权重，适用于 q target 贴移动边界的 smoke")
     parser.add_argument("--lambda_q_projected_dir", type=float, default=None,
@@ -1280,6 +1292,7 @@ if __name__ == "__main__":
         lambda_q=args.lambda_q,
         lambda_a=args.lambda_a,
         lambda_p=args.lambda_p,
+        lambda_sep=args.lambda_sep,
         lambda_assoc_raw_ce=args.lambda_assoc_raw_ce,
         lambda_q_dir=args.lambda_q_dir,
         lambda_q_projected_dir=args.lambda_q_projected_dir,

@@ -335,3 +335,64 @@ conversion.
 Local `compileall` and `git diff --check` pass.  The Windows audit host lacks
 NumPy, so the targeted runtime tests and the existing train20 re-audit must be
 run in the server's `uavmllm` environment before val20 generation resumes.
+
+## Revision-3 train20/val20 data gate
+
+The server-side targeted tests and the repaired train20 exact replay audit
+passed.  The existing train20 dataset was retained without regenerating or
+editing its sealed records.  A fresh seed-2026 val20 dataset was then generated
+with three Oracle restarts per environment and passed the same exact audit.
+
+- both datasets contain 20 paired SFT/DPO records and 20 referenced images;
+- both use schema 5, solver revision 3, and simulation fingerprint
+  `bc6f4a5bd357aba7c0c57bee383bffc6facb83838cdc33b2dd4101d749308940`;
+- train and validation content fingerprints differ;
+- validation maximum constraint violation is `1.9282e-06`;
+- validation minimum DPO utility gap is `0.091405`; and
+- train/validation generation-complete flags are true.
+
+Target distributions are aligned at the branch level:
+
+- Q per-dimension standard deviation: `8.2256 / 8.3947`;
+- A per-dimension standard deviation: `0.42383 / 0.42260`;
+- P per-dimension standard deviation: `0.08467 / 0.09202`;
+- inactive communication power mean and nonzero ratio: `0 / 0` on both;
+- A fixed-user count: `0 / 0`; and
+- A dominant ratio mean: `0.3375 / 0.3550`.
+
+Real Gemma multimodal chat-template lengths, including image expansion and
+eight control tokens, are `2697..2735` for train and `2694..2732` for
+validation.  Every record fits within the selected `max_length=3072`.
+
+The near-optimal medoid selector also respects its utility contract:
+
+- chosen relative utility gap maximum: `0.005245 / 0.007240`, both below 1%;
+- chosen Q consensus mean: `0.8142 / 0.8752`; and
+- chosen Q consensus minimum: `0.2988 / 0.5529`.
+
+The low train minimum is not a contract failure, but it identifies at least one
+multi-modal near-optimal environment whose hard Q direction is less stable.
+That record must be identified and reported before interpreting Q-only cosine
+metrics; it must not be silently deleted after seeing model performance.
+
+The low-consensus records are:
+
+- train `env_2`: two candidates, consensus `0.2988`, selected utility rank 1;
+- train `env_20`: two candidates, consensus `0.5567`, selected rank 1;
+- train `env_9`: three candidates, selected rank 3 at a `0.524%` utility gap,
+  improving consensus from `0.2769` to `0.5869`; and
+- validation `env_22`: three candidates, selected rank 2 at a `0.240%`
+  utility gap, improving consensus from `0.5149` to `0.5529`.
+
+Thus low-consensus multi-candidate records account for 15% of train and 5% of
+validation.  They remain below the declared 20% stop threshold and are kept
+unchanged.  Full-set Q cosine must be interpreted together with these known
+multi-solution cases.
+
+Before the Q train20 fit gate, a loss-isolation audit found that Q isolation
+intentionally permits the UAV separation penalty, but the SFT CLI had no way
+to override the configured `lambda_sep=0.1`.  The two-record gate happened to
+have zero separation penalty; train20 need not.  A `--lambda_sep` override was
+therefore added consistently with the other loss overrides.  The formal
+Q-only learnability run sets it explicitly to zero, while default joint
+training behavior remains unchanged.
