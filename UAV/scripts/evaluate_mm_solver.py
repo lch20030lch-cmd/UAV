@@ -25,6 +25,7 @@ from src.data.oracle_contract import validate_checkpoint_dataset_compatibility
 from src.data.oracle_runtime import (
     build_oracle_scenario,
     build_oracle_solver,
+    environment_sample_to_solver_dict,
 )
 from src.training.train_dpo_mm import _checkpoint_metadata, _load_model
 
@@ -212,14 +213,7 @@ def main():
                 "sealed dataset seed does not reproduce q_current for "
                 f"sample {sample_id}"
             )
-        env = {
-            "q_current": env_sample.q_current,
-            "user_positions": env_sample.u_positions,
-            "target_positions": env_sample.s_positions,
-            "target_detected": env_sample.target_detected,
-            "channel_gains": env_sample.channel_gains_users,
-            "user_weights": env_sample.user_weights,
-        }
+        env = environment_sample_to_solver_dict(env_sample)
         batch = _move_batch(batch, model.device)
         forward = {
             key: value

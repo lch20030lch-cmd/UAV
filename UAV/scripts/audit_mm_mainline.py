@@ -26,6 +26,7 @@ from src.data.oracle_contract import (
 from src.data.oracle_runtime import (
     build_oracle_scenario,
     build_oracle_solver,
+    environment_sample_to_solver_dict,
 )
 from src.data.prompt_builder import build_multimodal_prompt
 
@@ -389,14 +390,7 @@ def _audit_dataset(data_root: Path, cfg: dict) -> tuple[dict, dict]:
                 f"{sample_id}: stored Oracle violates constraints "
                 f"({sample_max_violation})"
             )
-        environment = {
-            "q_current": reproduced.q_current,
-            "user_positions": reproduced.u_positions,
-            "target_positions": reproduced.s_positions,
-            "target_detected": reproduced.target_detected,
-            "channel_gains": reproduced.channel_gains_users,
-            "user_weights": reproduced.user_weights,
-        }
+        environment = environment_sample_to_solver_dict(reproduced)
         q_eval = reproduced.q_current + delta_q
         a_eval = delta_a
         p_comm_eval = delta_p[:, :k]
@@ -426,7 +420,11 @@ def _audit_dataset(data_root: Path, cfg: dict) -> tuple[dict, dict]:
         ):
             raise ValueError(
                 f"{sample_id}: stored utility does not match serialized "
-                "Oracle target"
+                "Oracle target "
+                f"(stored={float(sft_row['utility']):.12g}, "
+                f"recomputed={float(recomputed['utility']):.12g}, "
+                f"difference="
+                f"{float(sft_row['utility']) - float(recomputed['utility']):.12g})"
             )
         for key, value in recomputed["constraint_violations"].items():
             if key not in violations or not np.isclose(

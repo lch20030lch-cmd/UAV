@@ -10,9 +10,39 @@ from typing import Mapping
 
 import numpy as np
 
-from src.env import ISACScenarioGenerator
+from src.env import EnvironmentSample, ISACScenarioGenerator
 from src.data.oracle_contract import canonical_simulation_config
 from src.solver.sca_fp import SCAFPConfig, SCAFPOptimizer
+
+
+def environment_sample_to_solver_dict(
+    sample: EnvironmentSample,
+) -> dict:
+    """Build the one canonical solver environment for a sampled scenario.
+
+    Scenario tensors are consumed by the Oracle at float32 source precision
+    and promoted to float64 by ``SCAFPOptimizer._validate_environment``.
+    Keeping this conversion in one place prevents generation, auditing, and
+    downstream evaluation from assigning slightly different utilities to the
+    same seeded environment.  In particular, ``UAVNetwork`` exposes user
+    weights as float64 while the original Oracle generation path deliberately
+    consumed their float32 representation.
+    """
+
+    def _float32_copy(value) -> np.ndarray:
+        return np.asarray(value, dtype=np.float32).copy()
+
+    return {
+        "q_current": _float32_copy(sample.q_current),
+        "user_positions": _float32_copy(sample.u_positions),
+        "target_positions": _float32_copy(sample.s_positions),
+        "target_detected": np.asarray(
+            sample.target_detected, dtype=bool
+        ).copy(),
+        "channel_gains": _float32_copy(sample.channel_gains_users),
+        "user_weights": _float32_copy(sample.user_weights),
+        "association": _float32_copy(sample.association),
+    }
 
 
 def build_oracle_scenario(

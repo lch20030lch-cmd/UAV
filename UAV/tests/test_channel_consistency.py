@@ -1,12 +1,48 @@
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
-from src.data.oracle_runtime import build_oracle_solver
+from src.data.oracle_runtime import (
+    build_oracle_solver,
+    environment_sample_to_solver_dict,
+)
 from src.env.uav_channel import ISACChannel
 
 
 class SensingChannelConsistencyTest(unittest.TestCase):
+    def test_sample_to_solver_environment_has_one_canonical_precision(self):
+        precise_weights = np.array(
+            [1.123456789123, 0.876543210987],
+            dtype=np.float64,
+        )
+        sample = SimpleNamespace(
+            q_current=np.zeros((1, 3), dtype=np.float64),
+            u_positions=np.zeros((2, 2), dtype=np.float64),
+            s_positions=np.zeros((1, 2), dtype=np.float64),
+            target_detected=np.array([True]),
+            channel_gains_users=np.ones((1, 2), dtype=np.float64),
+            user_weights=precise_weights,
+            association=np.ones((1, 2), dtype=np.float64),
+        )
+
+        environment = environment_sample_to_solver_dict(sample)
+
+        for key in (
+            "q_current",
+            "user_positions",
+            "target_positions",
+            "channel_gains",
+            "user_weights",
+            "association",
+        ):
+            self.assertEqual(environment[key].dtype, np.float32)
+        np.testing.assert_array_equal(
+            environment["user_weights"],
+            precise_weights.astype(np.float32),
+        )
+        self.assertEqual(environment["target_detected"].dtype, np.bool_)
+
     def test_runtime_builder_normalizes_yaml_numeric_strings(self):
         solver = build_oracle_solver({
             "area_size": [1000, 1000],

@@ -188,3 +188,150 @@ candidate arrays -> serialize JSON once -> parse stored JSON values
 Both the record tensors and their utility fields therefore describe the exact
 same numeric tuple.  The invalid two-sample gate dataset must be regenerated;
 changing its sealed JSONL fields in place is forbidden.
+
+The regenerated revision-3 gate subsequently passed end to end:
+
+- 101 tests: PASS;
+- two paired SFT/DPO records and two BEV images: PASS;
+- exact mainline audit: PASS;
+- maximum constraint violation: `1.4987809876743086e-06`;
+- minimum exact serialized DPO utility gap: `0.2167664679316772`;
+- real multimodal control-only length: `2712..2724`, below `3072`;
+- chat template and eight control tokens: PASS;
+- Gemma forward control states: `(1, 8, 2560)`;
+- split outputs Q/A/P: `(1,4,3)`, `(1,4,20)`, `(1,4,21)`.
+
+This closes the non-training runtime gate.  The next permitted experiment is
+the two-record Q-head-only overfit gate with LoRA and control offsets disabled.
+
+## Revision-3 Q-head learnability gate
+
+The isolated Q branch was trained on the sealed two-record revision-3 runtime
+dataset with:
+
+- split projection head, direct direction mode, and no geometry shortcut;
+- only `readout_q` / `q_mlp` trainable;
+- LoRA and control-token offsets disabled; and
+- only `lambda_q_dir=1`, with every A/P and auxiliary Q loss set to zero.
+
+The first 30-step run reduced the unit-direction MSE from approximately
+`0.48` to `0.289619` but exhausted its short cosine schedule before fitting the
+two records.  Continuing from that projection checkpoint with a fresh
+100-step schedule resolved the apparent underfit:
+
+- step 1: `loss_q_dir=0.289619`;
+- step 25: `loss_q_dir=0.064822`;
+- step 50: `loss_q_dir=0.000957`;
+- step 75: `loss_q_dir=0.000108`;
+- step 100: `loss_q_dir=0.000035`;
+- all unrelated loss terms remained exactly zero; and
+- no NaN, Inf, OOM, or runtime error occurred.
+
+Reloading the final checkpoint reproduced the result:
+
+- predicted/target displacement norm: `14.999998 / 14.999998`;
+- mobility violation ratio: `0.0`;
+- Q target 3D cosine: `0.999948`;
+- Q target XY cosine: `0.999976`;
+- raw Q direction cosine: `0.999948`; and
+- predicted/target direction standard deviation: `0.334509 / 0.336234`.
+
+Verdict: the direct Q projection branch, direction loss, backward path,
+optimizer path, serialization, reload, and inference path pass the two-record
+learnability gate.  This establishes implementation capacity and checkpoint
+integrity only; it does not establish held-out generalization.  The passing
+checkpoint is a diagnostic artifact and must not initialize an independent A
+or P branch gate.
+
+## Revision-3 A-head learnability gate
+
+The independent A branch was started from the same clean model/configuration,
+not from the diagnostic Q checkpoint.  Only `readout_a` / `a_mlp` were
+trainable; LoRA and control-token offsets were disabled.  The initial gate
+used only raw association cross-entropy so that classification capacity could
+be established before involving the constrained association projection.
+
+Training reduced `loss_a_raw_ce` from `1.386258` (the four-class random
+baseline) to `0.013615` in 100 optimizer steps.  Every unrelated loss stayed
+at zero and no numerical/runtime error occurred.
+
+Reloading the final checkpoint established both raw and projected behavior:
+
+- raw argmax/top-2 accuracy: `1.0 / 1.0`;
+- projected argmax/top-2 accuracy: `1.0 / 1.0`;
+- fixed-user-majority baseline: `0.625`;
+- projected oracle probability mean: `0.999776`;
+- raw oracle probability mean: `0.986536`; and
+- predicted and target UAV histograms both equal
+  `{'0': 16, '1': 9, '2': 11, '3': 4}`.
+
+Verdict: the A readout, raw classification loss, constrained projection,
+checkpoint serialization/reload, and inference path pass the two-record
+learnability gate.  The remaining diagnostic warning belongs to the frozen P
+branch and is not an A-gate failure.
+
+## Revision-3 P-head learnability gate
+
+The independent P branch was also started from the clean model/configuration.
+Only `readout_p` / `p_mlp` were trainable; LoRA and control-token offsets were
+disabled.  The gate used the raw power-distribution KL loss, whose temperature
+and normalization match the final simplex power projection.
+
+Training reduced `loss_p_raw_kl` from `2.431211` to `0.009261` in 100
+optimizer steps.  Inactive communication-power leakage fell from `0.048377`
+to `0.000570`; all unrelated losses stayed zero and no numerical/runtime error
+occurred.
+
+Reloading the final checkpoint produced:
+
+- predicted/target per-dimension standard deviation:
+  `0.040320 / 0.040855`;
+- total power MSE: `3.2244e-06`;
+- active communication MSE: `4.3110e-06`;
+- inactive communication MSE: `7.5868e-07`;
+- sensing MSE: `3.4778e-05`;
+- inactive power leakage mean: `5.6993e-04`; and
+- predicted/target total power mean: `1.0 / 0.999777`, with total-power MAE
+  `2.2326e-04`.
+
+Verdict: the P readout, raw KL loss, simplex projection, checkpoint
+serialization/reload, and inference path pass the two-record learnability
+gate.  The diagnostic warnings belong to the frozen random A branch.
+
+Together, the Q, A, and P branches now pass their independent two-record
+implementation gates.  These gates prove wiring, optimization capacity, and
+artifact integrity, but not held-out generalization or joint-training
+stability.
+
+## Train20 replay precision repair
+
+Fresh revision-3 train20 generation completed, but the strict replay audit
+stopped at `env_7` because its stored utility differed from the utility
+recomputed from the seeded environment by more than `1e-6`.
+
+The serialized Q/A/P tuple was not the source of this mismatch.  Generation
+converted `EnvironmentSample.user_weights` to float32 in
+`OracleDataGenerator._env_sample_to_dict`, while the audit and downstream
+solver evaluator independently reconstructed a dictionary with the original
+float64 weights.  Since communication utility is explicitly weighted by
+`user_weights`, the two paths could assign slightly different utilities to
+the same otherwise identical record.
+
+The repair adds one authoritative
+`environment_sample_to_solver_dict()` conversion in `oracle_runtime.py` and
+uses it for:
+
+- Oracle data generation;
+- exact dataset replay auditing; and
+- downstream warm-start/cold-start solver evaluation.
+
+The helper preserves the generator's established float32 source precision,
+so the already generated train20 labels and stored utilities are unchanged.
+The audit tolerance remains the strict absolute `1e-6`; no mismatch is hidden
+by relaxing the gate.  Audit failures now include stored, recomputed, and
+difference values.  A regression test covers the canonical user-weight
+conversion.
+
+Local `compileall` and `git diff --check` pass.  The Windows audit host lacks
+NumPy, so the targeted runtime tests and the existing train20 re-audit must be
+run in the server's `uavmllm` environment before val20 generation resumes.

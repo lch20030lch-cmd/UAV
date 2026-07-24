@@ -28,6 +28,7 @@ from .oracle_contract import (
     DEFAULT_ORACLE_SELECTION_UTILITY_TOLERANCE,
     ORACLE_SELECTION_MODE,
 )
+from .oracle_runtime import environment_sample_to_solver_dict
 from .prompt_builder import build_full_prompt, format_oracle_response
 
 
@@ -638,15 +639,7 @@ class OracleDataGenerator:
 
     def _env_sample_to_dict(self, env_sample: EnvironmentSample) -> Dict:
         """将 EnvironmentSample 转换为 solver 期望的 dict 格式"""
-        return {
-            "q_current": env_sample.q_current.copy(),
-            "user_positions": env_sample.u_positions.copy(),
-            "target_positions": env_sample.s_positions.copy(),
-            "target_detected": env_sample.target_detected.copy(),
-            "channel_gains": env_sample.channel_gains_users.copy(),
-            "user_weights": env_sample.user_weights.copy().astype(np.float32),
-            "association": env_sample.association.copy(),
-        }
+        return environment_sample_to_solver_dict(env_sample)
 
     def _save_dataset(self, data: List[Dict], filename: str):
         """保存数据集为 JSONL 格式"""
