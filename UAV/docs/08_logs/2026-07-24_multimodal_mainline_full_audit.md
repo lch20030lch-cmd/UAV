@@ -439,3 +439,37 @@ Formal Q training must not be extended and LoRA must not be enabled until this
 probe reaches a classified result.  Static compilation and `git diff --check`
 pass locally.  Numerical tests require the server `uavmllm` environment
 because the Windows audit interpreter does not contain PyTorch.
+
+### Cached-state Q bottleneck classification
+
+The normalized four-readout probe showed that every tested readout can
+memorize the 20 cached Q targets.  Most importantly, the exact online
+`ControlReadout + ResidualMLP` architecture reached cosine `0.923860` at step
+100, `0.999179` at step 200, and `1.0` thereafter.  This rules out missing Q
+information, insufficient Q-head capacity, and mandatory full-token
+flattening.
+
+A second isolation run removed state normalization, retained the formal
+`max_grad_norm=1`, and trained only the exact online readout with constant
+`3e-4` learning rate.  It progressed as follows:
+
+- step 100: cosine `0.428108`;
+- step 300: cosine `0.745769`;
+- step 500: cosine `0.918546`;
+- step 600: cosine `0.957509`;
+- step 800: cosine `0.988108`; and
+- step 1000: cosine `0.999982`.
+
+Thus input normalization is not required and LoRA is not justified by this
+failure.  The formal 50-step run ended before the unnormalized head's
+train-fit regime and simultaneously annealed its cosine learning rate to
+approximately zero.  The failure is classified as an online optimization
+control mismatch.
+
+To keep an isolated branch run from mutating the shared joint-SFT YAML,
+`train_sft_mm.py` now accepts per-run overrides for scheduler, warmup ratio,
+weight decay, and maximum gradient norm.  Defaults remain exactly the YAML
+values.  Resolved values are printed and saved in both intermediate and final
+checkpoint metadata.  Framework-independent validation rejects empty
+scheduler names, invalid warmup ratios, negative weight decay, and nonpositive
+gradient clipping thresholds.

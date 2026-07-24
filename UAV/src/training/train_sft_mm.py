@@ -47,7 +47,11 @@ from src.model.gemma_multimodal_isac import (
     is_vision_parameter_name,
     keep_vision_modules_in_eval_mode,
 )
-from src.training.runtime_utils import resolve_warmup_steps, rotate_step_checkpoints
+from src.training.runtime_utils import (
+    resolve_optimizer_controls,
+    resolve_warmup_steps,
+    rotate_step_checkpoints,
+)
 
 
 def _move_batch(batch, device):
@@ -325,6 +329,10 @@ def train_mm_sft_smoke(
     freeze_all_except_q_cue: bool = False,
     freeze_all_except_p: bool = False,
     gradient_accumulation_steps: int = None,
+    lr_scheduler_override: str = None,
+    warmup_ratio_override: float = None,
+    weight_decay_override: float = None,
+    max_grad_norm_override: float = None,
     lambda_lm_ce: float = None,
     use_chat_template: bool = None,
     train_control_offsets: bool = None,
@@ -737,12 +745,22 @@ def train_mm_sft_smoke(
     ]
     if train_lora and lora_params:
         param_groups.append({"params": lora_params, "lr": lora_lr})
+    optimizer_controls = resolve_optimizer_controls(
+        train_cfg,
+        configured_max_grad_norm=cfg["hardware"].get("max_grad_norm", 1.0),
+        lr_scheduler_override=lr_scheduler_override,
+        warmup_ratio_override=warmup_ratio_override,
+        weight_decay_override=weight_decay_override,
+        max_grad_norm_override=max_grad_norm_override,
+    )
+    weight_decay_value = optimizer_controls["weight_decay"]
+    max_grad_norm_value = optimizer_controls["max_grad_norm"]
     optimizer = torch.optim.AdamW(
         param_groups,
-        weight_decay=train_cfg.get("weight_decay", 0.01),
+        weight_decay=weight_decay_value,
     )
-    scheduler_name = str(train_cfg.get("lr_scheduler", "constant")).lower()
-    warmup_ratio = float(train_cfg.get("warmup_ratio", 0.0))
+    scheduler_name = optimizer_controls["lr_scheduler"]
+    warmup_ratio = optimizer_controls["warmup_ratio"]
     warmup_steps = resolve_warmup_steps(steps_limit, warmup_ratio)
     scheduler = get_scheduler(
         scheduler_name,
@@ -767,6 +785,8 @@ def train_mm_sft_smoke(
     print(f"  LoRA lr:                      {lora_lr if train_lora else 0.0}")
     print(f"  lr scheduler:                 {scheduler_name}")
     print(f"  warmup steps:                 {warmup_steps}")
+    print(f"  weight decay:                 {weight_decay_value}")
+    print(f"  max grad norm:                {max_grad_norm_value}")
     print(f"  projection head type:         {head_type}")
     print(f"  q projection mode:            {q_mode}")
     print(f"  q geometry mode:              {q_geom_mode}")
@@ -914,12 +934,12 @@ def train_mm_sft_smoke(
             ) = _clip_projection_and_lora_gradients(
                 proj_params,
                 lora_params,
-                float(cfg["hardware"].get("max_grad_norm", 1.0)),
+                max_grad_norm_value,
             )
             if control_offset_params:
                 torch.nn.utils.clip_grad_norm_(
                     control_offset_params,
-                    float(cfg["hardware"].get("max_grad_norm", 1.0)),
+                    max_grad_norm_value,
                 )
             grad_norm_control_post_clip = _grad_norm(
                 control_offset_params
@@ -1011,6 +1031,8 @@ def train_mm_sft_smoke(
                         "lr_scheduler": scheduler_name,
                         "warmup_ratio": warmup_ratio,
                         "warmup_steps": warmup_steps,
+                        "weight_decay": weight_decay_value,
+                        "max_grad_norm": max_grad_norm_value,
                         "include_response_tokens": include_response_tokens,
                         "use_chat_template": use_chat_template_value,
                         "lambda_lm_ce": lambda_lm_ce_value,
@@ -1094,6 +1116,8 @@ def train_mm_sft_smoke(
             "lr_scheduler": scheduler_name,
             "warmup_ratio": warmup_ratio,
             "warmup_steps": warmup_steps,
+            "weight_decay": weight_decay_value,
+            "max_grad_norm": max_grad_norm_value,
             "include_response_tokens": include_response_tokens,
             "use_chat_template": use_chat_template_value,
             "lambda_lm_ce": lambda_lm_ce_value,
@@ -1273,6 +1297,30 @@ if __name__ == "__main__":
         default=None,
         help="覆盖配置中的梯度累积步数；max_steps 始终表示 optimizer updates",
     )
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default=None,
+        help="override training.sft.lr_scheduler for this run",
+    )
+    parser.add_argument(
+        "--warmup_ratio",
+        type=float,
+        default=None,
+        help="override training.sft.warmup_ratio for this run",
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=None,
+        help="override training.sft.weight_decay for this run",
+    )
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=None,
+        help="override hardware.max_grad_norm for this run",
+    )
     args = parser.parse_args()
 
     train_mm_sft_smoke(
@@ -1310,6 +1358,10 @@ if __name__ == "__main__":
         freeze_all_except_q_cue=args.freeze_all_except_q_cue,
         freeze_all_except_p=args.freeze_all_except_p,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        lr_scheduler_override=args.lr_scheduler,
+        warmup_ratio_override=args.warmup_ratio,
+        weight_decay_override=args.weight_decay,
+        max_grad_norm_override=args.max_grad_norm,
         lambda_lm_ce=args.lambda_lm_ce,
         use_chat_template=args.use_chat_template,
         allow_partial_projection_load=args.allow_partial_projection_load,

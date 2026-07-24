@@ -38,6 +38,53 @@ def resolve_warmup_steps(max_steps: int, warmup_ratio: float) -> int:
     return int(max_steps * warmup_ratio)
 
 
+def resolve_optimizer_controls(
+    train_cfg: dict,
+    *,
+    configured_max_grad_norm: float,
+    lr_scheduler_override: Optional[str] = None,
+    warmup_ratio_override: Optional[float] = None,
+    weight_decay_override: Optional[float] = None,
+    max_grad_norm_override: Optional[float] = None,
+):
+    """Resolve auditable optimizer controls without mutating shared config."""
+    scheduler_name = str(
+        lr_scheduler_override
+        if lr_scheduler_override is not None
+        else train_cfg.get("lr_scheduler", "constant")
+    ).strip().lower()
+    warmup_ratio = float(
+        warmup_ratio_override
+        if warmup_ratio_override is not None
+        else train_cfg.get("warmup_ratio", 0.0)
+    )
+    weight_decay = float(
+        weight_decay_override
+        if weight_decay_override is not None
+        else train_cfg.get("weight_decay", 0.01)
+    )
+    max_grad_norm = float(
+        max_grad_norm_override
+        if max_grad_norm_override is not None
+        else configured_max_grad_norm
+    )
+
+    if not scheduler_name:
+        raise ValueError("lr_scheduler must not be empty")
+    if not 0.0 <= warmup_ratio <= 1.0:
+        raise ValueError("warmup_ratio must be in [0, 1]")
+    if weight_decay < 0.0:
+        raise ValueError("weight_decay must be non-negative")
+    if max_grad_norm <= 0.0:
+        raise ValueError("max_grad_norm must be positive")
+    return {
+        "lr_scheduler": scheduler_name,
+        "warmup_ratio": warmup_ratio,
+        "weight_decay": weight_decay,
+        "max_grad_norm": max_grad_norm,
+    }
+
+
 def rotate_step_checkpoints(
     checkpoint_root,
     *,

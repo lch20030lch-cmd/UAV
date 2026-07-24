@@ -3,10 +3,75 @@ import unittest
 from pathlib import Path
 
 from src.training.runtime_utils import (
+    resolve_optimizer_controls,
     resolve_optimizer_steps,
     resolve_warmup_steps,
     rotate_step_checkpoints,
 )
+
+
+class OptimizerControlResolutionTest(unittest.TestCase):
+    def test_defaults_are_read_without_mutating_config(self):
+        config = {
+            "lr_scheduler": "cosine",
+            "warmup_ratio": 0.03,
+            "weight_decay": 0.01,
+        }
+
+        result = resolve_optimizer_controls(
+            config,
+            configured_max_grad_norm=1.0,
+        )
+
+        self.assertEqual(result["lr_scheduler"], "cosine")
+        self.assertEqual(result["warmup_ratio"], 0.03)
+        self.assertEqual(result["weight_decay"], 0.01)
+        self.assertEqual(result["max_grad_norm"], 1.0)
+        self.assertEqual(config["lr_scheduler"], "cosine")
+
+    def test_explicit_overrides_are_isolated_to_one_run(self):
+        result = resolve_optimizer_controls(
+            {
+                "lr_scheduler": "cosine",
+                "warmup_ratio": 0.03,
+                "weight_decay": 0.01,
+            },
+            configured_max_grad_norm=1.0,
+            lr_scheduler_override="constant",
+            warmup_ratio_override=0.0,
+            weight_decay_override=0.0,
+            max_grad_norm_override=5.0,
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "lr_scheduler": "constant",
+                "warmup_ratio": 0.0,
+                "weight_decay": 0.0,
+                "max_grad_norm": 5.0,
+            },
+        )
+
+    def test_invalid_optimizer_controls_are_rejected(self):
+        with self.assertRaises(ValueError):
+            resolve_optimizer_controls(
+                {},
+                configured_max_grad_norm=1.0,
+                warmup_ratio_override=1.1,
+            )
+        with self.assertRaises(ValueError):
+            resolve_optimizer_controls(
+                {},
+                configured_max_grad_norm=1.0,
+                weight_decay_override=-0.1,
+            )
+        with self.assertRaises(ValueError):
+            resolve_optimizer_controls(
+                {},
+                configured_max_grad_norm=1.0,
+                max_grad_norm_override=0.0,
+            )
 
 
 class OptimizerStepResolutionTest(unittest.TestCase):
