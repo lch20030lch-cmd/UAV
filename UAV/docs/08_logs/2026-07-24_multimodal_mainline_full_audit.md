@@ -396,3 +396,46 @@ have zero separation penalty; train20 need not.  A `--lambda_sep` override was
 therefore added consistently with the other loss overrides.  The formal
 Q-only learnability run sets it explicitly to zero, while default joint
 training behavior remains unchanged.
+
+## Q train20 projection-only failure and cached-state probe
+
+The first formal Q-only train20 run used a clean initialization, the exact
+chat-template path, full-batch gradient accumulation over all 20 records, and
+strict branch/loss isolation.  Only `readout_q` / `q_mlp` were trainable;
+LoRA, control offsets, projected-Q loss, separation loss, and every A/P loss
+were disabled.  This rules out cross-branch interference in the observed
+failure.
+
+The direction loss decreased only from `0.574999` to `0.518345` over 50
+optimizer steps.  Reloaded train20 diagnostics showed:
+
+- target 3D / XY cosine: `0.222502 / 0.259868`;
+- predicted/target direction standard deviation: `0.043555 / 0.557452`;
+- movement-constraint violation ratio: `0.0`;
+- centered control-state effective rank: `3.8737`;
+- centered nearest-neighbour cosine mean/max: `0.5941 / 0.8178`; and
+- no duplicate control-state pairs.
+
+The branch is therefore producing valid 15 m displacements but has collapsed
+most cross-environment direction variation.  The nonzero gradients and the
+passing two-record Q gate show that this is not a disconnected loss or broken
+checkpoint path.  However, the low effective rank alone is insufficient to
+choose between under-optimized online readout, attention-pooling loss, and a
+frozen-representation bottleneck.
+
+`scripts/probe_q_control_states.py` was added as a read-only cached-state
+diagnostic.  It does not load Gemma or modify checkpoints.  With
+training-statistics-only feature normalization and full-batch AdamW, it
+compares:
+
+1. the exact online `ControlReadout + ResidualMLP` Q architecture;
+2. a mean-pooled linear readout;
+3. a flattened linear readout that retains all eight control-token slots; and
+4. a flattened nonlinear readout.
+
+The ordered comparison distinguishes online optimization, Q-readout,
+control-token pooling, nonlinear readability, and frozen-state bottlenecks.
+Formal Q training must not be extended and LoRA must not be enabled until this
+probe reaches a classified result.  Static compilation and `git diff --check`
+pass locally.  Numerical tests require the server `uavmllm` environment
+because the Windows audit interpreter does not contain PyTorch.
